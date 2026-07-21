@@ -71,6 +71,18 @@ Ask your model:
 - *"Are there any live tournaments right now with Hikaru Nakamura?"*
 - *"From the position after 1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6 5.Nc3 a6, what's the top continuation across the whole database?"*
 
+## Prep workflow (built-in prompts)
+
+For MCP hosts that show prompts in a slash-menu (Claude Desktop, Cursor, Claude Code), three pre-baked prompts are included so users get a proper preparation workflow without prompt-engineering their own:
+
+| Prompt | Purpose |
+|---|---|
+| `prepare_for_game(me, opponent, my_color?, time_control?)` | Full pre-match workflow: resolves both players, weights games by recency + format (classical OTB > rapid/blitz > online), walks the opponent's repertoire looking for lines where they score under 40%, checks head-to-head, and delivers a concrete plan with the moves to steer toward the opponent's weak points. |
+| `scout_player(player)` | Deep scouting report on one player — style, top openings, recent form, biggest wins and losses, recurring weaknesses. |
+| `head_to_head_briefing(player_a, player_b)` | One-paragraph read on the history between two players — who has the edge, dominant openings, style clash, current form. |
+
+Pick one from the host's slash-menu, fill in the arguments, and the model does the rest.
+
 ## Remote MCP (chess.ceo-hosted)
 
 You can also connect to chess.ceo's hosted instance and skip installing anything:

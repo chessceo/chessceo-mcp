@@ -13,7 +13,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
   ListToolsRequestSchema,
+  type Prompt,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 
@@ -78,7 +81,7 @@ const TOOLS: Tool[] = [
   {
     name: "get_player_preparation",
     description:
-      "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc.",
+      "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc. When preparing for a real game, weight recent games (last 12-24 months) more heavily than old ones, classical over-the-board > rapid/blitz > online, and look for variations the player scores poorly in (below ~40%) or plays with less variety (shallower prep).",
     inputSchema: {
       type: "object",
       properties: {
@@ -230,14 +233,146 @@ async function callTool(name: string, args: Args): Promise<unknown> {
   }
 }
 
+// ── Prompt templates ───────────────────────────────────────────────
+//
+// MCP prompts are pre-baked instructions the host surfaces in a slash-menu
+// (Claude Desktop, Cursor, etc.). Users pick one and the templated content
+// gets injected into the conversation. Perfect for workflows the LLM
+// wouldn't reliably discover from tool descriptions alone — chess prep
+// especially, where "call the right tools in the right order weighted by
+// recency and format" is non-obvious.
+
+const PROMPTS: Prompt[] = [
+  {
+    name: "prepare_for_game",
+    description:
+      "Prep workflow for an upcoming chess game. Walks both players' repertoires and identifies where the opponent is weakest.",
+    arguments: [
+      { name: "me", description: "Your name (or FIDE ID)", required: true },
+      { name: "opponent", description: "Opponent's name (or FIDE ID)", required: true },
+      { name: "my_color", description: "The color you'll be playing: 'white' or 'black'. Optional — if you don't know yet, ask.", required: false },
+      { name: "time_control", description: "Optional: 'classical', 'rapid', 'blitz'. Weights which of the opponent's games matter most.", required: false },
+    ],
+  },
+  {
+    name: "scout_player",
+    description:
+      "Deep scouting report on one player. Their style, top openings, recent form, and where they've been beaten.",
+    arguments: [
+      { name: "player", description: "Player name or FIDE ID", required: true },
+    ],
+  },
+  {
+    name: "head_to_head_briefing",
+    description:
+      "Briefing on the history between two players — who has the edge, what openings decide their meetings, style clash.",
+    arguments: [
+      { name: "player_a", description: "First player (name or FIDE ID)", required: true },
+      { name: "player_b", description: "Second player (name or FIDE ID)", required: true },
+    ],
+  },
+];
+
+// The workflow text for prepare_for_game. Kept in one place so both the
+// MCP prompt handler and the /prepare fallback can share it.
+const PREP_WORKFLOW = (args: Record<string, string | undefined>) => {
+  const me = args.me ?? "the user";
+  const opp = args.opponent ?? "the opponent";
+  const color = args.my_color ? ` as ${args.my_color}` : "";
+  const tc = args.time_control ? ` in a ${args.time_control} game` : "";
+  return `You are preparing ${me} for a chess game against ${opp}${color}${tc}.
+
+Preparation workflow — follow the steps in order and be explicit about which tools you called at each step:
+
+1. **Resolve both players.** Call \`search_player\` for "${me}" and "${opp}" to get their FIDE IDs. Confirm the identity — many players share names.
+
+2. **Understand the opponent.** Call \`get_player_profile\` for the opponent. Read out:
+   - Current classical / rapid / blitz ratings.
+   - Top openings as White and Black (from openingRepertoire).
+   - Career win / draw / loss splits — is the draw rate above ~40%? That's a stylistic hint (drawish opponents need to be unbalanced).
+   - Notable wins and worst losses — patterns?
+
+3. **Weight games by quality when interpreting the data.**
+   - Recent games (last 12-24 months) matter far more than old ones. Opening repertoires evolve.
+   - Classical over-the-board games are the strongest signal — that's what real preparation reveals.
+   - Rapid and blitz reveal what they play under time pressure but may include experiments.
+   - Online games are useful but noisier (blitz gambits, alt accounts).
+
+4. **Walk the opponent's repertoire against ${me}'s color.** Call \`get_player_preparation\` on the opponent for the color they'll have in this game. Iterate: start from move 1, pick the opponent's most-played reply, call again with \`line\` extended. Look for:
+   - **Weak lines**: variations where the opponent scores below 40% as their side.
+   - **Shallow lines**: openings the opponent has played only a few times — probably less deeply prepared.
+   - **Abandoned lines**: openings they used to play but stopped. Something went wrong; may not want to revisit.
+   - **Variety**: places where the opponent picks different moves game to game — those are branching points where they can't predict your prep.
+
+5. **Style considerations.**
+   - High draw rate → propose openings that unbalance early (Benoni, King's Indian, gambit lines).
+   - Sharp tactician → don't play their prepared attacks; steer toward quiet positional lines.
+   - Endgame strong → keep queens on and keep complications.
+
+6. **Cross-check head-to-head.** Call \`get_head_to_head\` on the two players. If they've met before, what openings decided those games? Anything the opponent showed only against ${me}?
+
+7. **Deliver a concrete plan.** Summarize:
+   - What the opponent will likely play on move 1 (with confidence level).
+   - The 2-3 branching points where the opponent is weakest for ${me}'s color.
+   - The concrete move sequence ${me} should aim for to steer into those positions.
+   - What to avoid — the opponent's strongest weapons.
+
+Don't just dump data. Reason about it. Cite specific numbers (game counts, win rates, dates) so the user can trust your conclusions.`;
+};
+
 // ── Server wiring ──────────────────────────────────────────────────
 
 const server = new Server(
   { name: "chessceo-mcp", version: process.env.npm_package_version ?? "0.1.0" },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, prompts: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: PROMPTS }));
+
+server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+  const { name, arguments: args } = req.params;
+  const promptArgs: Record<string, string | undefined> = {};
+  if (args) for (const [k, v] of Object.entries(args)) promptArgs[k] = String(v);
+
+  let text: string;
+  switch (name) {
+    case "prepare_for_game":
+      text = PREP_WORKFLOW(promptArgs);
+      break;
+    case "scout_player": {
+      const p = promptArgs.player ?? "the player";
+      text = `Produce a scouting report on ${p}. Steps:
+1. \`search_player\` to get their FIDE ID.
+2. \`get_player_profile\` — pull rating history, career splits by color and time control, opening repertoire, opponent analysis, top events, notable wins and losses.
+3. Weight the data: recent (last 12-24 months) > older, classical OTB > rapid/blitz > online.
+4. \`get_player_preparation\` for both colors from the starting position to summarise their opening choices with actual frequencies and win rates.
+5. Deliver: current strength, characteristic openings, one-sentence style read, biggest wins, biggest losses / recurring weakness. Cite the numbers.`;
+      break;
+    }
+    case "head_to_head_briefing": {
+      const a = promptArgs.player_a ?? "player A";
+      const b = promptArgs.player_b ?? "player B";
+      text = `Briefing on the ${a} vs ${b} history. Steps:
+1. Resolve both FIDE IDs with \`search_player\`.
+2. \`get_head_to_head\` for the pair — pull overall + per-color W/D/L (from ${a}'s perspective), splits by time format, first / last meeting, most-played openings between them, average game length.
+3. Read the pattern: who has the edge, in which colour, in which time format. Which openings decide the meetings? Anything unusual — very drawish, very sharp, big rating gap?
+4. If either player is currently live in a tournament, note it with \`list_player_live_tournaments\`.
+5. Deliver a one-paragraph read: score, dominant openings, one-line style clash, current form.`;
+      break;
+    }
+    default:
+      throw new Error(`Unknown prompt: ${name}`);
+  }
+
+  return {
+    description: `chessceo prompt: ${name}`,
+    messages: [
+      { role: "user", content: { type: "text", text } },
+    ],
+  };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
