@@ -51,6 +51,17 @@ Similar `~/.cursor/mcp.json`:
 }
 ```
 
+## Install (Claude Code)
+
+This repo is also a [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces), so you can add it directly:
+
+```
+/plugin marketplace add chessceo/chessceo-mcp
+/plugin install chessceo@chessceo
+```
+
+Claude Code will pull the plugin from GitHub and wire the MCP server automatically. Enable "Sync automatically" in the marketplace UI if you want future updates fetched on push.
+
 ## Try it
 
 Ask your model:

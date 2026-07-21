@@ -1,0 +1,19 @@
+{
+  "name": "chessceo",
+  "description": "MCP tools for chess.ceo — search 1.5M FIDE players, get opening preparation, position statistics from 11.7M games, head-to-head records, and live tournament broadcasts. No API key.",
+  "version": "0.1.0",
+  "author": {
+    "name": "chess.ceo",
+    "url": "https://chess.ceo"
+  },
+  "homepage": "https://github.com/chessceo/chessceo-mcp",
+  "repository": "https://github.com/chessceo/chessceo-mcp",
+  "license": "MIT",
+  "keywords": ["chess", "fide", "chessceo", "chess-preparation", "chess-database"],
+  "mcpServers": {
+    "chessceo": {
+      "command": "npx",
+      "args": ["-y", "@chessceo/mcp"]
+    }
+  }
+}
