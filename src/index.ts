@@ -8,6 +8,7 @@
 // No API key, no auth, no state; the API's own rate limits apply.
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { Chess } from "chess.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -176,6 +177,29 @@ const TOOLS: Tool[] = [
       required: ["fide_id"],
     },
   },
+  {
+    name: "prep_snapshot",
+    description:
+      "One call, three parallel fetches at the same position: opponent's stats on their side, your stats on your side, and the 11.7M-game general database at that position. Use this while walking the opening tree — one round trip instead of three separate calls, and you can compare the three views directly (e.g. opponent has 2 games here but the general DB has 8k → prep candidate).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fide_id_me: { type: "integer", description: "Your FIDE ID." },
+        fide_id_opponent: { type: "integer", description: "Opponent's FIDE ID." },
+        my_color: { type: "string", enum: ["white", "black"], description: "The colour YOU will play." },
+        line: {
+          type: "string",
+          description:
+            "Move sequence in SAN, space-separated. Empty = starting position. Example: 'e4 c5 Nf3'. Either line or fen (or neither for the starting position).",
+        },
+        fen: {
+          type: "string",
+          description: "Alternative to line — raw FEN of the target position.",
+        },
+      },
+      required: ["fide_id_me", "fide_id_opponent", "my_color"],
+    },
+  },
 ];
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -227,6 +251,56 @@ async function callTool(name: string, args: Args): Promise<unknown> {
     case "list_player_live_tournaments":
       // Note: snake_case fide_id, unlike the prep endpoints. Documented quirk.
       return get("/api/chess/live/player", { fide_id: Number(args.fide_id) });
+
+    case "prep_snapshot": {
+      const me = Number(args.fide_id_me);
+      const opp = Number(args.fide_id_opponent);
+      const myColor = String(args.my_color);
+      const oppColor = myColor === "white" ? "black" : "white";
+      const line = typeof args.line === "string" ? args.line.trim() : "";
+      let fen = typeof args.fen === "string" ? args.fen.trim() : "";
+
+      // General DB lookup needs a FEN. If we only have a line, compute it
+      // locally with chess.js — one dep, keeps the three data-fetches truly
+      // parallel instead of doing a preliminary round-trip.
+      if (!fen) {
+        const board = new Chess();
+        if (line.length > 0) {
+          for (const raw of line.split(/\s+/)) {
+            // Tolerant of move-number tokens like "1." / "12..." that some
+            // clients include; chess.js rejects those outright.
+            const san = raw.replace(/^\d+\.+/, "");
+            if (!san) continue;
+            try {
+              board.move(san);
+            } catch {
+              throw new Error(`bad SAN token '${raw}' in line`);
+            }
+          }
+        }
+        fen = board.fen();
+      }
+
+      const prepParams = (fideId: number, color: string) => ({
+        fideId,
+        color,
+        compact: "true",
+        ...(line.length > 0 ? { line } : { fen }),
+      });
+
+      const [opponent, you, general] = await Promise.all([
+        get("/api/chess/prep/by-player", prepParams(opp, oppColor)),
+        get("/api/chess/prep/by-player", prepParams(me, myColor)),
+        get("/api/chess/database/main", { fen, limit: 20, sort: "relevance" }),
+      ]);
+
+      return {
+        position: { line, fen, my_color: myColor },
+        opponent,
+        you,
+        general,
+      };
+    }
 
     default:
       throw new Error(`Unknown tool: ${name}`);
