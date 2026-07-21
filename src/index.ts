@@ -134,6 +134,30 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "analyse",
+    description:
+      "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in UCI notation (e2e4, not e4). Use this to sanity-check candidate lines from get_position_stats or get_player_preparation — human game frequency tells you what people play, engine evaluation tells you what's actually good.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fen: { type: "string", description: "FEN of the position to analyse." },
+        movetime_ms: {
+          type: "integer",
+          minimum: 100,
+          maximum: 10000,
+          description: "Think time in milliseconds (default 2000).",
+        },
+        multipv: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description: "Number of candidate lines to return (default 3).",
+        },
+      },
+      required: ["fen"],
+    },
+  },
+  {
     name: "get_head_to_head",
     description:
       "Complete head-to-head record between two players. Includes overall and per-colour W/D/L (from player A's perspective), splits by time control, most-played openings between them, first / last meeting, average game length, and the game list.",
@@ -233,6 +257,13 @@ async function callTool(name: string, args: Args): Promise<unknown> {
         limit: typeof args.limit === "number" ? args.limit : 20,
         sort: "relevance",
       });
+
+    case "analyse": {
+      const params: Record<string, string | number | undefined> = { fen: String(args.fen) };
+      if (typeof args.movetime_ms === "number") params.movetime_ms = args.movetime_ms;
+      if (typeof args.multipv === "number") params.multipv = args.multipv;
+      return get("/api/chess/database/analyse", params);
+    }
 
     case "get_head_to_head":
       return get("/api/chess/players/h2h", {
