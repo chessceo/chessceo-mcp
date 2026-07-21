@@ -5,13 +5,12 @@
     "url": "https://chess.ceo"
   },
   "metadata": {
-    "description": "Chess data plugins for Claude Code — FIDE players, opening preparation, live tournament broadcasts.",
-    "pluginRoot": "./plugins"
+    "description": "Chess data plugins for Claude Code — FIDE players, opening preparation, live tournament broadcasts."
   },
   "plugins": [
     {
       "name": "chessceo",
-      "source": "chessceo",
+      "source": "./plugins/chessceo",
       "description": "MCP server exposing 11.7M+ chess games, ~1.5M FIDE player profiles, per-player opening preparation, position statistics, head-to-head records, and live tournament broadcasts. No API key required.",
       "homepage": "https://github.com/chessceo/chessceo-mcp",
       "category": "Chess"
