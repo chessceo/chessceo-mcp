@@ -1,0 +1,35 @@
+{
+  "name": "@chessceo/mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for chess.ceo — 11.7M+ games, ~1.5M FIDE player profiles, opening preparation, live broadcasts.",
+  "type": "module",
+  "bin": {
+    "chessceo-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["mcp", "modelcontextprotocol", "chess", "chessceo", "llm", "claude", "fide"],
+  "author": "chess.ceo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chessceo/mcp"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
