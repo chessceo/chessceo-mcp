@@ -7,8 +7,10 @@
 // endpoints — see the public contract at https://chess.ceo/llms.txt.
 // No API key, no auth, no state; the API's own rate limits apply.
 
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -252,5 +254,133 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// ── Transport selection ────────────────────────────────────────────
+//
+// Two modes:
+//   stdio        (default)  — local subprocess, host spawns via npx / config.
+//                             Every existing Claude Desktop / Cursor / Claude Code
+//                             install of this package uses stdio.
+//   http         (--transport=http --http-port=8080)
+//                            — remote MCP over Streamable HTTP. Bind to a port,
+//                              expose /mcp, users add the URL to their host
+//                              instead of running npx. This is what
+//                              claude.ai / mobile / other zero-install hosts
+//                              need. Stateless mode: each request creates a
+//                              fresh transport + response, no session
+//                              persistence, safe to scale horizontally.
+
+const argv = process.argv.slice(2);
+const arg = (name: string, def?: string): string | undefined => {
+  const i = argv.findIndex((a) => a === `--${name}` || a.startsWith(`--${name}=`));
+  if (i < 0) return def;
+  const cur = argv[i];
+  return cur.includes("=") ? cur.split("=").slice(1).join("=") : argv[i + 1];
+};
+
+const transportKind = (arg("transport", process.env.MCP_TRANSPORT ?? "stdio") ?? "stdio").toLowerCase();
+
+if (transportKind === "stdio") {
+  await server.connect(new StdioServerTransport());
+} else if (transportKind === "http" || transportKind === "streamable-http") {
+  const port = Number(arg("http-port", process.env.MCP_HTTP_PORT ?? "8080"));
+  const host = arg("http-host", process.env.MCP_HTTP_HOST ?? "127.0.0.1") ?? "127.0.0.1";
+  const path = arg("http-path", process.env.MCP_HTTP_PATH ?? "/mcp") ?? "/mcp";
+
+  // Read a JSON body off req into memory. Bodies are tiny (JSON-RPC), so
+  // no streaming needed; guard against absurd payloads with a hard cap.
+  const MAX_BODY = 1_048_576; // 1 MB
+  const readBody = (req: IncomingMessage): Promise<unknown> =>
+    new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      req.on("data", (c: Buffer) => {
+        total += c.length;
+        if (total > MAX_BODY) {
+          req.destroy();
+          reject(new Error("body too large"));
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on("end", () => {
+        try {
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve(text.length === 0 ? undefined : JSON.parse(text));
+        } catch (e) {
+          reject(e);
+        }
+      });
+      req.on("error", reject);
+    });
+
+  const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // Basic CORS so browser-based MCP hosts can call us cross-origin.
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Last-Event-ID");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    // Liveness — cheap health check for load balancers / uptime monitors.
+    if (req.method === "GET" && (req.url === "/healthz" || req.url === "/health")) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/plain");
+      res.end("ok\n");
+      return;
+    }
+
+    // Everything else must hit the MCP path.
+    const urlPath = (req.url ?? "").split("?")[0];
+    if (urlPath !== path) {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
+
+    try {
+      // Stateless: one transport per request, no session store. Simpler,
+      // scales trivially, matches how claude.ai / ChatGPT connectors call.
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      });
+      res.on("close", () => transport.close());
+      await server.connect(transport);
+      const body = req.method === "POST" ? await readBody(req) : undefined;
+      await transport.handleRequest(req, res, body);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32603,
+            message: err instanceof Error ? err.message : String(err),
+          },
+          id: null,
+        }));
+      }
+    }
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(`chessceo-mcp: streamable-http on http://${host}:${port}${path}`);
+  });
+
+  // Graceful shutdown so `systemctl stop` doesn't leak connections.
+  const shutdown = (sig: string) => {
+    console.error(`chessceo-mcp: ${sig} received, closing`);
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000).unref();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+} else {
+  console.error(`chessceo-mcp: unknown --transport '${transportKind}' (expected stdio or http)`);
+  process.exit(2);
+}

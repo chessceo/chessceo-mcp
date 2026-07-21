@@ -71,6 +71,100 @@ Ask your model:
 - *"Are there any live tournaments right now with Hikaru Nakamura?"*
 - *"From the position after 1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6 5.Nc3 a6, what's the top continuation across the whole database?"*
 
+## Remote MCP (chess.ceo-hosted)
+
+You can also connect to chess.ceo's hosted instance and skip installing anything:
+
+```
+https://mcp.chess.ceo/mcp
+```
+
+In Claude Code:
+
+```
+/plugin add-mcp url https://mcp.chess.ceo/mcp
+```
+
+In Claude Desktop, edit `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "chessceo": {
+      "url": "https://mcp.chess.ceo/mcp"
+    }
+  }
+}
+```
+
+Same 8 tools, same data, zero-install. Useful when the host can't spawn subprocesses (e.g. Claude.ai web, Claude mobile, ChatGPT connectors).
+
+## Self-host the HTTP transport
+
+The same package can run as a persistent HTTP server, not just a stdio subprocess:
+
+```bash
+chessceo-mcp --transport=http --http-port=8080 --http-host=127.0.0.1
+```
+
+Flags (or the corresponding env vars):
+
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `--transport` | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
+| `--http-port` | `MCP_HTTP_PORT` | `8080` | Port to bind |
+| `--http-host` | `MCP_HTTP_HOST` | `127.0.0.1` | Bind address |
+| `--http-path` | `MCP_HTTP_PATH` | `/mcp` | Streamable-HTTP endpoint |
+
+`GET /healthz` returns `200 ok\n` — wire it into your uptime monitor.
+
+### systemd unit (example)
+
+```ini
+# /etc/systemd/system/chessceo-mcp.service
+[Unit]
+Description=chess.ceo MCP server (Streamable HTTP)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Environment=NODE_ENV=production
+Environment=MCP_TRANSPORT=http
+Environment=MCP_HTTP_PORT=8127
+Environment=MCP_HTTP_HOST=127.0.0.1
+ExecStart=/usr/bin/npx -y @chessceo/mcp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### nginx snippet (example)
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name mcp.chess.ceo;
+
+    ssl_certificate     /etc/letsencrypt/live/mcp.chess.ceo/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mcp.chess.ceo/privkey.pem;
+
+    # Streamable HTTP is short JSON POSTs — no long-poll SSE required.
+    location /mcp {
+        proxy_pass         http://127.0.0.1:8127/mcp;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_buffering    off;   # streaming responses shouldn't be buffered
+        proxy_read_timeout 300s;
+    }
+
+    location = /healthz { proxy_pass http://127.0.0.1:8127/healthz; }
+}
+```
+
 ## Development
 
 ```bash
@@ -79,11 +173,16 @@ cd chessceo-mcp
 npm install
 npm run build   # tsc → dist/
 npm start       # runs the server on stdio (for MCP hosts)
+
+# or run the HTTP transport locally:
+node dist/index.js --transport=http --http-port=8127
+curl http://127.0.0.1:8127/healthz     # should print "ok"
 ```
 
 Environment variable overrides:
 
 - `CHESSCEO_BASE_URL` — override the API base (default `https://chess.ceo`). Useful for testing against staging.
+- MCP transport env vars — see the self-host table above.
 
 ## What's under the hood
 
