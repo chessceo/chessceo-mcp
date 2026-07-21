@@ -19,7 +19,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/chessceo/mcp"
+    "url": "https://github.com/chessceo/chessceo-mcp"
+  },
+  "homepage": "https://chess.ceo",
+  "bugs": {
+    "url": "https://github.com/chessceo/chessceo-mcp/issues"
   },
   "engines": {
     "node": ">=18"
