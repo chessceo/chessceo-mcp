@@ -40,6 +40,26 @@ const UA = `chessceo-mcp/${process.env.npm_package_version ?? "0.1.0"} (+https:/
 
 const authContext = new AsyncLocalStorage<{ authHeader: string | undefined }>();
 
+// Tools that require an MCP token — cloud engine tools operate on the
+// user's rented instances so we can't service them anonymously. The
+// streamable-http transport uses this list to decide whether to trigger
+// the OAuth discovery flow via 401 + WWW-Authenticate before the SDK
+// gets a chance to handle the call.
+const AUTHED_TOOLS = new Set([
+  "start_cloud_engine",
+  "list_cloud_engines",
+  "stop_cloud_engine",
+  "cloud_analyse",
+]);
+
+function isAuthedToolCall(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const b = body as { method?: unknown; params?: { name?: unknown } };
+  if (b.method !== "tools/call") return false;
+  const name = b.params?.name;
+  return typeof name === "string" && AUTHED_TOOLS.has(name);
+}
+
 function resolveAuthHeader(): string | undefined {
   const store = authContext.getStore();
   if (store?.authHeader) return store.authHeader;
@@ -711,8 +731,26 @@ if (transportKind === "stdio") {
       return;
     }
 
-    // Everything else must hit the MCP path.
     const urlPath = (req.url ?? "").split("?")[0];
+
+    // RFC 9728 protected-resource metadata. MCP hosts (claude.ai, ChatGPT)
+    // fetch this after receiving a 401 with WWW-Authenticate below; it
+    // points them at chess.ceo's OAuth 2.1 authorization server, which
+    // handles registration (DCR), consent, and token issuance.
+    if (req.method === "GET" && urlPath === "/.well-known/oauth-protected-resource") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.end(JSON.stringify({
+        resource: "https://mcp.chess.ceo/mcp",
+        authorization_servers: ["https://chess.ceo"],
+        scopes_supported: ["agent"],
+        bearer_methods_supported: ["header"],
+      }));
+      return;
+    }
+
+    // Everything else must hit the MCP path.
     if (urlPath !== path) {
       res.statusCode = 404;
       res.end();
@@ -720,6 +758,29 @@ if (transportKind === "stdio") {
     }
 
     try {
+      const body = req.method === "POST" ? await readBody(req) : undefined;
+      const authHeader = req.headers["authorization"];
+      const authHeaderStr = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+
+      // If the caller is invoking an authed tool without a token, respond
+      // with 401 + WWW-Authenticate pointing at RFC 9728 metadata BEFORE
+      // handing off to the MCP SDK — MCP hosts (claude.ai, ChatGPT) look
+      // for this header at the HTTP layer to auto-start OAuth discovery.
+      if (!authHeaderStr && isAuthedToolCall(body)) {
+        res.statusCode = 401;
+        res.setHeader(
+          "WWW-Authenticate",
+          `Bearer realm="chess.ceo", resource_metadata="https://mcp.chess.ceo/.well-known/oauth-protected-resource"`,
+        );
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "authentication required" },
+          id: (body as { id?: unknown } | undefined)?.id ?? null,
+        }));
+        return;
+      }
+
       // Stateless: one transport per request, no session store. Simpler,
       // scales trivially, matches how claude.ai / ChatGPT connectors call.
       const transport = new StreamableHTTPServerTransport({
@@ -728,12 +789,10 @@ if (transportKind === "stdio") {
       });
       res.on("close", () => transport.close());
       await server.connect(transport);
-      const body = req.method === "POST" ? await readBody(req) : undefined;
       // Forward the caller's Authorization header down to tool handlers so
       // they can attach it when calling authenticated backend endpoints.
       // AsyncLocalStorage survives every await inside the tool handler.
-      const authHeader = req.headers["authorization"];
-      await authContext.run({ authHeader: Array.isArray(authHeader) ? authHeader[0] : authHeader }, async () => {
+      await authContext.run({ authHeader: authHeaderStr }, async () => {
         await transport.handleRequest(req, res, body);
       });
     } catch (err) {
