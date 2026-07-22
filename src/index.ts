@@ -8,6 +8,7 @@
 // No API key, no auth, no state; the API's own rate limits apply.
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Chess } from "chess.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -25,6 +26,27 @@ const BASE = process.env.CHESSCEO_BASE_URL ?? "https://chess.ceo";
 const UA = `chessceo-mcp/${process.env.npm_package_version ?? "0.1.0"} (+https://chess.ceo)`;
 
 // ── HTTP ────────────────────────────────────────────────────────────
+//
+// Two auth flavours coexist:
+//   - Anonymous GETs (players, positions, prep, live) — no auth.
+//   - Authed tools (cloud engines) — `Authorization: Bearer mcp_...`.
+//
+// The token comes from one of two sources:
+//   - stdio: `CHESSCEO_TOKEN` env var, set by the MCP host config. Bare
+//     `mcp_...` — we prepend the `Bearer ` scheme when building the header.
+//   - streamable-http: the caller's `Authorization` header, forwarded
+//     per-request via AsyncLocalStorage so tool handlers can see it even
+//     though the MCP SDK's request handler doesn't know about HTTP.
+
+const authContext = new AsyncLocalStorage<{ authHeader: string | undefined }>();
+
+function resolveAuthHeader(): string | undefined {
+  const store = authContext.getStore();
+  if (store?.authHeader) return store.authHeader;
+  const env = process.env.CHESSCEO_TOKEN?.trim();
+  if (!env) return undefined;
+  return env.toLowerCase().startsWith("bearer ") ? env : `Bearer ${env}`;
+}
 
 async function get(path: string, params: Record<string, string | number | undefined>): Promise<unknown> {
   const url = new URL(path, BASE);
@@ -40,6 +62,43 @@ async function get(path: string, params: Record<string, string | number | undefi
     throw new Error(`chess.ceo ${res.status}: ${body.slice(0, 500)}`);
   }
   return res.json();
+}
+
+// authedRequest is the shared code path for POST/GET/DELETE calls that need
+// an MCP token. Missing-token errors are surfaced early with a message the
+// LLM can act on (either configure CHESSCEO_TOKEN or generate a token in
+// user settings) rather than a generic 401 from the backend.
+async function authedRequest(
+  method: "GET" | "POST" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
+  const auth = resolveAuthHeader();
+  if (!auth) {
+    throw new Error(
+      "No MCP token available. Set CHESSCEO_TOKEN env (stdio mode) or pass an " +
+        "Authorization: Bearer mcp_... header (streamable-http mode). Generate " +
+        "a token at chess.ceo → user settings → MCP tokens.",
+    );
+  }
+  const url = new URL(path, BASE);
+  const headers: Record<string, string> = {
+    "User-Agent": UA,
+    "Accept": "application/json",
+    "Authorization": auth,
+  };
+  const init: RequestInit = { method, headers };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, init);
+  if (res.status === 204) return null;
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`chess.ceo ${res.status}: ${text.slice(0, 500)}`);
+  }
+  return text.length ? JSON.parse(text) : null;
 }
 
 // ── Tool definitions ───────────────────────────────────────────────
@@ -202,6 +261,67 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "start_cloud_engine",
+    description:
+      "Rent a combo GPU instance (Stockfish + Lc0 in the same container) on the user's chess.ceo account. Real money — billed per second while running. Requires an MCP token with agent access. Use `list_cloud_engines` first to see if the user already has one running; don't start a second combo unless the user asked for it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        machine_type: {
+          type: "string",
+          description:
+            "SKU picked from the user's cloud-engine options (e.g. 'rtx-5090', 'rtx-5090-dual'). Ask the user if you don't already know which one they want.",
+        },
+      },
+      required: ["machine_type"],
+    },
+  },
+  {
+    name: "list_cloud_engines",
+    description:
+      "List the user's currently running cloud engines. Use before starting a new one, or to find the contract_id for stop_cloud_engine. `cloud_analyse` auto-picks the only running combo, so listing is only necessary when the user might have zero or several.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "stop_cloud_engine",
+    description:
+      "Destroy a running cloud engine. Billing stops immediately. Use the contract_id from `list_cloud_engines` — don't guess.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        contract_id: {
+          type: "string",
+          description: "Instance contract_id, from list_cloud_engines.",
+        },
+      },
+      required: ["contract_id"],
+    },
+  },
+  {
+    name: "cloud_analyse",
+    description:
+      "Runs a synchronous ~2s analysis on the user's running combo instance and returns both Stockfish and Lc0's final read for the FEN — depth, top-N candidate moves with scores (centipawns from side-to-move POV or mate distance), and each engine's principal variation. Auto-picks the caller's only running combo instance; errors clearly if there are zero (start one first) or more than one (destroy the extras first). Much deeper than `analyse` (the CPU-only public endpoint) — use this when the user is genuinely doing prep work and has cloud engines running.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fen: { type: "string", description: "FEN of the position to analyse." },
+        movetime_ms: {
+          type: "integer",
+          minimum: 100,
+          maximum: 10000,
+          description: "Think time in milliseconds (default 2000).",
+        },
+        multipv: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description: "Number of candidate lines per engine (default 3).",
+        },
+      },
+      required: ["fen"],
+    },
+  },
+  {
     name: "prep_snapshot",
     description:
       "One call, three parallel fetches at the same position: opponent's stats on their side, your stats on your side, and the 11.7M-game general database at that position. Use this while walking the opening tree — one round trip instead of three separate calls, and you can compare the three views directly (e.g. opponent has 2 games here but the general DB has 8k → prep candidate).",
@@ -282,6 +402,24 @@ async function callTool(name: string, args: Args): Promise<unknown> {
     case "list_player_live_tournaments":
       // Note: snake_case fide_id, unlike the prep endpoints. Documented quirk.
       return get("/api/chess/live/player", { fide_id: Number(args.fide_id) });
+
+    case "start_cloud_engine":
+      return authedRequest("POST", "/api/agent/cloud-engines", {
+        machineType: String(args.machine_type),
+      });
+
+    case "list_cloud_engines":
+      return authedRequest("GET", "/api/agent/cloud-engines");
+
+    case "stop_cloud_engine":
+      return authedRequest("DELETE", `/api/agent/cloud-engines/${encodeURIComponent(String(args.contract_id))}`);
+
+    case "cloud_analyse": {
+      const body: Record<string, unknown> = { fen: String(args.fen) };
+      if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
+      if (typeof args.multipv === "number") body.multipv = args.multipv;
+      return authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
+    }
 
     case "prep_snapshot": {
       const me = Number(args.fide_id_me);
@@ -591,7 +729,13 @@ if (transportKind === "stdio") {
       res.on("close", () => transport.close());
       await server.connect(transport);
       const body = req.method === "POST" ? await readBody(req) : undefined;
-      await transport.handleRequest(req, res, body);
+      // Forward the caller's Authorization header down to tool handlers so
+      // they can attach it when calling authenticated backend endpoints.
+      // AsyncLocalStorage survives every await inside the tool handler.
+      const authHeader = req.headers["authorization"];
+      await authContext.run({ authHeader: Array.isArray(authHeader) ? authHeader[0] : authHeader }, async () => {
+        await transport.handleRequest(req, res, body);
+      });
     } catch (err) {
       if (!res.headersSent) {
         res.statusCode = 500;

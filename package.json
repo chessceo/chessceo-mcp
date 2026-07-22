@@ -1,6 +1,6 @@
 {
   "name": "@chessceo/mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Model Context Protocol server for chess.ceo — 11.7M+ games, ~1.5M FIDE player profiles, opening preparation, live broadcasts.",
   "type": "module",
   "bin": {
