@@ -9,6 +9,9 @@
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { Chess } from "chess.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -24,6 +27,21 @@ import {
 
 const BASE = process.env.CHESSCEO_BASE_URL ?? "https://chess.ceo";
 const UA = `chessceo-mcp/${process.env.npm_package_version ?? "0.1.0"} (+https://chess.ceo)`;
+
+// The engine-usage guide ships in the package (see package.json "files").
+// Loaded once at startup and returned verbatim by the engine_usage_primer
+// prompt — LLM hosts surface it in their slash menu so a user can push the
+// full doc into the conversation on demand.
+const ENGINE_USAGE_DOC: string = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // dist/index.js → ../docs/engine-usage.md when packaged; src/index.ts
+    // → ../docs/engine-usage.md during dev. Same resolution either way.
+    return readFileSync(join(here, "..", "docs", "engine-usage.md"), "utf8");
+  } catch {
+    return "Engine usage guide not bundled with this install of @chessceo/mcp.";
+  }
+})();
 
 // ── HTTP ────────────────────────────────────────────────────────────
 //
@@ -320,7 +338,15 @@ const TOOLS: Tool[] = [
   {
     name: "cloud_analyse",
     description:
-      "Runs a synchronous ~2s analysis on the user's running combo instance and returns both Stockfish and Lc0's final read for the FEN — depth, top-N candidate moves with scores (centipawns from side-to-move POV or mate distance), and each engine's principal variation. Auto-picks the caller's only running combo instance; errors clearly if there are zero (start one first) or more than one (destroy the extras first). Much deeper than `analyse` (the CPU-only public endpoint) — use this when the user is genuinely doing prep work and has cloud engines running.",
+      "Runs a synchronous ~2s analysis on the user's running combo instance and returns both Stockfish and Lc0's final read for the FEN — depth, top-N candidate moves with scores (centipawns from side-to-move POV, or mate distance), and each engine's principal variation.\n\n" +
+      "Auto-picks the caller's only running combo instance; errors clearly if there are zero (start one first with start_cloud_engine) or more than one (destroy the extras first).\n\n" +
+      "How to read the response:\n" +
+      "• Stockfish is objective truth — trust it for 'does this line hold?' 'is there a tactic?' 'is this endgame drawn?' A Stockfish 0.00 means 'objectively equal', NOT 'trivial draw' — one side can still be much harder to play in practice.\n" +
+      "• Lc0 is practical eval — trust it for 'which side is easier?' 'which candidate is best when Stockfish shows several as equal?' Lc0 sees long-term positional factors Stockfish's fixed search can miss.\n" +
+      "• When they agree → high confidence. When they disagree → look at both scores and reason WHY (Stockfish sharply higher = tactic Lc0 missed; Lc0 higher = long-term positional edge past Stockfish's horizon). Never dismiss either — the disagreement is the signal.\n\n" +
+      "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Practical range -20..+20. Use it to find non-objective 'practical' ideas or when the user needs to steer toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
+      "For the full guide including worked examples, use the `engine_usage_primer` prompt.\n\n" +
+      "Not for casual questions — this costs real money per second. Use the free `analyse` tool (single Stockfish, 2s) or `get_position_stats` for anything that doesn't require deep prep.",
     inputSchema: {
       type: "object",
       properties: {
@@ -336,6 +362,13 @@ const TOOLS: Tool[] = [
           minimum: 1,
           maximum: 10,
           description: "Number of candidate lines per engine (default 3).",
+        },
+        contempt: {
+          type: "integer",
+          minimum: -100,
+          maximum: 100,
+          description:
+            "Lc0 contempt bias. 0 = objective (default). Positive favours White, negative favours Black; stay within -20..+20 in practice. Not applied to Stockfish. See engine_usage_primer prompt for when to use.",
         },
       },
       required: ["fen"],
@@ -438,6 +471,7 @@ async function callTool(name: string, args: Args): Promise<unknown> {
       const body: Record<string, unknown> = { fen: String(args.fen) };
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") body.multipv = args.multipv;
+      if (typeof args.contempt === "number") body.contempt = args.contempt;
       return authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
     }
 
@@ -534,6 +568,12 @@ const PROMPTS: Prompt[] = [
       { name: "player_b", description: "Second player (name or FIDE ID)", required: true },
     ],
   },
+  {
+    name: "engine_usage_primer",
+    description:
+      "Full guide on how to use the chess.ceo cloud engines — Stockfish vs Lc0 tradeoffs, when to trust which, how to read disagreements, and how to use Lc0 contempt to find practical ideas. Read before running expensive cloud_analyse calls or when the user asks WHY the engines gave certain scores.",
+    arguments: [],
+  },
 ];
 
 // The workflow text for prepare_for_game. Kept in one place so both the
@@ -614,6 +654,9 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
 5. Deliver: current strength, characteristic openings, one-sentence style read, biggest wins, biggest losses / recurring weakness. Cite the numbers.`;
       break;
     }
+    case "engine_usage_primer":
+      text = ENGINE_USAGE_DOC;
+      break;
     case "head_to_head_briefing": {
       const a = promptArgs.player_a ?? "player A";
       const b = promptArgs.player_b ?? "player B";
