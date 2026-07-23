@@ -528,7 +528,8 @@ const TOOLS: Tool[] = [
       "Save (replace) a prep file's PGN content. Optimistic-lock via `expected_version` — pass the `version` you got from read_prep_file. If someone else (user in the app, or another agent session) updated the file since you read it, save returns 409 with the current version — re-read and merge.\n\n" +
       "How to write PGN (structure, variations, NAGs, arrows, coloured squares, common pitfalls) is covered by read_pgn_authoring_guide — call it before your first save this session. Bare minimum you should NOT get wrong:\n" +
       "- Variations are MOVES in parentheses, not sentences describing moves. Wrong: '{if 7...Be6 then 8.f3 Nbd7}'. Right: '7...Be6 (7...h5 8.Nd5)'.\n" +
-      "- Plans, prep-signal, and citations go in {curly-brace comments}. Cite tool output; don't invent chess prose.",
+      "- Engine evals go into NAG GLYPHS, not into prose. |eval|<0.25 → $10 (=), <0.6 → $14/$15 (⩲/⩱), <1.3 → $16/$17 (±/∓), ≥1.3 → $18/$19 (+−/−+). Don't paste raw numbers like 'SF: +0.15' — the glyph is enough. Don't name the engine unless it adds signal.\n" +
+      "- Prose is for what the glyph CAN'T say: practical difficulty asymmetry, long-term factors, disagreement worth flagging, plans. If prose duplicates the glyph, delete it.",
     inputSchema: {
       type: "object",
       properties: {

@@ -87,6 +87,50 @@ Attach the NAG to the move it applies to:
 15. exd5 $44 {Black has piece activity + two bishops for the pawn.}
 ```
 
+### Eval → NAG thresholds
+
+**Use the glyphs to carry engine evaluations. Do not paste raw numbers into prose.** Convert the numeric eval to the correct NAG once, put the NAG on the move, done.
+
+| Engine eval (White POV) | NAG (White ahead)       | NAG (Black ahead)       |
+|-------------------------|-------------------------|-------------------------|
+| `\|eval\| < 0.25`         | `$10` (=)               | `$10` (=)               |
+| `0.25 ≤ \|eval\| < 0.6`   | `$14` (⩲)               | `$15` (⩱)               |
+| `0.6 ≤ \|eval\| < 1.3`    | `$16` (±)               | `$17` (∓)               |
+| `\|eval\| ≥ 1.3`          | `$18` (+−)              | `$19` (−+)              |
+| Sharp, hard to evaluate | `$13` (∞)               | `$13` (∞)               |
+
+**Don't name the engine unless it adds signal.** "SF says +0.15" as raw prose is noise — the glyph is what the reader wants. Same for "human predictor says 42% win" — bake it into the comment only when the reader needs the *why*, not the number itself.
+
+### When prose ADDS to the glyph
+
+Prose is worth writing when the glyph *understates* something the human should know:
+
+Good (glyph = equal, but there's a practical wrinkle):
+```
+15... Rc8 = {Lc0 still gives Black a small pull — dark-square control is
+long-term, engine horizon can't quite reach it.}
+```
+```
+12. Nd4 = {Objectively equal, but Black must remember 8 precise moves to
+hold; White plays this side blindfolded.}
+```
+
+Good (glyph tells the truth, prose flags a mismatch worth noting):
+```
+9... h6 $14 {Human predictor: 47% win at 2200 vs 2600 — the Elo gap does
+the practical work despite the objective edge being small.}
+```
+
+Bad (prose duplicates the glyph, adds nothing):
+```
+9... h6 $14 {Stockfish gives +0.35 for White here.}
+```
+```
+15. exd5 $16 {SF: +0.9. Lc0: +0.85. Both engines agree White is clearly better.}
+```
+
+**Rule of thumb**: if the reader could derive your prose from the glyph, don't write it. Write only what the glyph can't say — the practical layer, the surprise, the disagreement worth flagging, the plan.
+
 ## Visual annotations (arrows, coloured squares)
 
 The chess.ceo app renders arrows and highlighted squares directly on the board. Use the ChessBase / Lichess convention inside a move's `{...}` comment.
