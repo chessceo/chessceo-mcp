@@ -46,6 +46,7 @@ function loadBundledDoc(filename: string, fallbackLabel: string): string {
 const ENGINE_USAGE_DOC = loadBundledDoc("engine-usage.md", "Engine usage guide");
 const PREP_STRATEGY_DOC = loadBundledDoc("prep-strategy.md", "Prep strategy guide");
 const PREP_FILES_DOC = loadBundledDoc("prep-files-guide.md", "Prep files guide");
+const PGN_AUTHORING_DOC = loadBundledDoc("pgn-authoring.md", "PGN authoring guide");
 
 // ── HTTP ────────────────────────────────────────────────────────────
 //
@@ -525,14 +526,9 @@ const TOOLS: Tool[] = [
     name: "save_prep_file",
     description:
       "Save (replace) a prep file's PGN content. Optimistic-lock via `expected_version` — pass the `version` you got from read_prep_file. If someone else (user in the app, or another agent session) updated the file since you read it, save returns 409 with the current version — re-read and merge.\n\n" +
-      "PGN structure guidance (call read_prep_files_guide for the full doc — this is just the essentials):\n" +
-      "- Mainline = your top recommendation. Alternative candidates go in parenthesised variations at the branching move.\n" +
-      "- CRITICAL: variations are MOVES, not prose. Wrong: '{if 7...Be6 then 8.f3 Nbd7 9.Qd2}'. Right: '7...Be6 (7...h5 8.Nd5) 8.f3 Nbd7'.\n" +
-      "- Plans, prep-signal, and interpretation CAN go in {curly-brace comments}. Cite actual tool output ('Lc0 gives +0.15') — don't invent chess prose.\n" +
-      "- NAGs (right after the SAN): $1 !, $2 ?, $3 !!, $4 ??, $5 !?, $6 ?!, $13 ∞ (unclear), $14 ⩲ (White slightly better), $15 ⩱, $16 ±, $17 ∓, $18 +−, $19 −+, $36 ↑ (initiative), $40 → (attack), $44 =/∞ (compensation), $132 ⇆ (counterplay), $140 ∆ (with the idea), $146 N (novelty).\n" +
-      "- Arrows in comments: [%cal Gd2d4,Rf3g5] — colours G/R/Y/C/B/O. Keep light: 1-3 arrows per move, not twenty.\n" +
-      "- Highlighted squares: [%csl Rf7,Ge5] — same colour codes.\n" +
-      "Example move with everything: `10. O-O $5 {Aiming for f4-f5. [%cal Gf2f4,Gc1h6] [%csl Gg6]}`",
+      "How to write PGN (structure, variations, NAGs, arrows, coloured squares, common pitfalls) is covered by read_pgn_authoring_guide — call it before your first save this session. Bare minimum you should NOT get wrong:\n" +
+      "- Variations are MOVES in parentheses, not sentences describing moves. Wrong: '{if 7...Be6 then 8.f3 Nbd7}'. Right: '7...Be6 (7...h5 8.Nd5)'.\n" +
+      "- Plans, prep-signal, and citations go in {curly-brace comments}. Cite tool output; don't invent chess prose.",
     inputSchema: {
       type: "object",
       properties: {
@@ -573,7 +569,13 @@ const TOOLS: Tool[] = [
   {
     name: "read_prep_files_guide",
     description:
-      "Returns the full guide on how to store prep in the user's chess.ceo account via list_prep_files / read_prep_file / create_prep_file / save_prep_file / delete_prep_file. Covers: how to structure a repertoire PGN (mainline + variations + comments + NAGs), the critical 'search-before-create' habit to avoid duplicates, optimistic-locking with `version`, and how to write comments that cite tool output instead of inventing chess prose. Call this ONCE per session before your first create_prep_file / save_prep_file call.",
+      "Returns the guide to the prep-files FEATURE — how the storage works, when to list vs search vs create, optimistic locking with `version`, and naming conventions for the [Event] tag. Call this ONCE per session before your first create_prep_file. For how to actually WRITE PGN (mainline, variations, NAGs, arrows, comments) call read_pgn_authoring_guide instead — separate concern.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "read_pgn_authoring_guide",
+    description:
+      "Returns the guide on how to write correct, useful PGN — mainline discipline, variations as moves (never prose describing moves), NAG symbols including novelty ($146), unclear ($13), compensation ($44) and the standard set, ChessBase arrow/coloured-square syntax ([%cal] / [%csl]), and common pitfalls the parser will reject. Call this ONCE per session before any save_prep_file call, or any time you're producing PGN output for the user.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -947,6 +949,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "read_prep_files_guide":
       return { guide: PREP_FILES_DOC };
+
+    case "read_pgn_authoring_guide":
+      return { guide: PGN_AUTHORING_DOC };
 
     case "prep_snapshot": {
       const me = Number(args.fide_id_me);

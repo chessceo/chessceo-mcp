@@ -25,131 +25,18 @@ Six tools:
 
 Duplicate files are the #1 way to lose your user's trust in this system.
 
-## PGN structure
+## PGN authoring — separate concern
 
-Real chess prep files are PGN with parenthesised variations. Learn the shape:
+Everything about **how to write good PGN** (structure, NAGs, arrows, coloured squares, variation discipline, common pitfalls) lives in `pgn-authoring.md` — call `read_pgn_authoring_guide` for the full doc. That guide is universal to any chess file you might write; this guide is about the prep-files *feature* on top.
 
-```pgn
-[Event "Prep vs Firouzja (Black) — 2026-07-23"]
-[White "Firouzja, Alireza"]
-[Black "Van Foreest, Jorden"]
-[Date "2026.07.23"]
+Minimum you should know before calling `save_prep_file`:
 
-1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 5. Nc3 a6 6. Be3 e5 7. Nb3
-{Main line. Firouzja plays this in 68% of his English Attacks (32 games, 2023-2025).}
-7... Be6 8. f3
-(8. Qd2 Nbd7 9. f3 h5 {Sideline he tried once and lost — probably patched.})
-8... Nbd7 9. Qd2 h5
-{Critical position for us. Lc0 at multipv=3 gives:
- - h5: +0.12 (main line, active)
- - Be7: +0.08 (calm, more classical)
- - Rc8: 0.00 (Stockfish preferred)}
+- Mainline = your top recommendation. Alternative candidates go in parenthesised variations at the branching move.
+- **Variations are MOVES**, not prose describing moves. `7...Be6 (7...h5 8.Nd5)` — never `{if Black plays h5 White responds with Nd5}`.
+- **Plans, prep-signal, and interpretation** go in `{curly-brace comments}`. Cite tool output; don't invent chess prose.
+- `Event` tag is the file's user-facing name.
 
-*
-```
-
-The pieces:
-
-- **PGN tag pairs at the top** (`[Key "Value"]`) — `Event` is the name you show the user. `White` / `Black` set the game headers. `Date` is standard.
-- **Mainline** = your top recommendation. Numbered SAN moves separated by whitespace.
-- **Variations** in parentheses `(...)` at the branching move. Nesting is allowed but be conservative — three deep is a lot.
-- **Comments** in curly braces `{...}` between moves. This is where you cite tool output:
-  - `{Lc0 says +0.15 in this line vs 0.00 for the alternative}`
-  - `{Firouzja plays this in 32/47 games with Black. Scores 41%.}`
-  - `{Stockfish sees h4 as a tactical shot; Lc0 disagrees. Deep look needed.}`
-- **NAG glyphs** for evaluations at a move — see the table below. Placed right after the SAN: `7. Nb3 $1`.
-- **Visual annotations** (arrows, coloured squares) — see the "Visual annotations" section below. Live inside the same `{...}` comment as any text.
-- **Result marker** at the end: `*` for unfinished (prep files are always unfinished), `1-0`, `0-1`, `1/2-1/2`.
-
-## Move-judgment symbols (NAGs)
-
-Standard PGN NAG codes render as the usual chess symbols in the chess.ceo app. Use them freely — one or two per key move is normal, no need to annotate every move.
-
-| NAG   | Symbol  | Meaning                                                        |
-|-------|---------|----------------------------------------------------------------|
-| `$1`  | `!`     | Good move                                                      |
-| `$2`  | `?`     | Mistake                                                        |
-| `$3`  | `!!`    | Brilliant move                                                 |
-| `$4`  | `??`    | Blunder                                                        |
-| `$5`  | `!?`    | Interesting / speculative                                      |
-| `$6`  | `?!`    | Dubious                                                        |
-| `$10` | `=`     | Equal position                                                 |
-| `$13` | `∞`     | **Unclear** — position genuinely hard to evaluate              |
-| `$14` | `⩲`     | White slightly better                                          |
-| `$15` | `⩱`     | Black slightly better                                          |
-| `$16` | `±`     | White clearly better                                           |
-| `$17` | `∓`     | Black clearly better                                           |
-| `$18` | `+−`    | Winning for White                                              |
-| `$19` | `−+`    | Winning for Black                                              |
-| `$36` | `↑`     | With initiative                                                |
-| `$40` | `→`     | With attack                                                    |
-| `$44` | `=/∞`   | **Compensation** for the material (usually Black side)         |
-| `$132`| `⇆`     | With counterplay                                               |
-| `$140`| `∆`     | With the idea …                                                |
-| `$146`| `N`     | **Novelty** — this move has not been played before at this level |
-
-Attach the NAG to the move it comments on:
-```
-14. Nd5 $5 {Speculative — the concrete lines are messy but Black must know several defences.}
-14... Nxd5 $146 {New. Previous games saw 14...exd5 15. Nxd5 with an edge for White.}
-15. exd5 $44 {Black has piece activity and the two bishops as compensation.}
-```
-
-## Visual annotations (arrows and coloured squares)
-
-The chess.ceo app renders arrows and highlighted squares directly on the board. Add them via ChessBase / Lichess convention inside the move's `{...}` comment:
-
-- **Arrows:** `[%cal <colour><from><to>,<colour><from><to>,...]` — e.g. `[%cal Gd2d4,Rf3g5]` draws a green arrow d2→d4 and a red arrow f3→g5.
-- **Coloured squares:** `[%csl <colour><square>,...]` — e.g. `[%csl Rf7,Ge5]` shades f7 red and e5 green.
-
-**Colour codes** (single letters):
-
-| Code | Colour     | Typical use                                    |
-|------|------------|------------------------------------------------|
-| `G`  | Green      | Good move / plan / key square for you          |
-| `R`  | Red        | Threat / opponent's target / danger square     |
-| `Y`  | Yellow     | Worth-noting / candidate                       |
-| `C`  | Light blue | Neutral pointer / diagram note                 |
-| `B`  | Dark blue  | Alternative / secondary idea                   |
-| `O`  | Orange     | Attention / warning                            |
-
-Example combining a plan comment with arrows and a square:
-```
-10. O-O {Plan: aim for f4-f5, exchange the dark-square bishop, then attack g6.
-[%cal Gf2f4,Gc1h6,Yh2h4] [%csl Gg6,Rh6]}
-```
-
-**Discipline — this matters:**
-
-- **Keep annotations light.** A move should have 1-3 arrows and maybe 2-3 highlighted squares, tops. Twenty arrows is noise, not signal — pick the most important ones.
-- **Highlights are labels, not decoration.** Every coloured square should mean something specific to the plan you're writing about. Don't paint the board rainbow.
-- **Arrows show intent, not calculation.** A green arrow d2→d4 says "the plan is to push d4," not "then Nf3, then Bg5, then..." — for concrete sequences use variations (see below).
-
-## Variations vs text: the biggest discipline point
-
-**Variations belong in parentheses as moves, not in prose comments.**
-
-Wrong:
-```
-7. Nb3 {If Black plays Be6 White continues with 8. f3 and after Nbd7 9. Qd2
-h5, White should play g4 to blunt the kingside attack.}
-```
-
-Right:
-```
-7. Nb3 Be6 (7... h5 {Aggressive — but concedes tempo.} 8. Nd5 $14)
-8. f3 Nbd7 9. Qd2 h5 10. g4 {Blunting the h5-pawn's support before ...h4.}
-```
-
-Why: the app is a *chess app*. Users navigate PGN by clicking through moves on a board. If you bury the moves in prose, the user can't step through them, the engine can't analyse them, and the app can't check they're legal. Variations as move sequences are first-class citizens; prose paraphrases of variations are noise the app can't work with.
-
-**Plans belong in text.** These are fine:
-
-- `{Long-term plan: exchange dark-square bishops, then break with f5.}`
-- `{Practical note: Firouzja spent 8 min here vs Anand — probably out of prep.}`
-- `{Structural summary: IQP position, Black's plan is …Nb4 to trade the c3-knight.}`
-
-The rule: **if it can be encoded as moves, encode it as moves.** Only use prose for context, plans, prep-signal ("opponent lost 3 games here"), and interpretation the app can't derive.
+Full details, NAG table, arrow/highlight syntax, and worked example: `read_pgn_authoring_guide`.
 
 ## Editing without breaking the tree
 
