@@ -291,6 +291,52 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "predict_human_move",
+    description:
+      "Predicts what a HUMAN of the given rating will most likely play from a position. Rating-conditioned neural net (ResNet-20x256) — you get the top-N most likely moves with their probabilities and a WDL value head (White POV).\n\n" +
+      "This is a completely different question from the engine tools (analyse / cloud_analyse):\n" +
+      "• Engines answer: 'what is objectively best?'\n" +
+      "• predict_human_move answers: 'what will my 2200-rated opponent actually play here?'\n\n" +
+      "Prime use cases in prep:\n" +
+      "• After you've found what the opponent SHOULD do (with the engine), check what they'll ACTUALLY do at their rating. If the top human move is a mistake, you have a real practical advantage.\n" +
+      "• The WDL head is rating-aware — a 400-point gap will show up as a big win probability even in equal positions (the model has learned that human errors compound).\n" +
+      "• Pass `prev_fen` (most recent first) when analysing mid-trade positions — without history the model treats the position as quiet.\n\n" +
+      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. Free (~1-2s per call).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fen: { type: "string", description: "Starting position as FEN." },
+        moves: {
+          type: "string",
+          description: "Optional SAN moves to apply on top of `fen` (or startpos).",
+        },
+        white_elo: {
+          type: "integer",
+          minimum: 100,
+          maximum: 3400,
+          description: "White's rating (default 2400).",
+        },
+        black_elo: {
+          type: "integer",
+          minimum: 100,
+          maximum: 3400,
+          description: "Black's rating (default 2400).",
+        },
+        top: {
+          type: "integer",
+          minimum: 1,
+          maximum: 20,
+          description: "Number of top predicted moves to return (default 5).",
+        },
+        prev_fens: {
+          type: "array",
+          items: { type: "string" },
+          description: "Previous FEN(s), most recent first. Optional — omit for quiet-position analysis. Useful mid-trade so the model doesn't assume the position is stable.",
+        },
+      },
+    },
+  },
+  {
     name: "get_head_to_head",
     description:
       "Complete head-to-head record between two players. Includes overall and per-colour W/D/L (from player A's perspective), splits by time control, most-played openings between them, first / last meeting, average game length, and the game list.",
@@ -795,6 +841,29 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       if (typeof args.multipv === "number") params.multipv = args.multipv;
       const raw = await get("/api/chess/database/analyse", params);
       return convertAnalyseResponse(raw, fen);
+    }
+
+    case "predict_human_move": {
+      const fen = resolveFenFromArgs(args);
+      const params: Record<string, string | number | undefined> = { fen };
+      if (typeof args.white_elo === "number") params.white_elo = args.white_elo;
+      if (typeof args.black_elo === "number") params.black_elo = args.black_elo;
+      if (typeof args.top === "number") params.top = args.top;
+      // prev_fens is an array; the backend accepts repeated prev_fen params.
+      const raw = Array.isArray(args.prev_fens)
+        ? (args.prev_fens as unknown[]).filter(x => typeof x === "string")
+        : [];
+      const url = new URL("/api/chess/database/predict-move", BASE);
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
+      }
+      for (const p of raw) url.searchParams.append("prev_fen", String(p));
+      const res = await fetch(url, { headers: { "User-Agent": UA, "Accept": "application/json" } });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`chess.ceo ${res.status}: ${body.slice(0, 500)}`);
+      }
+      return res.json();
     }
 
     case "get_head_to_head":
