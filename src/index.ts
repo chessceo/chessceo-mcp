@@ -189,7 +189,7 @@ const TOOLS: Tool[] = [
       "• Recency > career. The last 12-24 months dominate. This endpoint's compact/LLM view deliberately omits per-move `hotness` — at the individual level it's trailing noise. The general DB endpoint keeps it (there it's fashion signal).\n" +
       "• Opponent will deviate early. Prep is a tree, not a line — cover the 2 most likely replies at each real branching point, not one 20-move line.\n" +
       "• Surprise is a scalpel. Don't tell a lifelong 1.e4 player to switch to 1.d4 — meta-signal screams prep. Rare secondary lines within the user's existing repertoire (e.g. 6.Bc4 instead of usual 6.Bg5 vs the Najdorf) are where surprise is real.\n\n" +
-      "For the full guide use the `prep_strategy_primer` prompt.",
+      "For the full guide call the `read_prep_strategy_guide` tool.",
     inputSchema: {
       type: "object",
       properties: {
@@ -355,7 +355,7 @@ const TOOLS: Tool[] = [
       "• Lc0 is practical eval — trust it for 'which side is easier?' 'which candidate is best when Stockfish shows several as equal?' Lc0 sees long-term positional factors Stockfish's fixed search can miss.\n" +
       "• When they agree → high confidence. When they disagree → look at both scores and reason WHY (Stockfish sharply higher = tactic Lc0 missed; Lc0 higher = long-term positional edge past Stockfish's horizon). Never dismiss either — the disagreement is the signal.\n\n" +
       "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Practical range -20..+20. Use it to find non-objective 'practical' ideas or when the user needs to steer toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
-      "For the full guide including worked examples, use the `engine_usage_primer` prompt.\n\n" +
+      "For the full guide including worked examples, call the `read_engine_usage_guide` tool.\n\n" +
       "Not for casual questions — this costs real money per second. Use the free `analyse` tool (single Stockfish, 2s) or `get_position_stats` for anything that doesn't require deep prep.",
     inputSchema: {
       type: "object",
@@ -383,6 +383,18 @@ const TOOLS: Tool[] = [
       },
       required: ["fen"],
     },
+  },
+  {
+    name: "read_engine_usage_guide",
+    description:
+      "Returns the full chess.ceo engine-usage guide: when to trust Stockfish (objective truth) vs Lc0 (practical eval), how to read disagreements between them, and how to use Lc0 contempt to find non-objective 'practical' ideas. Call this ONCE per session before running expensive `cloud_analyse` calls or when the user asks WHY the engines gave certain scores. Same content is also available as the `engine_usage_primer` prompt (for clients that surface prompts as slash commands), but many clients do not expose prompts to the model — this tool works everywhere.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "read_prep_strategy_guide",
+    description:
+      "Returns the full chess.ceo prep-strategy guide: why win% is one weight not a verdict, why prep is a two-player game with symmetric information (opponent sees your history too), how sample size and recency change the reading, when 'revealed weaknesses' are actionable vs already patched, how to use move-order tricks with the `trs` field, and how to calibrate surprise (rare secondary lines inside the existing repertoire, not big first-move switches). Call this ONCE per session before recommending an opening plan, especially when the user is preparing for a specific real opponent.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "prep_snapshot",
@@ -484,6 +496,12 @@ async function callTool(name: string, args: Args): Promise<unknown> {
       if (typeof args.contempt === "number") body.contempt = args.contempt;
       return authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
     }
+
+    case "read_engine_usage_guide":
+      return { guide: ENGINE_USAGE_DOC };
+
+    case "read_prep_strategy_guide":
+      return { guide: PREP_STRATEGY_DOC };
 
     case "prep_snapshot": {
       const me = Number(args.fide_id_me);
