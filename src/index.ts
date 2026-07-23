@@ -521,6 +521,45 @@ type EngineBlock = {
   bestMove?: string;
 };
 
+// Rewrite availableMoves[].move UCI → SAN. The prep + position-stats
+// endpoints return moves in UCI on the wire — same LLM-readability
+// concern as engine PVs, and the same wrapper-only fix. Passes the
+// response through unchanged if there's no availableMoves array.
+function convertAvailableMovesToSAN(raw: unknown, fen: string): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const r = raw as { availableMoves?: Array<{ move?: string }> };
+  if (!Array.isArray(r.availableMoves)) return raw;
+  for (const m of r.availableMoves) {
+    if (typeof m.move === "string" && m.move.length >= 4) {
+      m.move = uciMoveToSAN(fen, m.move);
+    }
+  }
+  return raw;
+}
+
+// Resolve a starting FEN from either the `fen` or `line` argument the tool
+// received. Same logic prep_snapshot already had inline — extracted so we
+// can reuse it wherever we need to walk a SAN line to a concrete FEN
+// (e.g. for UCI→SAN conversion of availableMoves).
+function resolveFenFromArgs(args: Args): string {
+  const fenArg = typeof args.fen === "string" ? args.fen.trim() : "";
+  if (fenArg) return fenArg;
+  const lineArg = typeof args.line === "string" ? args.line.trim() : "";
+  const board = new Chess();
+  if (lineArg) {
+    for (const raw of lineArg.split(/\s+/)) {
+      const san = raw.replace(/^\d+\.+/, "");
+      if (!san) continue;
+      try {
+        board.move(san);
+      } catch {
+        throw new Error(`bad SAN token '${raw}' in line`);
+      }
+    }
+  }
+  return board.fen();
+}
+
 function stringifyForLog(v: unknown): string {
   let s: string;
   try {
@@ -568,15 +607,19 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       if (typeof args.fen === "string" && args.fen.length > 0) params.fen = args.fen;
       if (typeof args.limit === "number") params.limit = args.limit;
       if (typeof args.offset === "number") params.offset = args.offset;
-      return get("/api/chess/prep/by-player", params);
+      const raw = await get("/api/chess/prep/by-player", params);
+      return convertAvailableMovesToSAN(raw, resolveFenFromArgs(args));
     }
 
-    case "get_position_stats":
-      return get("/api/chess/database/main", {
-        fen: String(args.fen),
+    case "get_position_stats": {
+      const fen = String(args.fen);
+      const raw = await get("/api/chess/database/main", {
+        fen,
         limit: typeof args.limit === "number" ? args.limit : 20,
         sort: "relevance",
       });
+      return convertAvailableMovesToSAN(raw, fen);
+    }
 
     case "analyse": {
       const fen = String(args.fen);
@@ -679,9 +722,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
       return {
         position: { line, fen, my_color: myColor },
-        opponent,
-        you,
-        general,
+        opponent: convertAvailableMovesToSAN(opponent, fen),
+        you: convertAvailableMovesToSAN(you, fen),
+        general: convertAvailableMovesToSAN(general, fen),
       };
     }
 
