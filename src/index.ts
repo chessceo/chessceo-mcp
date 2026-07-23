@@ -309,16 +309,24 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "list_cloud_machine_options",
+    description:
+      "Returns the catalog of combo cloud-engine machine types the user can start (SKU, human display name, cost per hour, availability). ALWAYS call this before start_cloud_engine — SKU strings like 'rtx-5090-64' do not match the display names ('Stockfish 32 CPUs + Lc0 1× RTX 5090') and are NOT guessable. Present the user the display names + prices; pass the SKU to start_cloud_engine.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "start_cloud_engine",
     description:
-      "Rent a combo GPU instance (Stockfish + Lc0 in the same container) on the user's chess.ceo account. Real money — billed per second while running. Requires an MCP token with agent access. Use `list_cloud_engines` first to see if the user already has one running; don't start a second combo unless the user asked for it.",
+      "Rent a combo GPU instance (Stockfish + Lc0 in the same container) on the user's chess.ceo account. Real money — billed per second while running.\n\n" +
+      "CRITICAL: `machine_type` must be an exact SKU from `list_cloud_machine_options` (e.g. 'rtx-5090-64', NOT 'rtx-5090'). Guessing SKUs will fail. Call list_cloud_machine_options first, show the user the display names + prices, get their confirmation, then pass the SKU here.\n\n" +
+      "Use list_cloud_engines first to check if the user already has one running; don't start a second combo unless the user asked for it. Requires an MCP token with agent access.",
     inputSchema: {
       type: "object",
       properties: {
         machine_type: {
           type: "string",
           description:
-            "SKU picked from the user's cloud-engine options (e.g. 'rtx-5090', 'rtx-5090-dual'). Ask the user if you don't already know which one they want.",
+            "SKU from list_cloud_machine_options (e.g. 'rtx-5090-64', 'rtx-5090-dual-64'). MUST be the exact SKU, not the display name and not a guess.",
         },
       },
       required: ["machine_type"],
@@ -477,6 +485,9 @@ async function callTool(name: string, args: Args): Promise<unknown> {
     case "list_player_live_tournaments":
       // Note: snake_case fide_id, unlike the prep endpoints. Documented quirk.
       return get("/api/chess/live/player", { fide_id: Number(args.fide_id) });
+
+    case "list_cloud_machine_options":
+      return authedRequest("GET", "/api/agent/cloud-engines/options");
 
     case "start_cloud_engine":
       return authedRequest("POST", "/api/agent/cloud-engines", {
