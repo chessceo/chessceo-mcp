@@ -1,61 +1,65 @@
 # PGN authoring guide
 
-How to write a chess PGN that renders correctly and doesn't waste tokens or the user's time. Applies to any file you write through `save_prep_file` (or any tool that produces PGN).
+You author prep files by mutating a tree, not by writing PGN text. The MCP layer holds a parser+exporter (chessops-backed) so every mutation call load-mutates-saves atomically — you only ever address nodes, never raw text. No paren-counting, no move-numbering, no SAN typos surviving your edit.
 
-## The shape of a PGN
+## Path addressing
 
-```pgn
-[Event "..."]
-[White "..."]
-[Black "..."]
-[Date "YYYY.MM.DD"]
+Nodes are addressed by **path**: an array of child indices from the root.
 
-1. e4 c5 2. Nf3 d6 (2... e6 3. d4) 3. d4 cxd4 4. Nxd4 Nf6
+- `[]` — the root position (empty board state, before any move).
+- `[0]` — the first mainline move (root's first child).
+- `[0, 0]` — the second ply on the mainline.
+- `[0, 1]` — a variation branching after the first move (sibling of `[0, 0]`).
+- `[0, 0, 0, 1]` — a variation branching at the third ply.
 
-*
-```
+`children[0]` is always the mainline; `children[1..N]` are alternative variations in declaration order. `promote_variation` swaps this order.
 
-Pieces:
+## Workflow
 
-- **Tag pairs** at the top: `[Key "Value"]`, one per line. Standard tags: `Event`, `Site`, `Date` (`YYYY.MM.DD`), `Round`, `White`, `Black`, `Result`. For prep, `Event` is the file's user-facing name — pick this carefully.
-- **Movetext**: numbered SAN moves. Full move number before White's move (`1.`), and again with `...` before Black's move only when Black's move follows a comment or a variation (`{...}` `1... e5`).
-- **Variations** in `( ... )` at the branching move. Nesting allowed.
-- **Comments** in `{ ... }`. Attach after the move they discuss.
-- **NAGs** as `$N` right after the SAN.
-- **Result marker** at the end: `*` for unfinished (prep files always), `1-0`, `0-1`, `1/2-1/2`.
+The mutation tool set is:
 
-## Variations belong in parentheses, not prose
+- `read_prep_file(id)` → returns `{version, tags, tree}`. Every node in `tree` has `san`, `fen`, `ply`, optional `comment`, `nags`, `annotations`, and `children`.
+- `add_move(id, path, san)` — appends a new child of `path`. If `path` already has children, the new node becomes a variation. Returns the effective path of the new node.
+- `set_comment(id, path, comment)` — replace comment. Empty string clears.
+- `set_nags(id, path, nags)` — replace NAG list. Empty array clears.
+- `set_annotations(id, path, {arrows, highlights})` — replace visual annotations. Empty arrays clear.
+- `delete_subtree(id, path)` — remove node + descendants. Refuses to delete the root.
+- `promote_variation(id, path)` — make the node at `path` its parent's mainline.
+- `set_tag(id, key, value)` — set/clear a game-level tag.
 
-**This is the single biggest discipline point.** LLMs love to write "if Black plays Be6 White continues with 8. f3 and after Nbd7 9. Qd2 h5 White plays g4." That is prose *describing* moves — worse than useless: the app cannot step through it on a board, the engine cannot analyse it, the user cannot click.
+Every mutation **auto-saves** with optimistic locking. Response is `{ok: true, path, version}`. Pass the returned `version` as `expected_version` on your next mutation to catch concurrent edits.
 
-Wrong:
-```
-7. Nb3 {If Black plays Be6 White continues with 8. f3 and after Nbd7
-9. Qd2 h5, White should play g4 to blunt the kingside attack.}
-```
+## Typical build order
 
-Right:
-```
-7. Nb3 Be6 (7... h5 {Aggressive but concedes tempo.} 8. Nd5 $14)
-8. f3 Nbd7 9. Qd2 h5 10. g4 {Blunting the h5-pawn's support.}
-```
+1. `read_prep_file` — see what's there.
+2. `add_move` to extend the mainline: `add_move(id, [], "e4")` then `add_move(id, [0], "c5")` etc.
+3. `add_move` for a variation at some node: `add_move(id, [0, 0], "Nc3")` adds Nc3 as a sibling of the current mainline's move 2.
+4. `set_comment` for plans / prep-signal, `set_nags` for evaluations, `set_annotations` for arrows and squares — always on the node the annotation belongs to.
+5. `promote_variation` if a variation is more important than the current mainline.
+6. `delete_subtree` to prune.
 
-**The rule: if it can be encoded as moves, encode it as moves.**
+Every step returns the new `version`; carry it forward.
 
-What IS fine in prose:
+## Variations vs prose
+
+**Variations are moves, not sentences.** This was the biggest failure mode of raw-PGN authoring — LLMs writing "if Black plays Be6 White responds with f3" as prose. In the tree model there's no such temptation: variations are `add_move` calls at the branching node.
+
+Prose comments are for what MOVES cannot say:
+
 - **Plans**: `{Plan: exchange dark-square bishops, then break with f5.}`
 - **Prep-signal**: `{Firouzja plays this in 32 games since 2023, scores 41%.}`
-- **Interpretation the app can't derive**: `{IQP structure. Black's plan is …Nb4 to trade the c3-knight.}`
-- **Engine citations**: `{Lc0 +0.15 here; Stockfish sees 0.00 — probably a long-term factor.}`
+- **Interpretation the app can't derive**: `{IQP structure; Black's plan is …Nb4.}`
+- **Practical layer beyond the objective eval**: `{Objectively equal, but Black must remember 8 precise moves; White plays this blindfolded.}`
 
-What is NEVER fine in prose:
-- Move sequences ("then Nf3, then Bg5, ...")
-- Move recommendations ("here White should play h4")
-- Anything that would render as a legal move on the board
+Prose is NEVER for:
+
+- Move sequences ("then Nf3, then Bg5, ...") — use variations.
+- Move recommendations ("here White should play h4") — add_move it.
+- Restating the eval a NAG already conveys.
 
 ## Move-judgment symbols (NAGs)
 
-PGN NAG codes render as the standard chess symbols in the chess.ceo app. One or two per key move is normal — don't annotate every move.
+NAGs are the compact way to attach an evaluation to a move. Pass as `$N` strings to `set_nags`.
 
 | NAG   | Symbol  | Meaning                                                        |
 |-------|---------|----------------------------------------------------------------|
@@ -80,16 +84,9 @@ PGN NAG codes render as the standard chess symbols in the chess.ceo app. One or 
 | `$140`| `∆`     | With the idea …                                                |
 | `$146`| `N`     | **Novelty** — this move has not been played before at this level |
 
-Attach the NAG to the move it applies to:
-```
-14. Nd5 $5 {Speculative — concrete lines are messy but Black must know them.}
-14... Nxd5 $146 {New. Previous games saw 14...exd5 15. Nxd5 with an edge.}
-15. exd5 $44 {Black has piece activity + two bishops for the pawn.}
-```
+### Eval → NAG thresholds (the rule)
 
-### Eval → NAG thresholds
-
-**Use the glyphs to carry engine evaluations. Do not paste raw numbers into prose.** Convert the numeric eval to the correct NAG once, put the NAG on the move, done.
+Engine numbers go into the NAG, not into prose. Convert the eval to the correct NAG once and be done.
 
 | Engine eval (White POV) | NAG (White ahead)       | NAG (Black ahead)       |
 |-------------------------|-------------------------|-------------------------|
@@ -99,79 +96,68 @@ Attach the NAG to the move it applies to:
 | `\|eval\| ≥ 1.3`          | `$18` (+−)              | `$19` (−+)              |
 | Sharp, hard to evaluate | `$13` (∞)               | `$13` (∞)               |
 
-**Don't name the engine unless it adds signal.** "SF says +0.15" as raw prose is noise — the glyph is what the reader wants. Same for "human predictor says 42% win" — bake it into the comment only when the reader needs the *why*, not the number itself.
+**Don't paste raw engine numbers into comments.** `{Stockfish gives +0.35}` is noise — `$14` is the signal. Same for `{Lc0 says +0.15}`.
 
-### When prose ADDS to the glyph
+**Don't name the engine unless it adds signal.** Naming Stockfish adds nothing to a `$14` on a routine position. Naming it makes sense when there's a mismatch worth flagging: `$14 {Human predictor gives 47% win at 2200 vs 2600 — the Elo gap does the practical work.}`
 
-Prose is worth writing when the glyph *understates* something the human should know:
+### When prose ADDS to the NAG
 
-Good (glyph = equal, but there's a practical wrinkle):
+Prose is worth writing when the NAG *understates* something the human should know:
+
+Good (NAG says equal, prose adds the practical wrinkle):
 ```
-15... Rc8 = {Lc0 still gives Black a small pull — dark-square control is
-long-term, engine horizon can't quite reach it.}
-```
-```
-12. Nd4 = {Objectively equal, but Black must remember 8 precise moves to
-hold; White plays this side blindfolded.}
+set_comment(id, path, "Lc0 still gives Black a small pull — dark-square control is long-term, engine horizon can't quite reach it.")
+set_nags(id, path, ["$10"])
 ```
 
-Good (glyph tells the truth, prose flags a mismatch worth noting):
+Good (NAG tells the truth, prose flags a mismatch worth noting):
 ```
-9... h6 $14 {Human predictor: 47% win at 2200 vs 2600 — the Elo gap does
-the practical work despite the objective edge being small.}
-```
-
-Bad (prose duplicates the glyph, adds nothing):
-```
-9... h6 $14 {Stockfish gives +0.35 for White here.}
-```
-```
-15. exd5 $16 {SF: +0.9. Lc0: +0.85. Both engines agree White is clearly better.}
+set_comment(id, path, "Human predictor: 47% win at 2200 vs 2600 — the Elo gap does the practical work despite the small objective edge.")
+set_nags(id, path, ["$14"])
 ```
 
-**Rule of thumb**: if the reader could derive your prose from the glyph, don't write it. Write only what the glyph can't say — the practical layer, the surprise, the disagreement worth flagging, the plan.
-
-## Visual annotations (arrows, coloured squares)
-
-The chess.ceo app renders arrows and highlighted squares directly on the board. Use the ChessBase / Lichess convention inside a move's `{...}` comment.
-
-- **Arrows**: `[%cal <colour><from><to>,<colour><from><to>,...]`
-  - Example: `[%cal Gd2d4,Rf3g5]` — green arrow d2→d4, red arrow f3→g5
-- **Coloured squares**: `[%csl <colour><square>,...]`
-  - Example: `[%csl Rf7,Ge5]` — red square on f7, green on e5
-
-**Colour codes** (single letters):
-
-| Code | Colour     | Typical use                                    |
-|------|------------|------------------------------------------------|
-| `G`  | Green      | Good move / plan / key square for you          |
-| `R`  | Red        | Threat / opponent's target / danger square     |
-| `Y`  | Yellow     | Worth-noting / candidate                       |
-| `C`  | Light blue | Neutral pointer / diagram note                 |
-| `B`  | Dark blue  | Alternative / secondary idea                   |
-| `O`  | Orange     | Attention / warning                            |
-
-Example move combining plan + arrows + square:
+Bad (prose duplicates the NAG, adds nothing):
 ```
-10. O-O {Plan: aim for f4-f5, exchange the dark-square bishop, then attack g6.
-[%cal Gf2f4,Gc1h6,Yh2h4] [%csl Gg6,Rh6]}
+set_comment(id, path, "Stockfish gives +0.35 for White here.")
+set_nags(id, path, ["$14"])
 ```
 
-**Discipline for visual annotations:**
+## Visual annotations (arrows + coloured squares)
 
-- **Keep them light.** 1–3 arrows per move and 2–3 highlighted squares is plenty. Twenty arrows is noise, not signal.
-- **Highlights are labels, not decoration.** Every coloured square should point at something specific in the plan you're writing. Don't paint the board rainbow.
-- **Arrows show intent, not calculation.** A green arrow d2→d4 says "the plan is to push d4" — for concrete sequences, use variations.
+`set_annotations(id, path, {arrows, highlights})` sets both together (an atomic replacement — pass both current and new). Passing empty arrays clears.
 
-## Common pitfalls to check yourself against
+Colours (both arrows and squares): `green`, `red`, `yellow`, `light-blue`, `dark-blue`, `orange`.
 
-1. **Unbalanced parentheses.** Every `(` needs a matching `)`. If you added variations, count them.
-2. **Bad SAN.** `Nfd7` when you meant `Nbd7`. Always trace the position in your head (or use the tree from `read_prep_file`'s response) before writing a move.
-3. **Forgotten move numbers.** `1. e4 c5 2. Nf3` — after each White move you need `<num>.`, Black's move continues implicitly. In variations that start at Black's move, PGN wants `2... Nc6`.
-4. **Nested variations losing context.** `1.e4 e5 (1...c5 (2.Nf3 d6))` — the inner variation branches at `2.Nf3` off the c5 sideline, not off the mainline. Two levels of nesting is usually enough; three is confusing; four is unreadable.
-5. **Blank Event tag.** The prep-files list shows the Event as the file's name — empty = "Untitled" everywhere.
-6. **Comment-inside-comment.** PGN doesn't nest braces. If your comment needs to reference a variation, use a variation, not a nested comment.
+Usage conventions:
 
-## Backend validates on save
+| Colour     | Typical use                                    |
+|------------|------------------------------------------------|
+| green      | Good move / plan / key square for you          |
+| red        | Threat / opponent's target / danger square     |
+| yellow     | Worth-noting / candidate                       |
+| light-blue | Neutral pointer / diagram note                 |
+| dark-blue  | Alternative / secondary idea                   |
+| orange     | Attention / warning                            |
 
-If your PGN is malformed, `save_prep_file` returns 400 with the parser error. Read it, fix it, retry. Compute is cheap — don't be shy about the retry loop when you're not sure your syntax is right.
+**Keep it light.** 1–3 arrows per node and 2–3 highlighted squares is plenty. Twenty arrows is noise, not signal — pick the most important ones. Highlights are labels, not decoration.
+
+Example:
+```
+set_annotations(id, path, {
+  arrows: [
+    { color: "green", from: "f2", to: "f4" },
+    { color: "green", from: "c1", to: "h6" },
+  ],
+  highlights: [
+    { color: "green", square: "g6" },
+    { color: "red",   square: "h6" },
+  ],
+})
+```
+Renders as a green f2→f4 arrow, a green c1→h6 arrow, a green square on g6, and a red square on h6 — attached to whichever node's path you specified.
+
+## Errors and how to recover
+
+- **Illegal SAN**: `add_move` validates against the position and rejects illegal moves with a message including the position's FEN. Re-check what position you thought you were at, then retry.
+- **Path out of bounds**: happens if you call a mutation with a path from an older read that's been changed since. Re-read the tree, recompute paths, retry.
+- **Version conflict (409)**: someone (the user in the app, or a parallel agent session) edited the file since your last read. Re-read, decide whether to merge or override, retry with the new version.

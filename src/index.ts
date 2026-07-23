@@ -13,6 +13,27 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Chess } from "chess.js";
+import { parsePGN } from "./pgn/parser.js";
+import { exportPGN } from "./pgn/exporter.js";
+import {
+  addMove,
+  deleteSubtree,
+  MutationError,
+  promoteVariation,
+  setAnnotations,
+  setComment,
+  setNags,
+  setTag,
+} from "./pgn/mutations.js";
+import { PathError } from "./pgn/paths.js";
+import type {
+  Path,
+  PrepAnnotations,
+  PrepArrow,
+  PrepFile,
+  PrepHighlight,
+  PrepNode,
+} from "./pgn/types.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -77,8 +98,14 @@ const AUTHED_TOOLS = new Set([
   "search_prep_files",
   "read_prep_file",
   "create_prep_file",
-  "save_prep_file",
   "delete_prep_file",
+  "add_move",
+  "set_comment",
+  "set_nags",
+  "set_annotations",
+  "delete_subtree",
+  "promote_variation",
+  "set_tag",
   "predict_human_move",
 ]);
 
@@ -493,7 +520,8 @@ const TOOLS: Tool[] = [
   {
     name: "read_prep_file",
     description:
-      "Read one prep file. Returns the full PGN text and a compact tree JSON of the mainline (SAN + FEN per move) for programmatic reasoning. Also carries the `version` field you need to pass back to save_prep_file for the optimistic-lock check.",
+      "Read one prep file. Returns a compact tree (path-addressable, one node per move) plus tags and the `version` for optimistic locking on subsequent mutations. NO raw PGN — all edits go through the mutation tools (add_move / set_comment / set_nags / set_annotations / delete_subtree / promote_variation / set_tag), which validate SAN and structure for you.\n\n" +
+      "Path addressing: paths are arrays of child indices. `[]` = root position. `[0]` = the first mainline move. `[0, 1]` = the second variation branching after the first move. `[0, 0, 0]` = three plies deep on the mainline. Every mutation returns the effective path it landed at.",
     inputSchema: {
       type: "object",
       properties: {
@@ -505,54 +533,156 @@ const TOOLS: Tool[] = [
   {
     name: "create_prep_file",
     description:
-      "Create a new prep file. `name` becomes the Event PGN tag (user-facing label). Optional `pgn` seeds the file — if omitted, a minimal empty PGN is written and you can save_prep_file into it later.\n\n" +
-      "ALWAYS run list_prep_files (or search_prep_files with the opponent / opening keyword) BEFORE creating, so you don't duplicate an existing file. If a file already exists that fits, extend it via save_prep_file instead.",
+      "Create a new (empty) prep file. `name` becomes the Event PGN tag. You then extend it with mutation tools (add_move, set_comment, …).\n\n" +
+      "ALWAYS call list_prep_files (or search_prep_files with the opponent / opening keyword) FIRST — creating a duplicate 'Prep vs Firouzja' when one exists is the #1 LLM failure mode. If a file already covers the topic, add moves to that one instead.",
     inputSchema: {
       type: "object",
       properties: {
         name: {
           type: "string",
-          description: "User-facing name for the file — becomes the [Event] tag in the PGN. Example: 'Prep vs Firouzja (Black) 2026-07-23'.",
-        },
-        pgn: {
-          type: "string",
-          description: "Optional initial PGN content. Supports full PGN with headers and parenthesised variations. If omitted, an empty PGN is created.",
+          description: "User-facing name — becomes the [Event] tag. Example: 'Prep vs Firouzja (Black) 2026-07-23'.",
         },
       },
       required: ["name"],
     },
   },
   {
-    name: "save_prep_file",
-    description:
-      "Save (replace) a prep file's PGN content. Optimistic-lock via `expected_version` — pass the `version` you got from read_prep_file. If someone else (user in the app, or another agent session) updated the file since you read it, save returns 409 with the current version — re-read and merge.\n\n" +
-      "How to write PGN (structure, variations, NAGs, arrows, coloured squares, common pitfalls) is covered by read_pgn_authoring_guide — call it before your first save this session. Bare minimum you should NOT get wrong:\n" +
-      "- Variations are MOVES in parentheses, not sentences describing moves. Wrong: '{if 7...Be6 then 8.f3 Nbd7}'. Right: '7...Be6 (7...h5 8.Nd5)'.\n" +
-      "- Engine evals go into NAG GLYPHS, not into prose. |eval|<0.25 → $10 (=), <0.6 → $14/$15 (⩲/⩱), <1.3 → $16/$17 (±/∓), ≥1.3 → $18/$19 (+−/−+). Don't paste raw numbers like 'SF: +0.15' — the glyph is enough. Don't name the engine unless it adds signal.\n" +
-      "- Prose is for what the glyph CAN'T say: practical difficulty asymmetry, long-term factors, disagreement worth flagging, plans. If prose duplicates the glyph, delete it.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "Prep file id." },
-        pgn: { type: "string", description: "Full replacement PGN (headers + moves)." },
-        expected_version: {
-          type: "integer",
-          description: "The `version` you got from read_prep_file. If omitted, no optimistic check runs (last-write-wins — riskier).",
-        },
-      },
-      required: ["id", "pgn"],
-    },
-  },
-  {
     name: "delete_prep_file",
     description:
-      "Soft-delete a prep file. The user can restore it from the chess.ceo app's recycle bin if you deleted something valuable. Rare — usually you extend or replace instead.",
+      "Soft-delete a prep file. User can restore from the app's recycle bin. Rare — usually you extend or edit instead.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string", description: "Prep file id." },
       },
       required: ["id"],
+    },
+  },
+  {
+    name: "add_move",
+    description:
+      "Append a move as a new child of the node at `path`. If the node already has children, the new move becomes a variation (appended at the end). Use promote_variation afterwards if you want it to be the mainline. SAN is validated against the position — illegal moves are rejected with a clear error.\n\n" +
+      "Auto-saves. Returns `{path, version}` — the effective path the new node landed at (which you pass to follow-up set_comment / set_nags / etc.) and the new file version for optimistic locking on your next mutation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:   { type: "string", description: "Prep file id." },
+        path: { type: "array", items: { type: "integer", minimum: 0 }, description: "Path to the parent node the move is played FROM." },
+        san:  { type: "string", description: "The move in SAN notation (e.g. 'Nf3', 'exd5', 'O-O', 'Qxf7+')." },
+        expected_version: { type: "integer", description: "Optimistic-lock check; pass the `version` from your last read." },
+      },
+      required: ["id", "path", "san"],
+    },
+  },
+  {
+    name: "set_comment",
+    description:
+      "Set (or clear, with empty string) the text comment on the node at `path`. Comments are for plans, prep-signal, and interpretation the app can't derive — NOT for describing moves that should be variations instead. Auto-saves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:      { type: "string", description: "Prep file id." },
+        path:    { type: "array", items: { type: "integer", minimum: 0 } },
+        comment: { type: "string", description: "New comment text. Empty string clears." },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "path", "comment"],
+    },
+  },
+  {
+    name: "set_nags",
+    description:
+      "Replace the list of NAGs on the node at `path`. Empty array clears them. See read_pgn_authoring_guide for the full NAG table and eval→NAG thresholds (|eval|<0.25 → $10; <0.6 → $14/$15; <1.3 → $16/$17; ≥1.3 → $18/$19). Auto-saves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:   { type: "string" },
+        path: { type: "array", items: { type: "integer", minimum: 0 } },
+        nags: { type: "array", items: { type: "string", pattern: "^\\$\\d+$" }, description: "NAG list, e.g. ['$14'] or ['$146', '$44']." },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "path", "nags"],
+    },
+  },
+  {
+    name: "set_annotations",
+    description:
+      "Replace the visual annotations (arrows + coloured squares) on the node at `path`. Passing empty arrays clears them.\n\n" +
+      "Colours: green, red, yellow, light-blue, dark-blue, orange. Keep it LIGHT: 1-3 arrows and 2-3 squares per move maximum. Twenty arrows is noise, not signal. Auto-saves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:   { type: "string" },
+        path: { type: "array", items: { type: "integer", minimum: 0 } },
+        arrows: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              color: { type: "string", enum: ["green", "red", "yellow", "light-blue", "dark-blue", "orange"] },
+              from:  { type: "string", pattern: "^[a-h][1-8]$" },
+              to:    { type: "string", pattern: "^[a-h][1-8]$" },
+            },
+            required: ["color", "from", "to"],
+          },
+        },
+        highlights: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              color:  { type: "string", enum: ["green", "red", "yellow", "light-blue", "dark-blue", "orange"] },
+              square: { type: "string", pattern: "^[a-h][1-8]$" },
+            },
+            required: ["color", "square"],
+          },
+        },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "path"],
+    },
+  },
+  {
+    name: "delete_subtree",
+    description:
+      "Delete the node at `path` and all its descendants. Refuses to delete the root. Auto-saves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:   { type: "string" },
+        path: { type: "array", items: { type: "integer", minimum: 0 } },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "path"],
+    },
+  },
+  {
+    name: "promote_variation",
+    description:
+      "Make the node at `path` its parent's mainline (children[0]), demoting the current mainline (and any other siblings) into variation order. Silently no-op if already the mainline. Auto-saves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:   { type: "string" },
+        path: { type: "array", items: { type: "integer", minimum: 0 }, description: "Path to the node to promote. Length ≥ 1." },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "path"],
+    },
+  },
+  {
+    name: "set_tag",
+    description:
+      "Set or clear a game-level PGN tag (Event, Site, Date, White, Black, Result, or any custom tag). Passing empty string removes the tag. Auto-saves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:    { type: "string" },
+        key:   { type: "string", description: "Tag key, e.g. 'Event', 'White', 'Date'." },
+        value: { type: "string", description: "Tag value. Empty string removes the tag." },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "key", "value"],
     },
   },
   {
@@ -692,31 +822,57 @@ type EngineBlock = {
   bestMove?: string;
 };
 
-// Parse a PGN string into a compact tree JSON view — mainline as a
-// linear array of {san, fen} with a `variations` array on any node that
-// branches. Uses chess.js's built-in PGN loader. Best-effort: on parse
-// failure, returns null and the caller falls back to raw PGN only.
-type TreeNode = {
-  san: string;
-  fen: string;
-  comment?: string;
-  variations?: TreeNode[][];
-};
-function pgnToTree(pgn: string): TreeNode[] | null {
-  try {
-    const board = new Chess();
-    // chess.js loadPgn accepts full PGN incl. tags; loadPgn returns true on
-    // success or throws on newer versions. Wrap defensively.
-    (board as unknown as { loadPgn: (p: string) => boolean }).loadPgn(pgn);
-    // history({verbose:true}) walks the mainline only; variations aren't
-    // exposed by chess.js's built-in PGN loader at time of writing. If the
-    // PGN carries parenthesised variations they get flattened.
-    const hist = board.history({ verbose: true }) as Array<{ san: string; after: string; before: string }>;
-    if (hist.length === 0) return [];
-    return hist.map(h => ({ san: h.san, fen: h.after }));
-  } catch {
-    return null;
+// Path arg parsing for the mutation tools. Rejects malformed input
+// with a clear message the LLM can act on.
+function argPath(args: Args): Path {
+  const raw = args.path;
+  if (!Array.isArray(raw)) throw new Error("`path` must be an array of non-negative integers");
+  const out: Path = [];
+  for (let i = 0; i < raw.length; i++) {
+    const n = raw[i];
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
+      throw new Error(`path[${i}] must be a non-negative integer (got ${JSON.stringify(n)})`);
+    }
+    out.push(n);
   }
+  return out;
+}
+
+// Load-mutate-save: fetch current PGN, parse, apply mutation, re-export,
+// save with optimistic lock. Auto-saves so every tool call is atomic;
+// the LLM never sees intermediate state.
+async function applyMutation(
+  args: Args,
+  mutator: (file: PrepFile) => { file: PrepFile; path: Path },
+): Promise<unknown> {
+  const id = String(args.id);
+  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
+  const g = raw as { pgnContent?: string; version?: number };
+  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+
+  const file = parsePGN(g.pgnContent);
+  let result: { file: PrepFile; path: Path };
+  try {
+    result = mutator(file);
+  } catch (err) {
+    if (err instanceof MutationError || err instanceof PathError) {
+      throw new Error(`mutation rejected: ${err.message}`);
+    }
+    throw err;
+  }
+  const newPgn = exportPGN(result.file);
+
+  const expected = typeof args.expected_version === "number" ? args.expected_version : g.version;
+  const saved = await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(id)}`, {
+    pgn: newPgn,
+    expected_version: expected,
+  });
+  const savedRow = saved as { version?: number };
+  return {
+    ok: true,
+    path: result.path,
+    version: savedRow.version,
+  };
 }
 
 // Rewrite availableMoves[].move UCI → SAN. The prep + position-stats
@@ -915,32 +1071,55 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "read_prep_file": {
       const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
-      // MCP layer adds the tree JSON view — backend stays pure PGN in/out.
-      // If parse fails the LLM still has the raw PGN text to work with.
-      if (raw && typeof raw === "object") {
-        const g = raw as { pgnContent?: string };
-        if (typeof g.pgnContent === "string") {
-          const tree = pgnToTree(g.pgnContent);
-          return { ...(raw as object), tree };
-        }
-      }
-      return raw;
+      const g = raw as { pgnContent?: string; version?: number; id?: string };
+      if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+      const file = parsePGN(g.pgnContent);
+      return {
+        id: g.id,
+        version: g.version,
+        tags: file.tags,
+        tree: file.root,
+      };
     }
 
     case "create_prep_file":
       return authedRequest("POST", "/api/agent/prep-files", {
         name: String(args.name),
-        pgn: typeof args.pgn === "string" ? args.pgn : undefined,
-      });
-
-    case "save_prep_file":
-      return authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`, {
-        pgn: String(args.pgn),
-        expected_version: typeof args.expected_version === "number" ? args.expected_version : undefined,
       });
 
     case "delete_prep_file":
       return authedRequest("DELETE", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
+
+    case "add_move":
+      return applyMutation(args, file => addMove(file, argPath(args), String(args.san)));
+
+    case "set_comment":
+      return applyMutation(args, file => setComment(file, argPath(args), typeof args.comment === "string" ? args.comment : ""));
+
+    case "set_nags":
+      return applyMutation(args, file => setNags(file, argPath(args), Array.isArray(args.nags) ? (args.nags as unknown[]).map(String) : []));
+
+    case "set_annotations": {
+      const arrowsRaw = Array.isArray(args.arrows) ? args.arrows as PrepArrow[] : [];
+      const highlightsRaw = Array.isArray(args.highlights) ? args.highlights as PrepHighlight[] : [];
+      const ann: PrepAnnotations | null =
+        (arrowsRaw.length === 0 && highlightsRaw.length === 0)
+          ? null
+          : { arrows: arrowsRaw, highlights: highlightsRaw };
+      return applyMutation(args, file => setAnnotations(file, argPath(args), ann));
+    }
+
+    case "delete_subtree":
+      return applyMutation(args, file => deleteSubtree(file, argPath(args)));
+
+    case "promote_variation":
+      return applyMutation(args, file => promoteVariation(file, argPath(args)));
+
+    case "set_tag":
+      return applyMutation(args, file => ({
+        file: setTag(file, String(args.key), String(args.value ?? "")),
+        path: [],
+      }));
 
     case "read_engine_usage_guide":
       return { guide: ENGINE_USAGE_DOC };
