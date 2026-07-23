@@ -525,11 +525,14 @@ const TOOLS: Tool[] = [
     name: "save_prep_file",
     description:
       "Save (replace) a prep file's PGN content. Optimistic-lock via `expected_version` — pass the `version` you got from read_prep_file. If someone else (user in the app, or another agent session) updated the file since you read it, save returns 409 with the current version — re-read and merge.\n\n" +
-      "PGN structure guidance:\n" +
-      "- Keep the mainline clean (your top recommendation).\n" +
-      "- Alternative candidates go in parenthesised variations at the branching move.\n" +
-      "- Attach one-sentence commentary at key branch points using PGN {curly-brace comments}. Cite the actual tool output ('Lc0 gives +0.15 in this line') — don't dress the file up with unsourced chess prose.\n" +
-      "- Use PGN NAGs for evaluations: $1 !, $2 ?, $3 !!, $4 ??, $6 =, $10 = (equal), $14 +/= (slight edge), etc. Optional but nice.",
+      "PGN structure guidance (call read_prep_files_guide for the full doc — this is just the essentials):\n" +
+      "- Mainline = your top recommendation. Alternative candidates go in parenthesised variations at the branching move.\n" +
+      "- CRITICAL: variations are MOVES, not prose. Wrong: '{if 7...Be6 then 8.f3 Nbd7 9.Qd2}'. Right: '7...Be6 (7...h5 8.Nd5) 8.f3 Nbd7'.\n" +
+      "- Plans, prep-signal, and interpretation CAN go in {curly-brace comments}. Cite actual tool output ('Lc0 gives +0.15') — don't invent chess prose.\n" +
+      "- NAGs (right after the SAN): $1 !, $2 ?, $3 !!, $4 ??, $5 !?, $6 ?!, $13 ∞ (unclear), $14 ⩲ (White slightly better), $15 ⩱, $16 ±, $17 ∓, $18 +−, $19 −+, $36 ↑ (initiative), $40 → (attack), $44 =/∞ (compensation), $132 ⇆ (counterplay), $140 ∆ (with the idea), $146 N (novelty).\n" +
+      "- Arrows in comments: [%cal Gd2d4,Rf3g5] — colours G/R/Y/C/B/O. Keep light: 1-3 arrows per move, not twenty.\n" +
+      "- Highlighted squares: [%csl Rf7,Ge5] — same colour codes.\n" +
+      "Example move with everything: `10. O-O $5 {Aiming for f4-f5. [%cal Gf2f4,Gc1h6] [%csl Gg6]}`",
     inputSchema: {
       type: "object",
       properties: {
