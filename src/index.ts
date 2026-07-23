@@ -203,11 +203,16 @@ const TOOLS: Tool[] = [
         line: {
           type: "string",
           description:
-            "Move sequence in SAN, space-separated, no move numbers required. Example: 'e4 e5 Nf3'. Leave empty for the starting position.",
+            "Move sequence in SAN from the starting position, space-separated, no move numbers required. Example: 'e4 e5 Nf3'. Leave empty for startpos. Alias: `moves` (same thing).",
+        },
+        moves: {
+          type: "string",
+          description:
+            "SAN moves to apply on top of `fen` (or on top of startpos if no fen). Same shape as `line`. Use this when you have a starting FEN and want to walk from there — e.g. fen='<game tabiya>', moves='b4 a5 c3' to explore that continuation. Wins over `line` if both are set.",
         },
         fen: {
           type: "string",
-          description: "Alternative to `line` — raw FEN of the target position.",
+          description: "Starting position as FEN. Combine with `moves` to walk from there, or use alone.",
         },
         limit: {
           type: "integer",
@@ -229,7 +234,15 @@ const TOOLS: Tool[] = [
       properties: {
         fen: {
           type: "string",
-          description: "FEN of the position to look up.",
+          description: "Starting position as FEN. Combine with `moves` to walk from there.",
+        },
+        moves: {
+          type: "string",
+          description: "Optional SAN moves to apply on top of `fen` (or on top of startpos). Example: fen='<tabiya>', moves='b4 a5'.",
+        },
+        line: {
+          type: "string",
+          description: "Synonym for `moves` from the starting position; kept for compatibility.",
         },
         limit: {
           type: "integer",
@@ -238,7 +251,6 @@ const TOOLS: Tool[] = [
           description: "Number of top continuations to return.",
         },
       },
-      required: ["fen"],
     },
   },
   {
@@ -246,11 +258,16 @@ const TOOLS: Tool[] = [
     description:
       "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in SAN (e4, Nf3, Bxc4 — not UCI). Free (no cloud instance needed) — use liberally.\n\n" +
       "GROUNDING: cite this tool's actual output when you claim things about positions. Don't invent evaluations from general principles or training data — if you don't have engine output for a FEN, call this. Compute is cheap.\n\n" +
+      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves` to walk from an arbitrary position. Also see the flip-side-to-move threat check in read_engine_usage_guide.\n\n" +
       "Use this to sanity-check candidate lines from get_position_stats or get_player_preparation — human game frequency tells you what people play, engine evaluation tells you what's actually good.",
     inputSchema: {
       type: "object",
       properties: {
-        fen: { type: "string", description: "FEN of the position to analyse." },
+        fen: { type: "string", description: "Starting position as FEN (defaults to startpos)." },
+        moves: {
+          type: "string",
+          description: "Optional SAN moves to apply on top of `fen` (or on top of startpos). Example: fen='<tabiya>', moves='b4 a5'.",
+        },
         movetime_ms: {
           type: "integer",
           minimum: 100,
@@ -264,7 +281,6 @@ const TOOLS: Tool[] = [
           description: "Number of candidate lines to return (default 3).",
         },
       },
-      required: ["fen"],
     },
   },
   {
@@ -367,12 +383,17 @@ const TOOLS: Tool[] = [
       "• Lc0 is practical eval — trust it for 'which side is easier?' 'which candidate is best when Stockfish shows several as equal?' Lc0 sees long-term positional factors Stockfish's fixed search can miss.\n" +
       "• When they agree → high confidence. When they disagree → look at both scores and reason WHY (Stockfish sharply higher = tactic Lc0 missed; Lc0 higher = long-term positional edge past Stockfish's horizon). Never dismiss either — the disagreement is the signal.\n\n" +
       "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Practical range -20..+20. Use it to find non-objective 'practical' ideas or when the user needs to steer toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
+      "Also useful: pass `moves` on top of `fen` to explore a variation without computing FENs yourself (e.g. fen='<tabiya>', moves='b4 a5 c3'). And the flip-side-to-move threat check documented in the guide is a great free trick.\n\n" +
       "For the full guide including worked examples, call the `read_engine_usage_guide` tool.\n\n" +
       "Not for casual questions — this costs real money per second. Use the free `analyse` tool (single Stockfish, 2s) or `get_position_stats` for anything that doesn't require deep prep.",
     inputSchema: {
       type: "object",
       properties: {
-        fen: { type: "string", description: "FEN of the position to analyse." },
+        fen: { type: "string", description: "Starting position as FEN. Combine with `moves` to walk from there." },
+        moves: {
+          type: "string",
+          description: "Optional SAN moves to apply on top of `fen` (or on top of startpos). Example: fen='<tabiya>', moves='b4 a5 c3' analyses the position after those three moves.",
+        },
         movetime_ms: {
           type: "integer",
           minimum: 100,
@@ -537,23 +558,33 @@ function convertAvailableMovesToSAN(raw: unknown, fen: string): unknown {
   return raw;
 }
 
-// Resolve a starting FEN from either the `fen` or `line` argument the tool
-// received. Same logic prep_snapshot already had inline — extracted so we
-// can reuse it wherever we need to walk a SAN line to a concrete FEN
-// (e.g. for UCI→SAN conversion of availableMoves).
+// Resolve a starting FEN from any combination of `fen`, `line`, and
+// `moves` the tool received. Three modes, all valid:
+//
+//   fen alone                → use as-is
+//   line/moves alone         → walk from startpos
+//   fen + moves (or line)    → walk from that fen
+//
+// `line` is the historical field name from the backend's prep endpoint;
+// `moves` is the flexible-input name we now surface for LLM ergonomics
+// ("start from this FEN and play these moves next"). They're synonyms
+// here — same SAN sequence, same chess.js walker. `moves` wins if both
+// happen to be provided.
 function resolveFenFromArgs(args: Args): string {
   const fenArg = typeof args.fen === "string" ? args.fen.trim() : "";
-  if (fenArg) return fenArg;
+  const movesArg = typeof args.moves === "string" ? args.moves.trim() : "";
   const lineArg = typeof args.line === "string" ? args.line.trim() : "";
-  const board = new Chess();
-  if (lineArg) {
-    for (const raw of lineArg.split(/\s+/)) {
+  const sequence = movesArg || lineArg;
+
+  const board = fenArg ? new Chess(fenArg) : new Chess();
+  if (sequence) {
+    for (const raw of sequence.split(/\s+/)) {
       const san = raw.replace(/^\d+\.+/, "");
       if (!san) continue;
       try {
         board.move(san);
       } catch {
-        throw new Error(`bad SAN token '${raw}' in line`);
+        throw new Error(`bad SAN token '${raw}' in moves`);
       }
     }
   }
@@ -598,13 +629,25 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return get("/api/chess/players/profile", { fideId: Number(args.fide_id) });
 
     case "get_player_preparation": {
+      // Prefer sending `line` to the backend when the caller specified moves
+      // WITHOUT a fen — the backend then attaches the cumulative-line SAN to
+      // each move in the response (nicer for the LLM's follow-up walks).
+      // When a fen was supplied, always resolve the effective position
+      // client-side and send just fen — the backend can't reconstruct
+      // history it didn't see anyway.
+      const fenArg = typeof args.fen === "string" ? args.fen.trim() : "";
+      const movesArg = typeof args.moves === "string" ? args.moves.trim() : "";
+      const lineArg = typeof args.line === "string" ? args.line.trim() : "";
       const params: Record<string, string | number | undefined> = {
         fideId: Number(args.fide_id),
         color: String(args.color),
         compact: "true",
       };
-      if (typeof args.line === "string" && args.line.length > 0) params.line = args.line;
-      if (typeof args.fen === "string" && args.fen.length > 0) params.fen = args.fen;
+      if (fenArg || movesArg) {
+        params.fen = resolveFenFromArgs(args);
+      } else if (lineArg) {
+        params.line = lineArg;
+      }
       if (typeof args.limit === "number") params.limit = args.limit;
       if (typeof args.offset === "number") params.offset = args.offset;
       const raw = await get("/api/chess/prep/by-player", params);
@@ -612,7 +655,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     }
 
     case "get_position_stats": {
-      const fen = String(args.fen);
+      const fen = resolveFenFromArgs(args);
       const raw = await get("/api/chess/database/main", {
         fen,
         limit: typeof args.limit === "number" ? args.limit : 20,
@@ -622,7 +665,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     }
 
     case "analyse": {
-      const fen = String(args.fen);
+      const fen = resolveFenFromArgs(args);
       const params: Record<string, string | number | undefined> = { fen };
       if (typeof args.movetime_ms === "number") params.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") params.multipv = args.multipv;
@@ -663,7 +706,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return authedRequest("DELETE", `/api/agent/cloud-engines/${encodeURIComponent(String(args.contract_id))}`);
 
     case "cloud_analyse": {
-      const fen = String(args.fen);
+      const fen = resolveFenFromArgs(args);
       const body: Record<string, unknown> = { fen };
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") body.multipv = args.multipv;
