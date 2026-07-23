@@ -183,6 +183,7 @@ const TOOLS: Tool[] = [
     name: "get_player_preparation",
     description:
       "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc.\n\n" +
+      "GROUNDING: every claim about the opponent's repertoire must trace back to this tool's output. Don't assert 'they play sharply' or 'they hate isolated queen pawn' without pointing at the actual game counts / win rates in the response. Don't invent 'the opponent typically plays X' — check first. Compute is cheap: run this on more branches instead of pattern-matching from a chess book.\n\n" +
       "Reading the response — CRITICAL:\n" +
       "• Win % is one weight, not a verdict. Recommend 1.b3 over 1.d4 because 60% > 50% is wrong. Sample size matters (3 games at 66% is noise; 300 at 55% is signal); avgWhite / avgBlack per move show the rating context (a big score often means a rating gap, not repertoire truth).\n" +
       "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted; a weak opponent won't patch it, a strong or improving one already has (but structural weaknesses like 'bad in Catalan structures' hold anyway).\n" +
@@ -243,7 +244,9 @@ const TOOLS: Tool[] = [
   {
     name: "analyse",
     description:
-      "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in UCI notation (e2e4, not e4). Use this to sanity-check candidate lines from get_position_stats or get_player_preparation — human game frequency tells you what people play, engine evaluation tells you what's actually good.",
+      "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in UCI notation (e2e4, not e4). Free (no cloud instance needed) — use liberally.\n\n" +
+      "GROUNDING: cite this tool's actual output when you claim things about positions. Don't invent evaluations from general principles or training data — if you don't have engine output for a FEN, call this. Compute is cheap.\n\n" +
+      "Use this to sanity-check candidate lines from get_position_stats or get_player_preparation — human game frequency tells you what people play, engine evaluation tells you what's actually good.",
     inputSchema: {
       type: "object",
       properties: {
@@ -357,6 +360,7 @@ const TOOLS: Tool[] = [
     name: "cloud_analyse",
     description:
       "Runs a synchronous ~2s analysis on the user's running combo instance and returns both Stockfish and Lc0's final read for the FEN — depth, top-N candidate moves with scores (centipawns from side-to-move POV, or mate distance), and each engine's principal variation.\n\n" +
+      "GROUNDING: every claim you make about a position must trace back to actual engine output from a call in THIS session. Don't invent evaluations, don't name 'best moves' you haven't seen the engine list, don't fabricate variations that 'look plausible.' Compute is cheap — call this 5-10 times while walking a tree rather than pattern-matching from your training data. When you don't have data for the position, either run the tool or say so; don't fill the gap with chess prose the user can't distinguish from measured output.\n\n" +
       "Auto-picks the caller's only running combo instance; errors clearly if there are zero (start one first with start_cloud_engine) or more than one (destroy the extras first).\n\n" +
       "How to read the response:\n" +
       "• Stockfish is objective truth — trust it for 'does this line hold?' 'is there a tactic?' 'is this endgame drawn?' A Stockfish 0.00 means 'objectively equal', NOT 'trivial draw' — one side can still be much harder to play in practice.\n" +

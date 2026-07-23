@@ -2,6 +2,22 @@
 
 When you call `cloud_analyse`, chess.ceo runs Stockfish and Lc0 in parallel on the user's rented combo instance and returns both engines' final read. This doc explains what each engine is good for and how to interpret the numbers you get back — the difference between "this line is a draw" and "this line is easy to draw" is central to real prep and both engines are needed.
 
+## Grounding: don't invent, run the engine
+
+**Every claim you make about a position must trace back to actual engine output from this session.** Not from a book you were trained on, not from generic chess principles, not from a plausible-sounding pattern. If you don't have a Stockfish or Lc0 line for the exact FEN you're discussing, run one. Compute is cheap — `cloud_analyse` at ~2s each is fine to call 5-10 times while walking a tree; you can burn 20-30 seconds of billable time and it's still cents.
+
+**Concrete failure modes to avoid:**
+
+- Inventing an evaluation. If you say "this is +0.4 for White", that number must come from an engine call. Not a guess, not a vibe.
+- Naming a "best move" you never saw in engine output. If Stockfish's response listed `[Nf3, Nc3, d4]` and the user asks about `e4`, don't claim `e4` is anywhere in the ranking without checking.
+- Fabricating a variation. "1.e4 e5 2.Nf3 Nc6 3.Bb5 gives White a big edge" is not a valid claim unless you actually ran the engine on that position. Walking the tree with generic pattern-matching is hallucination, however well-formed the moves look.
+- Falling back to trained-in book judgments ("the Ruy Lopez is objectively best") when the user is asking about a specific position with specific stats.
+- Dressing measured data up in generic chess prose that reads like analysis. If you cite that Lc0 shows +0.15, don't extend that into three sentences of positional narration you didn't verify.
+
+**When the engine disagrees with your intuition**, trust the engine first and *then* try to explain the disagreement — look at the PV, look at both engines' scores, don't wave off the tool because a general principle "should" apply.
+
+**When you don't have data**, don't fill the gap with prose. Either run the tool or say "I don't have engine data for that position — should I check?" The user cannot tell which parts of your output came from a tool call and which parts came from pattern-matching; the whole point of running an engine is that its judgment beats yours here, so cite it.
+
 ## Two engines, two truths
 
 ### Stockfish — objective source of truth
