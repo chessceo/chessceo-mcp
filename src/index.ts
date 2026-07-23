@@ -244,7 +244,7 @@ const TOOLS: Tool[] = [
   {
     name: "analyse",
     description:
-      "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in UCI notation (e2e4, not e4). Free (no cloud instance needed) — use liberally.\n\n" +
+      "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in SAN (e4, Nf3, Bxc4 — not UCI). Free (no cloud instance needed) — use liberally.\n\n" +
       "GROUNDING: cite this tool's actual output when you claim things about positions. Don't invent evaluations from general principles or training data — if you don't have engine output for a FEN, call this. Compute is cheap.\n\n" +
       "Use this to sanity-check candidate lines from get_position_stats or get_player_preparation — human game frequency tells you what people play, engine evaluation tells you what's actually good.",
     inputSchema: {
@@ -444,6 +444,83 @@ type Args = Record<string, unknown>;
 // don't drown the log stream.
 const LOG_MAX_CHARS = 4096;
 
+// Convert a UCI move sequence into SAN by walking it move-by-move on
+// chess.js from the given starting FEN. LLMs reason far better in SAN
+// ("Nf3", "Bxc4") than UCI ("g1f3", "b5c4"), and matches how prep
+// discussion is written in the real world. If a move fails to parse
+// (illegal from the current position — bug or truncated PV), we
+// truncate cleanly rather than throwing so the response still carries
+// what we could convert.
+function uciLineToSAN(startFen: string, uciMoves: string[]): string[] {
+  const board = new Chess(startFen);
+  const out: string[] = [];
+  for (const uci of uciMoves) {
+    if (uci.length < 4) break;
+    try {
+      const move = board.move({
+        from: uci.slice(0, 2),
+        to: uci.slice(2, 4),
+        promotion: uci.length >= 5 ? uci[4] : undefined,
+      });
+      if (!move) break;
+      out.push(move.san);
+    } catch {
+      break;
+    }
+  }
+  return out;
+}
+
+function uciMoveToSAN(startFen: string, uci: string): string {
+  if (!uci || uci.length < 4) return uci;
+  const board = new Chess(startFen);
+  try {
+    const move = board.move({
+      from: uci.slice(0, 2),
+      to: uci.slice(2, 4),
+      promotion: uci.length >= 5 ? uci[4] : undefined,
+    });
+    return move ? move.san : uci;
+  } catch {
+    return uci;
+  }
+}
+
+// Rewrite the local /chess/database/analyse response (single engine)
+// so PVs come back in SAN.
+function convertAnalyseResponse(raw: unknown, startFen: string): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const r = raw as { lines?: Array<{ pv?: string[] }> };
+  if (Array.isArray(r.lines)) {
+    for (const line of r.lines) {
+      if (Array.isArray(line.pv)) line.pv = uciLineToSAN(startFen, line.pv);
+    }
+  }
+  return raw;
+}
+
+// Rewrite the /api/agent/cloud-engines/analyse response (two engines,
+// each with lines[] and a bestMove) so PVs and bestMove come back in SAN.
+function convertCloudSnapshotResponse(raw: unknown, startFen: string): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const r = raw as { stockfish?: EngineBlock; lc0?: EngineBlock };
+  for (const eng of [r.stockfish, r.lc0]) {
+    if (!eng) continue;
+    if (Array.isArray(eng.lines)) {
+      for (const line of eng.lines) {
+        if (Array.isArray(line.pv)) line.pv = uciLineToSAN(startFen, line.pv);
+      }
+    }
+    if (typeof eng.bestMove === "string") eng.bestMove = uciMoveToSAN(startFen, eng.bestMove);
+  }
+  return raw;
+}
+
+type EngineBlock = {
+  lines?: Array<{ pv?: string[] }>;
+  bestMove?: string;
+};
+
 function stringifyForLog(v: unknown): string {
   let s: string;
   try {
@@ -502,10 +579,12 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       });
 
     case "analyse": {
-      const params: Record<string, string | number | undefined> = { fen: String(args.fen) };
+      const fen = String(args.fen);
+      const params: Record<string, string | number | undefined> = { fen };
       if (typeof args.movetime_ms === "number") params.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") params.multipv = args.multipv;
-      return get("/api/chess/database/analyse", params);
+      const raw = await get("/api/chess/database/analyse", params);
+      return convertAnalyseResponse(raw, fen);
     }
 
     case "get_head_to_head":
@@ -541,11 +620,13 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return authedRequest("DELETE", `/api/agent/cloud-engines/${encodeURIComponent(String(args.contract_id))}`);
 
     case "cloud_analyse": {
-      const body: Record<string, unknown> = { fen: String(args.fen) };
+      const fen = String(args.fen);
+      const body: Record<string, unknown> = { fen };
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") body.multipv = args.multipv;
       if (typeof args.contempt === "number") body.contempt = args.contempt;
-      return authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
+      const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
+      return convertCloudSnapshotResponse(raw, fen);
     }
 
     case "read_engine_usage_guide":
