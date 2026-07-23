@@ -437,7 +437,43 @@ const TOOLS: Tool[] = [
 
 type Args = Record<string, unknown>;
 
+// Log every tool call in and out. Keeps args + response payloads together
+// with a per-call duration so we can trace what the LLM asked for and what
+// it got back on the same journalctl line. Response is JSON-stringified and
+// capped so the two doc-reading tools (~5-10 KB of static markdown each)
+// don't drown the log stream.
+const LOG_MAX_CHARS = 4096;
+
+function stringifyForLog(v: unknown): string {
+  let s: string;
+  try {
+    s = JSON.stringify(v);
+  } catch {
+    s = String(v);
+  }
+  if (s.length > LOG_MAX_CHARS) {
+    s = s.slice(0, LOG_MAX_CHARS) + `…+${s.length - LOG_MAX_CHARS}chars`;
+  }
+  return s;
+}
+
 async function callTool(name: string, args: Args): Promise<unknown> {
+  const started = Date.now();
+  console.error(`[mcp] IN  ${name} args=${stringifyForLog(args)}`);
+  try {
+    const result = await callToolInner(name, args);
+    const dur = Date.now() - started;
+    console.error(`[mcp] OUT ${name} ok ${dur}ms result=${stringifyForLog(result)}`);
+    return result;
+  } catch (err) {
+    const dur = Date.now() - started;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[mcp] OUT ${name} err ${dur}ms error=${JSON.stringify(msg)}`);
+    throw err;
+  }
+}
+
+async function callToolInner(name: string, args: Args): Promise<unknown> {
   switch (name) {
     case "search_player":
       return get("/api/chess/players/search/simple", { q: String(args.name), view: "llm" });
