@@ -32,16 +32,19 @@ const UA = `chessceo-mcp/${process.env.npm_package_version ?? "0.1.0"} (+https:/
 // Loaded once at startup and returned verbatim by the engine_usage_primer
 // prompt — LLM hosts surface it in their slash menu so a user can push the
 // full doc into the conversation on demand.
-const ENGINE_USAGE_DOC: string = (() => {
+function loadBundledDoc(filename: string, fallbackLabel: string): string {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
-    // dist/index.js → ../docs/engine-usage.md when packaged; src/index.ts
-    // → ../docs/engine-usage.md during dev. Same resolution either way.
-    return readFileSync(join(here, "..", "docs", "engine-usage.md"), "utf8");
+    // dist/index.js → ../docs/*.md when packaged; src/index.ts →
+    // ../docs/*.md during dev. Same resolution either way.
+    return readFileSync(join(here, "..", "docs", filename), "utf8");
   } catch {
-    return "Engine usage guide not bundled with this install of @chessceo/mcp.";
+    return `${fallbackLabel} not bundled with this install of @chessceo/mcp.`;
   }
-})();
+}
+
+const ENGINE_USAGE_DOC = loadBundledDoc("engine-usage.md", "Engine usage guide");
+const PREP_STRATEGY_DOC = loadBundledDoc("prep-strategy.md", "Prep strategy guide");
 
 // ── HTTP ────────────────────────────────────────────────────────────
 //
@@ -179,7 +182,14 @@ const TOOLS: Tool[] = [
   {
     name: "get_player_preparation",
     description:
-      "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc. When preparing for a real game, weight recent games (last 12-24 months) more heavily than old ones, classical over-the-board > rapid/blitz > online, and look for variations the player scores poorly in (below ~40%) or plays with less variety (shallower prep).",
+      "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc.\n\n" +
+      "Reading the response — CRITICAL:\n" +
+      "• Win % is one weight, not a verdict. Recommend 1.b3 over 1.d4 because 60% > 50% is wrong. Sample size matters (3 games at 66% is noise; 300 at 55% is signal); avgWhite / avgBlack per move show the rating context (a big score often means a rating gap, not repertoire truth).\n" +
+      "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted; a weak opponent won't patch it, a strong or improving one already has (but structural weaknesses like 'bad in Catalan structures' hold anyway).\n" +
+      "• Recency > career. The last 12-24 months dominate. This endpoint's compact/LLM view deliberately omits per-move `hotness` — at the individual level it's trailing noise. The general DB endpoint keeps it (there it's fashion signal).\n" +
+      "• Opponent will deviate early. Prep is a tree, not a line — cover the 2 most likely replies at each real branching point, not one 20-move line.\n" +
+      "• Surprise is a scalpel. Don't tell a lifelong 1.e4 player to switch to 1.d4 — meta-signal screams prep. Rare secondary lines within the user's existing repertoire (e.g. 6.Bc4 instead of usual 6.Bg5 vs the Najdorf) are where surprise is real.\n\n" +
+      "For the full guide use the `prep_strategy_primer` prompt.",
     inputSchema: {
       type: "object",
       properties: {
@@ -574,6 +584,12 @@ const PROMPTS: Prompt[] = [
       "Full guide on how to use the chess.ceo cloud engines — Stockfish vs Lc0 tradeoffs, when to trust which, how to read disagreements, and how to use Lc0 contempt to find practical ideas. Read before running expensive cloud_analyse calls or when the user asks WHY the engines gave certain scores.",
     arguments: [],
   },
+  {
+    name: "prep_strategy_primer",
+    description:
+      "Full guide on how to reason about opening preparation — why win% is one weight not a rule, why prep is a two-player game with symmetric information, when 'revealed weaknesses' are actionable, how to use move-order tricks, and how to calibrate surprise. Read before recommending an opening plan, especially when the user is preparing for a specific real opponent.",
+    arguments: [],
+  },
 ];
 
 // The workflow text for prepare_for_game. Kept in one place so both the
@@ -656,6 +672,9 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
     }
     case "engine_usage_primer":
       text = ENGINE_USAGE_DOC;
+      break;
+    case "prep_strategy_primer":
+      text = PREP_STRATEGY_DOC;
       break;
     case "head_to_head_briefing": {
       const a = promptArgs.player_a ?? "player A";
