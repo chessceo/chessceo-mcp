@@ -78,6 +78,7 @@ const AUTHED_TOOLS = new Set([
   "create_prep_file",
   "save_prep_file",
   "delete_prep_file",
+  "predict_human_move",
 ]);
 
 function isAuthedToolCall(body: unknown): boolean {
@@ -301,7 +302,7 @@ const TOOLS: Tool[] = [
       "• After you've found what the opponent SHOULD do (with the engine), check what they'll ACTUALLY do at their rating. If the top human move is a mistake, you have a real practical advantage.\n" +
       "• The WDL head is rating-aware — a 400-point gap will show up as a big win probability even in equal positions (the model has learned that human errors compound).\n" +
       "• Pass `prev_fen` (most recent first) when analysing mid-trade positions — without history the model treats the position as quiet.\n\n" +
-      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. Free (~1-2s per call).",
+      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. ~1-2s per call. **Premium (or admin/moderator) only** — anonymous calls get 402.",
     inputSchema: {
       type: "object",
       properties: {
@@ -845,25 +846,17 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "predict_human_move": {
       const fen = resolveFenFromArgs(args);
-      const params: Record<string, string | number | undefined> = { fen };
-      if (typeof args.white_elo === "number") params.white_elo = args.white_elo;
-      if (typeof args.black_elo === "number") params.black_elo = args.black_elo;
-      if (typeof args.top === "number") params.top = args.top;
-      // prev_fens is an array; the backend accepts repeated prev_fen params.
-      const raw = Array.isArray(args.prev_fens)
-        ? (args.prev_fens as unknown[]).filter(x => typeof x === "string")
-        : [];
-      const url = new URL("/api/chess/database/predict-move", BASE);
-      for (const [k, v] of Object.entries(params)) {
-        if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
+      const qs = new URLSearchParams();
+      qs.set("fen", fen);
+      if (typeof args.white_elo === "number") qs.set("white_elo", String(args.white_elo));
+      if (typeof args.black_elo === "number") qs.set("black_elo", String(args.black_elo));
+      if (typeof args.top === "number") qs.set("top", String(args.top));
+      if (Array.isArray(args.prev_fens)) {
+        for (const p of args.prev_fens as unknown[]) {
+          if (typeof p === "string" && p.length > 0) qs.append("prev_fen", p);
+        }
       }
-      for (const p of raw) url.searchParams.append("prev_fen", String(p));
-      const res = await fetch(url, { headers: { "User-Agent": UA, "Accept": "application/json" } });
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`chess.ceo ${res.status}: ${body.slice(0, 500)}`);
-      }
-      return res.json();
+      return authedRequest("GET", `/api/agent/predict-move?${qs.toString()}`);
     }
 
     case "get_head_to_head":
