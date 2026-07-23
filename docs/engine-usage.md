@@ -75,6 +75,19 @@ The eval Lc0 returns when contempt is set is **not** the objective eval — it's
 - **Playing for a win with the "worse" side** — negative contempt if the user needs to avoid drawing lines with Black in a must-win situation.
 - **Never with zero direction** — always know *why* you're skewing before you set contempt. It's a specific tool for a specific question, not a default knob.
 
+## Tricks worth knowing
+
+### Flip side-to-move to see threats
+
+If it's Black to move and you want to know what threats *White* has (i.e. "if Black passes, what does White do?"), take the FEN and flip the side-to-move field from `b` to `w` (or vice versa), then run analysis. This is the engine equivalent of the "null move" idea humans use to check for prophylaxis.
+
+- Real position: `... b KQkq -` — analyse says +0.2 for Black
+- Flipped:     `... w KQkq -` — analyse says +1.4 for White
+
+The gap (1.4 - 0.2 = 1.2) is roughly the value of the tempo Black has to spend defending. If it's huge, Black is under real pressure even if the current eval looks calm. If it's tiny, White has no immediate threats and Black can improve at leisure.
+
+**Gotcha:** flipping side-to-move invalidates the en passant target field (if the last move was a two-square pawn push, the ep square is now stale). Also, both sides are counted as still having whichever castling rights are in the FEN — don't do this in the middle of a castling sequence. For opening / middlegame threat-checking it's a very useful idiom.
+
 ## Worked example
 
 User is preparing Black against a 2600 opponent who plays 1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6 5.Nc3 a6 6.Be3 e5. You want to know if 7.Nb3 or 7.Nf3 is more testing.
