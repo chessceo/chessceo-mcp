@@ -45,6 +45,7 @@ function loadBundledDoc(filename: string, fallbackLabel: string): string {
 
 const ENGINE_USAGE_DOC = loadBundledDoc("engine-usage.md", "Engine usage guide");
 const PREP_STRATEGY_DOC = loadBundledDoc("prep-strategy.md", "Prep strategy guide");
+const PREP_FILES_DOC = loadBundledDoc("prep-files-guide.md", "Prep files guide");
 
 // ── HTTP ────────────────────────────────────────────────────────────
 //
@@ -71,6 +72,12 @@ const AUTHED_TOOLS = new Set([
   "list_cloud_engines",
   "stop_cloud_engine",
   "cloud_analyse",
+  "list_prep_files",
+  "search_prep_files",
+  "read_prep_file",
+  "create_prep_file",
+  "save_prep_file",
+  "delete_prep_file",
 ]);
 
 function isAuthedToolCall(body: unknown): boolean {
@@ -110,7 +117,7 @@ async function get(path: string, params: Record<string, string | number | undefi
 // LLM can act on (either configure CHESSCEO_TOKEN or generate a token in
 // user settings) rather than a generic 401 from the backend.
 async function authedRequest(
-  method: "GET" | "POST" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<unknown> {
@@ -418,6 +425,90 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "list_prep_files",
+    description:
+      "List every prep file the user has (all games inside their dedicated AI Prep collection). Returns id, PGN tags (Event, White, Black, Date, etc. — read the Event tag for the user-facing name), size, updated_at. ALWAYS call this before create_prep_file to check for existing coverage — creating a second 'Prep vs Firouzja' when one already exists is a common LLM failure. If the user has many, use search_prep_files with a query to narrow down.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "search_prep_files",
+    description:
+      "Text search over the user's prep files (matches PGN headers, comments, and content). Use this instead of list_prep_files when you know a keyword — e.g. search_prep_files(query='Firouzja') or search_prep_files(query='Najdorf').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Free-text query (opponent name, opening name, event keyword)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "read_prep_file",
+    description:
+      "Read one prep file. Returns the full PGN text and a compact tree JSON of the mainline (SAN + FEN per move) for programmatic reasoning. Also carries the `version` field you need to pass back to save_prep_file for the optimistic-lock check.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Prep file id, from list_prep_files or search_prep_files." },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "create_prep_file",
+    description:
+      "Create a new prep file. `name` becomes the Event PGN tag (user-facing label). Optional `pgn` seeds the file — if omitted, a minimal empty PGN is written and you can save_prep_file into it later.\n\n" +
+      "ALWAYS run list_prep_files (or search_prep_files with the opponent / opening keyword) BEFORE creating, so you don't duplicate an existing file. If a file already exists that fits, extend it via save_prep_file instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "User-facing name for the file — becomes the [Event] tag in the PGN. Example: 'Prep vs Firouzja (Black) 2026-07-23'.",
+        },
+        pgn: {
+          type: "string",
+          description: "Optional initial PGN content. Supports full PGN with headers and parenthesised variations. If omitted, an empty PGN is created.",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "save_prep_file",
+    description:
+      "Save (replace) a prep file's PGN content. Optimistic-lock via `expected_version` — pass the `version` you got from read_prep_file. If someone else (user in the app, or another agent session) updated the file since you read it, save returns 409 with the current version — re-read and merge.\n\n" +
+      "PGN structure guidance:\n" +
+      "- Keep the mainline clean (your top recommendation).\n" +
+      "- Alternative candidates go in parenthesised variations at the branching move.\n" +
+      "- Attach one-sentence commentary at key branch points using PGN {curly-brace comments}. Cite the actual tool output ('Lc0 gives +0.15 in this line') — don't dress the file up with unsourced chess prose.\n" +
+      "- Use PGN NAGs for evaluations: $1 !, $2 ?, $3 !!, $4 ??, $6 =, $10 = (equal), $14 +/= (slight edge), etc. Optional but nice.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Prep file id." },
+        pgn: { type: "string", description: "Full replacement PGN (headers + moves)." },
+        expected_version: {
+          type: "integer",
+          description: "The `version` you got from read_prep_file. If omitted, no optimistic check runs (last-write-wins — riskier).",
+        },
+      },
+      required: ["id", "pgn"],
+    },
+  },
+  {
+    name: "delete_prep_file",
+    description:
+      "Soft-delete a prep file. The user can restore it from the chess.ceo app's recycle bin if you deleted something valuable. Rare — usually you extend or replace instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Prep file id." },
+      },
+      required: ["id"],
+    },
+  },
+  {
     name: "read_engine_usage_guide",
     description:
       "Returns the full chess.ceo engine-usage guide: when to trust Stockfish (objective truth) vs Lc0 (practical eval), how to read disagreements between them, and how to use Lc0 contempt to find non-objective 'practical' ideas. Call this ONCE per session before running expensive `cloud_analyse` calls or when the user asks WHY the engines gave certain scores. Same content is also available as the `engine_usage_primer` prompt (for clients that surface prompts as slash commands), but many clients do not expose prompts to the model — this tool works everywhere.",
@@ -427,6 +518,12 @@ const TOOLS: Tool[] = [
     name: "read_prep_strategy_guide",
     description:
       "Returns the full chess.ceo prep-strategy guide: why win% is one weight not a verdict, why prep is a two-player game with symmetric information (opponent sees your history too), how sample size and recency change the reading, when 'revealed weaknesses' are actionable vs already patched, how to use move-order tricks with the `trs` field, and how to calibrate surprise (rare secondary lines inside the existing repertoire, not big first-move switches). Call this ONCE per session before recommending an opening plan, especially when the user is preparing for a specific real opponent.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "read_prep_files_guide",
+    description:
+      "Returns the full guide on how to store prep in the user's chess.ceo account via list_prep_files / read_prep_file / create_prep_file / save_prep_file / delete_prep_file. Covers: how to structure a repertoire PGN (mainline + variations + comments + NAGs), the critical 'search-before-create' habit to avoid duplicates, optimistic-locking with `version`, and how to write comments that cite tool output instead of inventing chess prose. Call this ONCE per session before your first create_prep_file / save_prep_file call.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -541,6 +638,33 @@ type EngineBlock = {
   lines?: Array<{ pv?: string[] }>;
   bestMove?: string;
 };
+
+// Parse a PGN string into a compact tree JSON view — mainline as a
+// linear array of {san, fen} with a `variations` array on any node that
+// branches. Uses chess.js's built-in PGN loader. Best-effort: on parse
+// failure, returns null and the caller falls back to raw PGN only.
+type TreeNode = {
+  san: string;
+  fen: string;
+  comment?: string;
+  variations?: TreeNode[][];
+};
+function pgnToTree(pgn: string): TreeNode[] | null {
+  try {
+    const board = new Chess();
+    // chess.js loadPgn accepts full PGN incl. tags; loadPgn returns true on
+    // success or throws on newer versions. Wrap defensively.
+    (board as unknown as { loadPgn: (p: string) => boolean }).loadPgn(pgn);
+    // history({verbose:true}) walks the mainline only; variations aren't
+    // exposed by chess.js's built-in PGN loader at time of writing. If the
+    // PGN carries parenthesised variations they get flattened.
+    const hist = board.history({ verbose: true }) as Array<{ san: string; after: string; before: string }>;
+    if (hist.length === 0) return [];
+    return hist.map(h => ({ san: h.san, fen: h.after }));
+  } catch {
+    return null;
+  }
+}
 
 // Rewrite availableMoves[].move UCI → SAN. The prep + position-stats
 // endpoints return moves in UCI on the wire — same LLM-readability
@@ -715,11 +839,49 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return convertCloudSnapshotResponse(raw, fen);
     }
 
+    case "list_prep_files":
+      return authedRequest("GET", "/api/agent/prep-files");
+
+    case "search_prep_files":
+      return authedRequest("GET", `/api/agent/prep-files/search?q=${encodeURIComponent(String(args.query))}`);
+
+    case "read_prep_file": {
+      const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
+      // MCP layer adds the tree JSON view — backend stays pure PGN in/out.
+      // If parse fails the LLM still has the raw PGN text to work with.
+      if (raw && typeof raw === "object") {
+        const g = raw as { pgnContent?: string };
+        if (typeof g.pgnContent === "string") {
+          const tree = pgnToTree(g.pgnContent);
+          return { ...(raw as object), tree };
+        }
+      }
+      return raw;
+    }
+
+    case "create_prep_file":
+      return authedRequest("POST", "/api/agent/prep-files", {
+        name: String(args.name),
+        pgn: typeof args.pgn === "string" ? args.pgn : undefined,
+      });
+
+    case "save_prep_file":
+      return authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`, {
+        pgn: String(args.pgn),
+        expected_version: typeof args.expected_version === "number" ? args.expected_version : undefined,
+      });
+
+    case "delete_prep_file":
+      return authedRequest("DELETE", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
+
     case "read_engine_usage_guide":
       return { guide: ENGINE_USAGE_DOC };
 
     case "read_prep_strategy_guide":
       return { guide: PREP_STRATEGY_DOC };
+
+    case "read_prep_files_guide":
+      return { guide: PREP_FILES_DOC };
 
     case "prep_snapshot": {
       const me = Number(args.fide_id_me);
