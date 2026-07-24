@@ -133,6 +133,17 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 
 **Don't name the engine unless it adds signal.** "SF: +0.15" for a routine position is noise. Name it when there's a mismatch worth flagging: `{Human predictor gives Black 47% win despite the -0.35 objective eval — Elo gap does the work.}`
 
+**Only quote engine numbers for positions you actually called `cloud_analyse` on** (or that carry a `ceoEval` from an earlier auto_evaluate, or an auto-attached `.eval` from a query tool). Do NOT infer an eval for a parent position from its children and then write "both engines 0.00" on the parent — that reads as a measurement but is a guess. If the position wasn't analysed, either analyse it or omit the number: prose can say "both continuations run to 0.00, so this looks balanced" without claiming an eval that wasn't taken.
+
+**When you set `contempt`, attribute it to Lc0 only.** Contempt affects Lc0 exclusively — Stockfish always analyses objectively. So don't write "both engines at contempt −15" — that misleads the reader into thinking SF was biased too. Correct phrasings:
+
+- `{Lc0 (contempt −15): 0.00 — even biased toward Black, still balanced. SF objective: 0.00.}`
+- `{With Lc0 nudged toward Black (contempt −15) it still picks Qg6 at 0.00; SF's objective read also 0.00.}`
+
+If you only quote the Lc0 number, disclose the bias in the same sentence — `{Lc0 gives Black +0.30}` with an undisclosed `contempt=-15` is a false objectivity claim.
+
+**Lc0 depth < 15 is a shallow read.** Lc0's node budget is capped per call, so on many positions it stops well before Stockfish. If the Lc0 leg comes back at depth 8–14, treat it as a hint, not a verdict — and weight Stockfish's deeper number more when the two disagree. Don't dress a shallow Lc0 number as authoritative in prose.
+
 ### Before you write any commentary: describe_position
 
 LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent captures, miscount pieces. Before you write a comment describing what's happening in a position, call `describe_position(fen)`. It's pure computation (no engine, ~1ms) and returns the same board state a human sees:
