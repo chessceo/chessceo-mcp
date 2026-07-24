@@ -19,16 +19,41 @@ import {
   type PrepFile,
   type PrepNode,
   type PrepTags,
+  type StoredEngineEval,
+  type StoredEval,
 } from "./types.js";
 
 const CAL_RE = /\[%cal\s+([^\]]+)\]/g;
 const CSL_RE = /\[%csl\s+([^\]]+)\]/g;
-const ANY_CMD_RE = /\[%[a-z]+\s+[^\]]+\]/g;
+const CEO_EVAL_RE = /\[%ceo-eval\s+([^\]]+)\]/g;
+const ANY_CMD_RE = /\[%[a-z-]+\s+[^\]]+\]/g;
 
-// Parse a comment string, splitting out visual annotations from prose.
+// Parse a `sf=+0.20/38` or `lc0=M-5/22` fragment into its numeric parts.
+// Returns null if the value doesn't parse; the parser tolerates missing
+// depth and mate notation.
+function parseEngineEvalFragment(raw: string): StoredEngineEval | null {
+  const m = raw.match(/^([+-]?)(?:M(-?\d+)|(\d+(?:\.\d+)?))(?:\/(\d+))?$/i);
+  if (!m) return null;
+  const sign = m[1] === "-" ? -1 : 1;
+  const out: StoredEngineEval = {};
+  if (m[2] !== undefined) {
+    out.mate = sign * parseInt(m[2], 10);
+  } else if (m[3] !== undefined) {
+    // pawn units → centipawns
+    out.cp = Math.round(sign * parseFloat(m[3]) * 100);
+  } else {
+    return null;
+  }
+  if (m[4] !== undefined) out.depth = parseInt(m[4], 10);
+  return out;
+}
+
+// Parse a comment string, splitting out visual annotations + stored
+// evals from prose.
 export function parseCommentAnnotations(comment: string): {
   text: string;
   annotations?: PrepAnnotations;
+  ceoEval?: StoredEval;
 } {
   const arrows: PrepAnnotations["arrows"] = [];
   const highlights: PrepAnnotations["highlights"] = [];
@@ -46,9 +71,30 @@ export function parseCommentAnnotations(comment: string): {
     }
   }
 
+  let ceoEval: StoredEval | undefined;
+  for (const m of comment.matchAll(CEO_EVAL_RE)) {
+    const ev: StoredEval = ceoEval ?? {};
+    for (const entry of m[1].trim().split(/\s+/)) {
+      const eq = entry.indexOf("=");
+      if (eq < 0) continue;
+      const k = entry.slice(0, eq).toLowerCase();
+      const v = entry.slice(eq + 1);
+      if (k === "sf") {
+        const parsed = parseEngineEvalFragment(v);
+        if (parsed) ev.sf = parsed;
+      } else if (k === "lc0") {
+        const parsed = parseEngineEvalFragment(v);
+        if (parsed) ev.lc0 = parsed;
+      } else if (k === "nag") {
+        if (/^\$\d+$/.test(v)) ev.nag = v;
+      }
+    }
+    if (ev.sf || ev.lc0 || ev.nag) ceoEval = ev;
+  }
+
   const text = comment.replace(ANY_CMD_RE, "").replace(/\s+/g, " ").trim();
   const annotations = arrows.length || highlights.length ? { arrows, highlights } : undefined;
-  return { text, annotations };
+  return { text, annotations, ceoEval };
 }
 
 // Parse full PGN → PrepFile. Throws on unrecoverable errors (no games,
@@ -78,6 +124,7 @@ export function parsePGN(pgn: string): PrepFile {
     const parsed = parseCommentAnnotations(gameComments.join(" "));
     if (parsed.text) root.comment = parsed.text;
     if (parsed.annotations) root.annotations = parsed.annotations;
+    if (parsed.ceoEval) root.ceoEval = parsed.ceoEval;
   }
 
   const build = (childNode: any, treeParent: PrepNode, pos: Position, ply: number): void => {
@@ -110,6 +157,7 @@ export function parsePGN(pgn: string): PrepFile {
       const parsed = parseCommentAnnotations(combined.join(" "));
       if (parsed.text) node.comment = parsed.text;
       if (parsed.annotations) node.annotations = parsed.annotations;
+      if (parsed.ceoEval) node.ceoEval = parsed.ceoEval;
     }
 
     if (Array.isArray(childNode.data.nags) && childNode.data.nags.length > 0) {

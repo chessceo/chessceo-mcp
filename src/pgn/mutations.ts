@@ -19,6 +19,7 @@ import type {
   PrepAnnotations,
   PrepFile,
   PrepNode,
+  StoredEval,
 } from "./types.js";
 
 export class MutationError extends Error {}
@@ -113,6 +114,16 @@ export function promoteVariation(file: PrepFile, path: Path): { file: PrepFile; 
   const rest = parent.children.filter((_, i) => i !== idx);
   parent.children = [promoted, ...rest];
   return { file: { tags: file.tags, root: newRoot }, path: [...parentPath, 0] };
+}
+
+// Replace the stored ceoEval on the node at `path`. Passing null clears.
+// This is what auto_evaluate calls per-node; also exposed as an op the
+// LLM can invoke directly if it wants to overwrite a stale eval.
+export function setCeoEval(file: PrepFile, path: Path, ev: StoredEval | null): { file: PrepFile; path: Path } {
+  const { root: newRoot, target } = cloneOnPath(file.root, path);
+  if (ev === null || (!ev.sf && !ev.lc0 && !ev.nag)) delete target.ceoEval;
+  else target.ceoEval = ev;
+  return { file: { tags: file.tags, root: newRoot }, path };
 }
 
 // Set or clear a tag. Passing null / empty removes.

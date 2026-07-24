@@ -21,6 +21,7 @@ import {
   MutationError,
   promoteVariation,
   setAnnotations,
+  setCeoEval,
   setComment,
   setNags,
   setTag,
@@ -33,6 +34,8 @@ import type {
   PrepFile,
   PrepHighlight,
   PrepNode,
+  StoredEngineEval,
+  StoredEval,
 } from "./pgn/types.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -222,6 +225,7 @@ const TOOLS: Tool[] = [
     description:
       "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc.\n\n" +
       "GROUNDING: every claim about the opponent's repertoire must trace back to this tool's output. Don't assert 'they play sharply' or 'they hate isolated queen pawn' without pointing at the actual game counts / win rates in the response. Don't invent 'the opponent typically plays X' — check first. Compute is cheap: run this on more branches instead of pattern-matching from a chess book.\n\n" +
+      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read at the requested position (top move + score + PV) and the corresponding NAG. Do NOT fire a separate cloud_analyse for the same FEN — the eval is right there.\n\n" +
       "Reading the response — CRITICAL:\n" +
       "• Win % is one weight, not a verdict. Recommend 1.b3 over 1.d4 because 60% > 50% is wrong. Sample size matters (3 games at 66% is noise; 300 at 55% is signal); avgWhite / avgBlack per move show the rating context (a big score often means a rating gap, not repertoire truth).\n" +
       "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted; a weak opponent won't patch it, a strong or improving one already has (but structural weaknesses like 'bad in Catalan structures' hold anyway).\n" +
@@ -266,7 +270,8 @@ const TOOLS: Tool[] = [
   {
     name: "get_position_stats",
     description:
-      "Move statistics from all 11.7M+ indexed games at a given position — game counts, win percentages, top continuations. Answers 'from position P, how often does White play 4. O-O vs 4. d3, and which scores better'.",
+      "Move statistics from all 11.7M+ indexed games at a given position — game counts, win percentages, top continuations. Answers 'from position P, how often does White play 4. O-O vs 4. d3, and which scores better'.\n\n" +
+      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read (top move + score + PV) and the corresponding NAG. Do NOT fire a separate cloud_analyse for the same FEN — the eval is right there.",
     inputSchema: {
       type: "object",
       properties: {
@@ -736,7 +741,8 @@ const TOOLS: Tool[] = [
   {
     name: "prep_snapshot",
     description:
-      "One call, three parallel fetches at the same position: opponent's stats on their side, your stats on your side, and the 11.7M-game general database at that position. Use this while walking the opening tree — one round trip instead of three separate calls, and you can compare the three views directly (e.g. opponent has 2 games here but the general DB has 8k → prep candidate).",
+      "One call, three parallel fetches at the same position: opponent's stats on their side, your stats on your side, and the 11.7M-game general database at that position. Use this while walking the opening tree — one round trip instead of three separate calls, and you can compare the three views directly (e.g. opponent has 2 games here but the general DB has 8k → prep candidate).\n\n" +
+      "AUTO-EVAL: if a cloud combo instance is running, the response includes a top-level `.eval` (Stockfish + Lc0 read at the shared position) so you get four signals in one call. Do NOT fire cloud_analyse separately for the same FEN.",
     inputSchema: {
       type: "object",
       properties: {
@@ -811,6 +817,28 @@ function uciMoveToSAN(startFen: string, uci: string): string {
   }
 }
 
+// Fetch a compact cloud eval for `fen`. Returns null on any error — no
+// running combo instance, engine failure, network timeout. Callers
+// attach the result to their response as `.eval` so the LLM has the
+// stockfish + lc0 read without a separate tool call.
+type CompactEval = {
+  nag: string | null;
+  stockfish?: { cp?: number; mate?: number; bestMove?: string; pv?: string[] };
+  lc0?:       { cp?: number; mate?: number; bestMove?: string; pv?: string[] };
+};
+
+async function fetchCompactEval(fen: string): Promise<CompactEval | null> {
+  try {
+    const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse",
+      { fen, movetime_ms: 1500, multipv: 1 });
+    const converted = convertCloudSnapshotResponse(raw, fen);
+    const stored = analysisToStoredEval(converted, fen);
+    return storedEvalToCompact(stored, converted);
+  } catch {
+    return null;
+  }
+}
+
 // Rewrite the /api/agent/cloud-engines/analyse response (two engines,
 // each with lines[] and a bestMove) so PVs and bestMove come back in SAN.
 function convertCloudSnapshotResponse(raw: unknown, startFen: string): unknown {
@@ -868,6 +896,10 @@ function dispatchMutation(file: PrepFile, op: Record<string, unknown>): { file: 
         arrows.length === 0 && highlights.length === 0 ? null : { arrows, highlights };
       return setAnnotations(file, path, ann);
     }
+    case "set_ceo_eval": {
+      const ev = op.ceoEval as StoredEval | null | undefined;
+      return setCeoEval(file, path, ev ?? null);
+    }
     case "delete_subtree":
       return deleteSubtree(file, path);
     case "promote_variation":
@@ -914,8 +946,10 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
 }
 
 // Auto-evaluate: walk the tree from `path`, run cloud_analyse on each node,
-// convert the SF score to a NAG per the standard thresholds, and apply
-// everything in one batch mutation. Uses batching to avoid N saves.
+// stash the compact per-engine eval in the node's `ceoEval` field (which
+// survives across sessions and appears on every read_prep_file), and
+// derive the NAG from the SF score. Both writes go via a single batch
+// mutation at the end so a 200-node evaluate is one save.
 async function autoEvaluate(args: Args): Promise<unknown> {
   const id = String(args.id);
   const startPath: Path = Array.isArray(args.path) ? (args.path as number[]) : [];
@@ -932,7 +966,7 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   const targets: Target[] = [];
   const walk = (node: PrepNode, path: Path) => {
     if (path.length > 0) {
-      if (!onlyMissing || !(node.nags && node.nags.length > 0)) {
+      if (!onlyMissing || !node.ceoEval) {
         targets.push({ path, fen: node.fen });
       }
     }
@@ -943,8 +977,8 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   if (targets.length === 0) return { ok: true, evaluated: 0, skipped: 0, version: g.version };
 
   // Dispatch cloud_analyse in parallel with a 4-way cap so we don't
-  // over-saturate the engine's WS connection cap (single-client per port).
-  const nags: { path: Path; nag: string }[] = [];
+  // over-saturate the engine-ws connection cap (single-client per port).
+  const stored: { path: Path; ev: StoredEval }[] = [];
   const CONCURRENCY = 4;
   let cursor = 0;
   async function worker() {
@@ -957,22 +991,30 @@ async function autoEvaluate(args: Args): Promise<unknown> {
           "/api/agent/cloud-engines/analyse",
           { fen: t.fen, movetime_ms: movetimeMs, multipv: 1 },
         );
-        const nag = analysisToNag(analysis);
-        if (nag) nags.push({ path: t.path, nag });
+        const ev = analysisToStoredEval(analysis, t.fen);
+        if (ev) stored.push({ path: t.path, ev });
       } catch {
-        // ignore per-node failures — best-effort auto-annotation
+        // best-effort — a single failed node shouldn't kill the batch
       }
     }
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
-  if (nags.length === 0) return { ok: true, evaluated: 0, skipped: targets.length, version: g.version };
+  if (stored.length === 0) return { ok: true, evaluated: 0, skipped: targets.length, version: g.version };
 
-  // Apply all NAGs as a single batch.
-  const batchMutations = nags.map(n => ({ op: "set_nags", path: n.path, nags: [n.nag] }));
+  // One batch, two ops per node: set_ceo_eval (persistent) + set_nags
+  // (visible glyph on the app-side board). The NAG lives inside ceoEval
+  // too so consumers who want just the number use the escape tag; the
+  // separate NAG is for standard PGN readers.
+  type BatchOp = { op: string; path: Path; nags?: string[]; ceoEval?: StoredEval };
+  const batchMutations: BatchOp[] = [];
+  for (const s of stored) {
+    batchMutations.push({ op: "set_ceo_eval", path: s.path, ceoEval: s.ev });
+    if (s.ev.nag) batchMutations.push({ op: "set_nags", path: s.path, nags: [s.ev.nag] });
+  }
   const saveResult = await applyBatchMutations({ id, mutations: batchMutations, expected_version: g.version } as Args);
   const sr = saveResult as { version?: number };
-  return { ok: true, evaluated: nags.length, skipped: targets.length - nags.length, version: sr.version };
+  return { ok: true, evaluated: stored.length, skipped: targets.length - stored.length, version: sr.version };
 }
 
 // Walk chess.js-free: resolve a path against a tree, throw if invalid.
@@ -987,31 +1029,78 @@ function pathIntoTree(root: PrepNode, path: Path): PrepNode {
   return cur;
 }
 
-// Read Stockfish's rank-1 line, convert to White-POV centipawns, and
-// bucket into a NAG per the standard threshold table. Returns null if
-// the response shape doesn't carry a usable score.
-function analysisToNag(analysis: unknown): string | null {
+// Read the cloud analyse response and build a StoredEval (compact form —
+// no PVs, White-POV cp / mate, depth, and derived NAG). Returns null if
+// there's no usable Stockfish signal (SF is the source of truth for
+// the NAG per docs).
+function analysisToStoredEval(analysis: unknown, fen: string): StoredEval | null {
   if (!analysis || typeof analysis !== "object") return null;
-  const r = analysis as { stockfish?: { lines?: Array<{ scoreCp?: number; mate?: number }>; }; fen?: string };
-  const line = r.stockfish?.lines?.[0];
-  if (!line) return null;
-  // Determine side to move from the FEN so we can convert side-to-move
-  // POV score to White POV.
-  const whiteToMove = typeof r.fen === "string" && / w /.test(r.fen);
-  let cp: number;
-  if (typeof line.mate === "number") {
-    cp = line.mate > 0 ? 10000 : -10000;
-  } else if (typeof line.scoreCp === "number") {
-    cp = line.scoreCp;
-  } else {
-    return null;
-  }
-  if (!whiteToMove) cp = -cp;
-  const abs = Math.abs(cp);
+  const r = analysis as {
+    stockfish?: { depth?: number; lines?: Array<{ depth?: number; scoreCp?: number; mate?: number }> };
+    lc0?:       { depth?: number; lines?: Array<{ depth?: number; scoreCp?: number; mate?: number }> };
+  };
+  const whiteToMove = / w /.test(fen);
+  const flip = (n: number) => (whiteToMove ? n : -n);
+
+  const engineEval = (block: typeof r.stockfish): StoredEngineEval | undefined => {
+    const line = block?.lines?.[0];
+    if (!line) return undefined;
+    const depth = line.depth ?? block?.depth;
+    if (typeof line.mate === "number") return { mate: flip(line.mate), depth };
+    if (typeof line.scoreCp === "number") return { cp: flip(line.scoreCp), depth };
+    return undefined;
+  };
+
+  const sf = engineEval(r.stockfish);
+  const lc0 = engineEval(r.lc0);
+  if (!sf && !lc0) return null;
+
+  const ev: StoredEval = {};
+  if (sf) ev.sf = sf;
+  if (lc0) ev.lc0 = lc0;
+  ev.nag = nagFromCp(sf?.cp, sf?.mate) ?? nagFromCp(lc0?.cp, lc0?.mate) ?? undefined;
+  return ev;
+}
+
+function nagFromCp(cp?: number, mate?: number): string | null {
+  let effective: number;
+  if (typeof mate === "number") effective = mate > 0 ? 10000 : -10000;
+  else if (typeof cp === "number") effective = cp;
+  else return null;
+  const abs = Math.abs(effective);
   if (abs < 25) return "$10";
-  if (abs < 60)  return cp > 0 ? "$14" : "$15";
-  if (abs < 130) return cp > 0 ? "$16" : "$17";
-  return cp > 0 ? "$18" : "$19";
+  if (abs < 60)  return effective > 0 ? "$14" : "$15";
+  if (abs < 130) return effective > 0 ? "$16" : "$17";
+  return effective > 0 ? "$18" : "$19";
+}
+
+// Adapter for the compact eval attached to live query responses. Same
+// derivation logic; different output shape (needs the .nag + summary
+// used by get_position_stats / prep_snapshot).
+function storedEvalToCompact(ev: StoredEval | null, analysis: unknown): CompactEval | null {
+  if (!ev) return null;
+  const a = analysis as {
+    stockfish?: { bestMove?: string; lines?: Array<{ pv?: string[] }> };
+    lc0?:       { bestMove?: string; lines?: Array<{ pv?: string[] }> };
+  };
+  const compact: CompactEval = { nag: ev.nag ?? null };
+  if (ev.sf) {
+    compact.stockfish = {
+      cp: ev.sf.cp,
+      mate: ev.sf.mate,
+      bestMove: a.stockfish?.bestMove,
+      pv: a.stockfish?.lines?.[0]?.pv,
+    };
+  }
+  if (ev.lc0) {
+    compact.lc0 = {
+      cp: ev.lc0.cp,
+      mate: ev.lc0.mate,
+      bestMove: a.lc0?.bestMove,
+      pv: a.lc0?.lines?.[0]?.pv,
+    };
+  }
+  return compact;
 }
 
 // Load-mutate-save: fetch current PGN, parse, apply mutation, re-export,
@@ -1159,18 +1248,29 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       }
       if (typeof args.limit === "number") params.limit = args.limit;
       if (typeof args.offset === "number") params.offset = args.offset;
-      const raw = await get("/api/chess/prep/by-player", params);
-      return convertAvailableMovesToSAN(raw, resolveFenFromArgs(args));
+      const effectiveFen = resolveFenFromArgs(args);
+      const [raw, ev] = await Promise.all([
+        get("/api/chess/prep/by-player", params),
+        fetchCompactEval(effectiveFen),
+      ]);
+      const converted = convertAvailableMovesToSAN(raw, effectiveFen);
+      if (ev && converted && typeof converted === "object") (converted as { eval?: CompactEval }).eval = ev;
+      return converted;
     }
 
     case "get_position_stats": {
       const fen = resolveFenFromArgs(args);
-      const raw = await get("/api/chess/database/main", {
-        fen,
-        limit: typeof args.limit === "number" ? args.limit : 20,
-        sort: "relevance",
-      });
-      return convertAvailableMovesToSAN(raw, fen);
+      const [raw, ev] = await Promise.all([
+        get("/api/chess/database/main", {
+          fen,
+          limit: typeof args.limit === "number" ? args.limit : 20,
+          sort: "relevance",
+        }),
+        fetchCompactEval(fen),
+      ]);
+      const converted = convertAvailableMovesToSAN(raw, fen);
+      if (ev && converted && typeof converted === "object") (converted as { eval?: CompactEval }).eval = ev;
+      return converted;
     }
 
 case "predict_human_move": {
@@ -1342,14 +1442,16 @@ case "predict_human_move": {
         ...(line.length > 0 ? { line } : { fen }),
       });
 
-      const [opponent, you, general] = await Promise.all([
+      const [opponent, you, general, ev] = await Promise.all([
         get("/api/chess/prep/by-player", prepParams(opp, oppColor)),
         get("/api/chess/prep/by-player", prepParams(me, myColor)),
         get("/api/chess/database/main", { fen, limit: 20, sort: "relevance" }),
+        fetchCompactEval(fen),
       ]);
 
       return {
         position: { line, fen, my_color: myColor },
+        eval: ev,
         opponent: convertAvailableMovesToSAN(opponent, fen),
         you: convertAvailableMovesToSAN(you, fen),
         general: convertAvailableMovesToSAN(general, fen),

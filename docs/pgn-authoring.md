@@ -124,6 +124,8 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 
 **Prefer auto_evaluate for the NAG.** Don't hand-write NAGs when building — call `auto_evaluate(id)` after your build and it assigns the right glyph to every node from actual engine analysis. Manual `set_nags` is for overrides (mark a novelty with $146, flag a `$5 !?` piece sac).
 
+**Persisted evals travel with the file.** Every node with an eval gets `ceoEval: { sf: {cp: 25, depth: 32}, lc0: {cp: 30, depth: 18}, nag: "$14" }` on subsequent `read_prep_file` calls. Stored as `[%ceo-eval sf=+0.25/32 lc0=+0.30/18 nag=$14]` inside the PGN comment (an escape tag the app hides from the board view, just like [%cal] / [%csl]). So a re-read after auto_evaluate gives you every position's number without re-running cloud_analyse. Query tools (get_position_stats, get_player_preparation, prep_snapshot) also auto-attach a live `eval` at the request position when a cloud engine is running.
+
 **Engine numbers in prose: brief only.** If you must reference a number, keep it compact:
 
 - Good: `{... +0.2}` — bare number at the end of a note

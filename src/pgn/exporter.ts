@@ -2,7 +2,7 @@
 // same PGN modulo whitespace, so paths stay stable across
 // export→reparse cycles.
 
-import { codeFromColor, type PrepFile, type PrepNode } from "./types.js";
+import { codeFromColor, type PrepFile, type PrepNode, type StoredEngineEval, type StoredEval } from "./types.js";
 
 // Standard PGN "seven tag roster" order. We emit these first (in the
 // order they appear in tags), then any extra tags in insertion order.
@@ -119,22 +119,52 @@ function renderNagsAndComment(node: PrepNode): string {
   return bits.join(" ");
 }
 
-// Build the [%cal ...] / [%csl ...] fragments if this node has arrows
-// or highlighted squares. Returns "" if none.
+// Build the [%cal ...] / [%csl ...] / [%ceo-eval ...] fragments if
+// this node has any. Returns "" if none.
 function renderNodeAnnotation(node: PrepNode): string {
-  if (!node.annotations) return "";
   const bits: string[] = [];
-  if (node.annotations.arrows.length > 0) {
-    const entries = node.annotations.arrows
-      .map(a => `${codeFromColor(a.color)}${a.from}${a.to}`)
-      .join(",");
-    bits.push(`[%cal ${entries}]`);
+  if (node.annotations) {
+    if (node.annotations.arrows.length > 0) {
+      const entries = node.annotations.arrows
+        .map(a => `${codeFromColor(a.color)}${a.from}${a.to}`)
+        .join(",");
+      bits.push(`[%cal ${entries}]`);
+    }
+    if (node.annotations.highlights.length > 0) {
+      const entries = node.annotations.highlights
+        .map(h => `${codeFromColor(h.color)}${h.square}`)
+        .join(",");
+      bits.push(`[%csl ${entries}]`);
+    }
   }
-  if (node.annotations.highlights.length > 0) {
-    const entries = node.annotations.highlights
-      .map(h => `${codeFromColor(h.color)}${h.square}`)
-      .join(",");
-    bits.push(`[%csl ${entries}]`);
+  if (node.ceoEval) {
+    const s = renderCeoEval(node.ceoEval);
+    if (s) bits.push(s);
   }
   return bits.join(" ");
+}
+
+// Serialise a stored eval as `[%ceo-eval sf=+0.20/38 lc0=+0.35/24 nag=$14]`.
+// Compact: no PVs (regenerable via cloud_analyse), decimal cp for
+// readability, mate as `MN`/`-MN`, depth as `/N`.
+function renderCeoEval(ev: StoredEval): string {
+  const bits: string[] = [];
+  if (ev.sf)  bits.push(`sf=${formatEngineEval(ev.sf)}`);
+  if (ev.lc0) bits.push(`lc0=${formatEngineEval(ev.lc0)}`);
+  if (ev.nag) bits.push(`nag=${ev.nag}`);
+  return bits.length > 0 ? `[%ceo-eval ${bits.join(" ")}]` : "";
+}
+
+function formatEngineEval(e: StoredEngineEval): string {
+  let body: string;
+  if (typeof e.mate === "number") {
+    body = e.mate >= 0 ? `+M${e.mate}` : `M${e.mate}`; // "+M5" / "M-5"
+  } else if (typeof e.cp === "number") {
+    const pawns = e.cp / 100;
+    body = pawns >= 0 ? `+${pawns.toFixed(2)}` : pawns.toFixed(2);
+  } else {
+    body = "+0.00";
+  }
+  if (typeof e.depth === "number") body += `/${e.depth}`;
+  return body;
 }
