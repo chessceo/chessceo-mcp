@@ -22,7 +22,7 @@ Reading:
 Building (use these — one call for many ops):
 
 - **`apply_mutations(id, mutations[])`** — batch. This is the primary build tool. Send 100 mutations in one call → one load-parse-mutate-save cycle instead of 100. When you're writing a repertoire from scratch, EVERYTHING should go through this. Individual mutation tools are for surgical follow-up edits, not for bulk work.
-- **`add_line(id, parent_id, sans[])`** — a whole linear variation in one op. Cleaner than N `add_move` ops for straight lines.
+- **`add_line(id, parent_id, sans[])`** — a whole linear variation in one op. Cleaner than N `add_move` ops for straight lines. Overlapping prefixes with an existing branch **join** (same SAN from the same position IS the same move) — see below.
 - **`auto_evaluate(id, node_id?)`** — walk from a node and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every descendant via cloud_analyse. **Does NOT set visible NAGs** — the numbers land in a hidden `[%ceo-eval]` tag so you can read them back later. NAG placement (`$1` `!`, `$14` `⩲`, `$16` `±`, `$18` `+−`, etc.) is your editorial call. Skip nodes that already have a stored eval by default.
 
 Per-op mutation tools (single-op calls, use for edits after the bulk build):
@@ -75,6 +75,24 @@ If you know the tree ahead of time (writing from scratch), the deterministic rec
 // Then the variation branching after Nf3:
 {op: "add_line", parent_id: NF3, sans: ["Nc6","Bb5","Bd7"]}
 ```
+
+### add_move / add_line join on existing SAN
+
+`add_move` and `add_line` are **idempotent on SAN**: if a child with that SAN already exists under the parent, they return the existing child's id rather than creating a duplicate. In chess, same SAN from the same position IS the same move — two sibling children with SAN "d5" would be nonsensical.
+
+This means you can freely send `add_line` batches that share a prefix — they build a clean Y-shape at the divergence point, not duplicate spines.
+
+```
+// Two Ruy Lopez lines that share the first 5 plies, diverging at Black's 3rd move:
+{op: "add_line", parent_id: "r", sans: ["e4","e5","Nf3","Nc6","Bb5","Nf6","O-O"]}   // Berlin
+{op: "add_line", parent_id: "r", sans: ["e4","e5","Nf3","Nc6","Bb5","a6","Ba4"]}     // Steinitz
+
+// Result: single spine e4→e5→Nf3→Nc6→Bb5, then Bb5 has TWO children (Nf6, a6).
+// Both add_line responses report every id on the resulting line, including
+// the joined-prefix nodes, so you can address any of them next.
+```
+
+**Consequence for building repertoires**: you don't have to hand-decompose overlapping variations into a mainline + variation pair. Just send each variation as its own `add_line` from the same starting `parent_id`; the tree will de-dup the shared prefix automatically. Use `promote_variation` afterwards to pick which continuation is the mainline at the branch.
 
 ## Variations vs prose
 

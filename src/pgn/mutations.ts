@@ -29,12 +29,29 @@ export class MutationError extends Error {}
 // the LLM; the underlying path is an implementation detail.
 export type MutationResult = { file: PrepFile; id: string };
 
-// Add a SAN move as a new child under `parentPath`. Appends — becomes
-// a variation if the parent already has children (mainline is
-// children[0]). Use promoteVariation afterwards to switch mainline.
-// Returns the new node's stable id (derived from parent.id + san).
+// Add a SAN move as a new child under `parentPath`. **Idempotent on
+// SAN**: if a child with this SAN already exists under the parent, we
+// return that existing child's id and leave the file unchanged. Same
+// SAN from the same position IS the same move in chess — appending a
+// duplicate sibling would (a) let the LLM create ambiguous "two lines
+// both starting with d5" trees and (b) produce two nodes with the
+// same content-derived id. Frontend's MoveService.playMove has the
+// same "append new or navigate to existing" behaviour; this mirrors it.
+//
+// If there's no existing child with that SAN, we validate the move,
+// derive the new id from (parent.id, san), and append. Because
+// mainline is children[0], any appended move becomes a variation
+// unless the parent had no children yet; use promoteVariation to
+// switch mainline afterwards.
 export function addMove(file: PrepFile, parentPath: Path, san: string): MutationResult {
   const parent = getNode(file.root, parentPath);
+
+  // Idempotence: join to an existing child with the same SAN.
+  const existing = parent.children.find(c => c.san === san);
+  if (existing) {
+    return { file, id: existing.id };
+  }
+
   const move = validateSan(parent.fen, san);
   const posSetup = parseFen(parent.fen);
   if (posSetup.isErr) throw new MutationError(`bad parent FEN in tree: ${posSetup.error}`);
@@ -63,9 +80,16 @@ export function addMove(file: PrepFile, parentPath: Path, san: string): Mutation
 }
 
 // Add a linear sequence of moves under `parentPath` — one call for a
-// whole variation instead of N add_move calls. Each move becomes the
-// mainline child (children[0]) of the previous. Returns the ids and
-// SANs of every added node so the LLM can address any of them next.
+// whole variation instead of N add_move calls. Inherits addMove's
+// idempotence: if the line's prefix overlaps an existing branch, we
+// join to it and only start creating new nodes at the divergence
+// point. So two `add_line` calls sharing a prefix (e.g. `[d5, Bb5,
+// Nd7]` and `[d5, Bb5, Ne4]`) build a proper Y-shape — one d5 → one
+// Bb5 → two siblings from there — not two duplicate chains.
+//
+// Returns the ids and SANs of every node along the resulting line
+// (both joined and newly-created), so the LLM can address any of
+// them next.
 export function addLine(
   file: PrepFile,
   parentPath: Path,
@@ -80,11 +104,13 @@ export function addLine(
   for (const san of sans) {
     const step = addMove(cur, curPath, san);
     cur = step.file;
-    // The move we just appended is the parent's last child — extend
-    // the walked path with that child index so the next move lands on
-    // top of it (extending the line, not creating a sibling).
+    // Find the child we just addressed (whether we appended a new
+    // node or joined to an existing one) by its id, so the next
+    // iteration extends from the RIGHT node — not necessarily the
+    // parent's last child.
     const parent = getNode(cur.root, curPath);
-    const childIdx = parent.children.length - 1;
+    const childIdx = parent.children.findIndex(c => c.id === step.id);
+    if (childIdx < 0) throw new MutationError(`internal: node ${step.id} not found after addMove`);
     curPath = [...curPath, childIdx];
     line.push({ id: step.id, san });
   }

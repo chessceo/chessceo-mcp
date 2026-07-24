@@ -18,11 +18,15 @@ import type { PrepNode, Path } from "./types.js";
 // Special ID for the root position (starting FEN, no move played).
 export const ROOT_ID = "r";
 
-// 8-hex-char content hash. Root is "r". Every other node's id is
-// derived from (parent.id, san). Two nodes with the same (parent, san)
-// can't co-exist as siblings in chess anyway, so within-parent
-// collisions are impossible. Cross-tree collisions in 32 bits at 1000
-// nodes are ~10^-4 — we throw on the rare hit rather than mask it.
+// 8-hex-char (32-bit) content hash. Root is "r". Every other node's
+// id is derived from (parent.id, san). Two children of the same parent
+// with the same SAN are impossible in real chess — same SAN from the
+// same position IS the same move — so within-parent same-id events
+// mean the caller tried to duplicate a move that already exists;
+// `addMove` handles that by joining to the existing child rather than
+// appending a duplicate (see mutations.ts). Cross-tree birthday
+// collisions in 32 bits at 1000 nodes are ~10^-4 — rare, and thrown
+// at parse time rather than silently masked.
 export function deriveNodeId(parentId: string, san: string): string {
   const h = createHash("sha256");
   h.update(parentId);
