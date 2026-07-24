@@ -94,6 +94,49 @@ This means you can freely send `add_line` batches that share a prefix — they b
 
 **Consequence for building repertoires**: you don't have to hand-decompose overlapping variations into a mainline + variation pair. Just send each variation as its own `add_line` from the same starting `parent_id`; the tree will de-dup the shared prefix automatically. Use `promote_variation` afterwards to pick which continuation is the mainline at the branch.
 
+## What good looks like
+
+Before writing your first substantial file, call `read_example_prep_files` — it returns two reference PGNs by a strong human coach. Read the full files; the rhythm and comment density are hard to convey in isolated snippets. What follows is a taste, not a substitute.
+
+**From an Italian Fried Liver overview (both sides, 1600+ audience):**
+
+```
+5. Nxf7 {Most principled. Interesting is that not long ago computers were saying this
+is winning for white. But modern strong engines almost immediately proclaim 0.00}
+  Bxf2+ 6. Kf1 Qe7 7. Nxh8 d5 8. exd5 Nd4
+9. d6 $1
+  (9. c3 {Most played, and weak engines still like this move, but fail to spot}
+    Bg4 10. Qa4+ Nd7 $1 {And black is winning} 11. Kxf2 Qh4+)
+9... Qxd6 (9... cxd6 $2 10. Kxf2 Ng4+ 11. Kg1 $18 {and the d6 pawn blocks Qc5})
+```
+
+Note the register: *"weak engines still like this move, but fail to spot"* — one sentence orients the reader and cites the failure mode. `$1` marks the resource, `$2` marks the trap, `$18` marks the resulting winning position — every glyph earns its place. No `{Stockfish gives 0.00 depth 22}` verbose engine chatter.
+
+**From a Najdorf 6.f4 White repertoire (2200+ audience):**
+
+```
+6... e6 {a common continuation, but usually in the Najdorf, e6 setups give white
+enough time to put their pieces in good positions, and here its no exception.}
+7. Qf3 {And black is already in danger. White just plans to finish development with
+Be3, long castle and g4.}
+  (7. g4 {is too early:} e5 $1 8. Nf5 Nc6 {[%cal Gg7g6]})
+7... Qc7
+8. g4 {White has easy play}
+  Nc6 9. Nxc6 bxc6 10. g5 Nd7 11. Bd2 $16 {[%cal Ge1c1,Gh2h4]}
+```
+
+Two `[%cal]` arrows on the last move show the whole plan (castle long, push h4). *"White has easy play"* is a five-word verdict that beats three sentences of hedged eval prose. The parenthesised sideline shows exactly WHY 7.g4 is premature — one variation, one point.
+
+**What both files share:**
+
+- Named citations: Karpov–Beliavsky, Nepomniachtchi, Mamedov–Volokitin, John Ludvig Hammer 2024. Concrete anchors the reader can look up.
+- Practical framing: *"objectively black has no compensation for the pawn, it does seem black still has some practical chances"* — separates objective from practical explicitly.
+- Move-order guidance in the reader's voice: *"Here it's easy for white to mess up the move order. If black wants to go exd4, you should be ready — d3 is a way to remember that white should castle first."*
+- Terse verdicts at line ends: *"White is a clean pawn up."* *"black is cooked"* *"All correspondence games here ended in a draw."* *"With a very unclear position."*
+- Zero decorative annotation: `[%csl Rf7]` on the Fried Liver f7 attack is one square, one colour, all signal.
+
+Study `read_example_prep_files` before writing at scale. The gap between "correct" prep and "prep worth reading" is entirely commentary discipline, and these two files are the target.
+
 ## Variations vs prose
 
 **Variations are moves, not sentences.** This was the biggest failure mode of raw-PGN authoring — LLMs writing "if Black plays Be6 White responds with f3" as prose. In the tree model there's no such temptation: variations are `add_move` calls at the branching node.

@@ -74,6 +74,14 @@ const PREP_STRATEGY_DOC = loadBundledDoc("prep-strategy.md", "Prep strategy guid
 const PREP_FILES_DOC = loadBundledDoc("prep-files-guide.md", "Prep files guide");
 const PGN_AUTHORING_DOC = loadBundledDoc("pgn-authoring.md", "PGN authoring guide");
 
+// Reference PGNs authored by a strong human coach. LLM pulls these when
+// it wants to see the commentary style, NAG discipline, and annotation
+// density we want it to hit. Kept as raw PGN so the LLM can parse them
+// against its own understanding of the game (comments, arrows, NAGs
+// all intact) — not summarised into English.
+const EXAMPLE_OVERVIEW_PGN = loadBundledDoc("examples/italian-fried-liver.pgn", "Italian Fried Liver overview example");
+const EXAMPLE_REPERTOIRE_PGN = loadBundledDoc("examples/najdorf-6-f4-white.pgn", "Najdorf 6.f4 White repertoire example");
+
 // ── HTTP ────────────────────────────────────────────────────────────
 //
 // Two auth flavours coexist:
@@ -820,6 +828,14 @@ const TOOLS: Tool[] = [
     name: "read_pgn_authoring_guide",
     description:
       "Returns the guide on how to write correct, useful PGN — mainline discipline, variations as moves (never prose describing moves), NAG symbols including novelty ($146), unclear ($13), compensation ($44) and the standard set, ChessBase arrow/coloured-square syntax ([%cal] / [%csl]), and common pitfalls the parser will reject. Call this ONCE per session before any save_prep_file call, or any time you're producing PGN output for the user.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "read_example_prep_files",
+    description:
+      "Returns two full reference PGNs authored by a strong human coach — one a general opening overview (Italian Fried Liver, both sides, 1600+ audience) and one a one-sided repertoire (Najdorf 6.f4 for White, 2200+ audience). Bundled with the MCP; not the user's files.\n\n" +
+      "Read these ONCE per session before writing your first substantial prep file. The authoring guide (read_pgn_authoring_guide) tells you the rules; these examples show you what the rules look like when applied by someone who knows what they're doing — comment density, when to cite games by player name, how to use `$146` / `$3` / `$44` sparingly and correctly, when a bare `[%csl Rf7]` says everything, how to acknowledge transpositions, how to phrase practical guidance vs objective evaluation. Study the rhythm before writing your own.\n\n" +
+      "Response: `{ overview: <pgn>, repertoire: <pgn> }`. Raw PGN — comments, arrows, NAGs, and stored evals all intact.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -1739,6 +1755,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "read_pgn_authoring_guide":
       return { guide: PGN_AUTHORING_DOC };
+
+    case "read_example_prep_files":
+      return { overview: EXAMPLE_OVERVIEW_PGN, repertoire: EXAMPLE_REPERTOIRE_PGN };
 
     case "prep_snapshot": {
       const me = Number(args.fide_id_me);
