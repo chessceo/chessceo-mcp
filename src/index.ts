@@ -709,15 +709,16 @@ const TOOLS: Tool[] = [
   {
     name: "auto_evaluate",
     description:
-      "Walk the tree from `path` (default `[]` = whole file) and auto-assign NAGs to every node based on the Stockfish eval from cloud_analyse. Uses the standard eval → NAG thresholds (|eval|<0.25 → $10, <0.6 → $14/$15, <1.3 → $16/$17, ≥1.3 → $18/$19). Requires a running cloud combo instance.\n\n" +
-      "This is the automate-the-boring-part tool. Instead of hand-annotating each move with a NAG, you build the tree via apply_mutations (no NAGs needed), then call auto_evaluate once and every node gets the right glyph.\n\n" +
-      "Costs real money — hits cloud_analyse per node. A 200-node tree at 1.5s/node = ~5 min of engine time. Use `only_missing=true` (default) to skip nodes that already have a NAG on subsequent runs. Runs 4 evaluations in parallel to save wall time.",
+      "Walk the tree from `path` (default `[]` = whole file) and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every node via cloud_analyse. Requires a running cloud combo instance.\n\n" +
+      "**Does NOT set visible NAGs.** NAG placement is your call, not the engine's — an opening tree full of 0.00 positions doesn't need a `$10` (=) glyph on every move (that's just noise on the board), and a `!` on a novelty or a `?!` on a risky committal is a judgment call the engine can't make. Use this tool to persist the raw numbers on every node, then re-read the file and hand-pick NAGs on the moves where a glyph carries real signal (novelty, sharp choice, real mistake, decisive advantage).\n\n" +
+      "On re-read every node with a stored eval carries `ceoEval: { sf: {cp, depth}, lc0: {cp, depth} }` — the numbers travel with the file. Use `only_missing=true` (default) to skip nodes already evaluated on repeat runs.\n\n" +
+      "Costs real money — hits cloud_analyse per node. A 200-node tree at 1.5s/node = ~5 min of engine time. Runs 4 evaluations in parallel to save wall time.",
     inputSchema: {
       type: "object",
       properties: {
         id:            { type: "string" },
         path:          { type: "array", items: { type: "integer", minimum: 0 }, description: "Subtree root (default = whole file)." },
-        only_missing:  { type: "boolean", description: "Skip nodes that already carry a NAG (default true)." },
+        only_missing:  { type: "boolean", description: "Skip nodes that already carry a stored ceoEval (default true)." },
         movetime_ms:   { type: "integer", minimum: 500, maximum: 5000, description: "Per-node cloud_analyse think time (default 1500)." },
         expected_version: { type: "integer" },
       },
@@ -986,7 +987,10 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
   const file = parsePGN(g.pgnContent);
 
-  // Collect eligible nodes (skip root — no move to evaluate).
+  // Collect eligible nodes (skip root — no move to evaluate). `onlyMissing`
+  // gates on stored `ceoEval` (the raw persisted numbers), not on visible
+  // NAGs — this tool never sets NAGs, so gating on NAGs would incorrectly
+  // re-evaluate hand-annotated moves whose eval hasn't been stored yet.
   type Target = { path: Path; fen: string };
   const targets: Target[] = [];
   const walk = (node: PrepNode, path: Path) => {
@@ -1027,15 +1031,17 @@ async function autoEvaluate(args: Args): Promise<unknown> {
 
   if (stored.length === 0) return { ok: true, evaluated: 0, skipped: targets.length, version: g.version };
 
-  // One batch, two ops per node: set_ceo_eval (persistent) + set_nags
-  // (visible glyph on the app-side board). The NAG lives inside ceoEval
-  // too so consumers who want just the number use the escape tag; the
-  // separate NAG is for standard PGN readers.
-  type BatchOp = { op: string; path: Path; nags?: string[]; ceoEval?: StoredEval };
+  // Persist the raw numbers only — never touch visible NAGs. NAG glyphs
+  // are the LLM's editorial call (novelty, sharp choice, real mistake),
+  // not an automatic mapping from the engine number. Stamping `$10` on
+  // every 0.00 position in an opening tree just clutters the board.
+  // The threshold-derived NAG still lives INSIDE `ceoEval.nag` so the
+  // LLM can read it back and decide whether to promote it to a visible
+  // NAG on a case-by-case basis.
+  type BatchOp = { op: string; path: Path; ceoEval?: StoredEval };
   const batchMutations: BatchOp[] = [];
   for (const s of stored) {
     batchMutations.push({ op: "set_ceo_eval", path: s.path, ceoEval: s.ev });
-    if (s.ev.nag) batchMutations.push({ op: "set_nags", path: s.path, nags: [s.ev.nag] });
   }
   const saveResult = await applyBatchMutations({ id, mutations: batchMutations, expected_version: g.version } as Args);
   const sr = saveResult as { version?: number };

@@ -23,7 +23,7 @@ Reading:
 Building (use these — one call for many ops):
 
 - **`apply_mutations(id, mutations[])`** — batch. This is the primary build tool. Send 100 mutations in one call → one load-parse-mutate-save cycle instead of 100. When you're writing a repertoire from scratch, EVERYTHING should go through this. Individual mutation tools are for surgical follow-up edits, not for bulk work.
-- **`auto_evaluate(id, path?)`** — walk the tree from `path` and auto-assign the right NAG to every node by running cloud_analyse on each position. Standard threshold table (below). Costs real engine time but frees you from hand-annotating evals. Skip nodes that already have a NAG by default.
+- **`auto_evaluate(id, path?)`** — walk the tree from `path` and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every node by running cloud_analyse on each position. **Does NOT set visible NAGs** — the numbers land in a hidden `[%ceo-eval]` tag so you can read them back later. NAG placement (`$1` `!`, `$14` `⩲`, `$16` `±`, `$18` `+−`, etc.) is your editorial call, not an automatic mapping — see the section on NAG discipline below. Skip nodes that already have a stored eval by default.
 
 Per-op mutation tools (single-op calls, use for edits after the bulk build):
 
@@ -40,9 +40,9 @@ All mutations **auto-save** with optimistic locking. Response includes the new `
 ## Typical build order
 
 1. `read_prep_file` — see what's there.
-2. `apply_mutations([...])` — one call with your whole intended build (all `add_move` for the moves and variations, plus any `set_comment`/`set_annotations` you already know at author time). Skip `set_nags` — auto_evaluate handles that.
-3. `auto_evaluate(id)` — walk the tree, get engine evals, assign NAGs. One shot.
-4. Individual mutation tools ONLY for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).
+2. `apply_mutations([...])` — one call with your whole intended build (all `add_move` for the moves and variations, plus any `set_comment`/`set_annotations` you already know at author time, plus any `set_nags` where you already have a clear judgment — novelty `$146`, `!?` speculative sac, obvious `?` blunder in a sideline you're rejecting).
+3. `auto_evaluate(id)` — walk the tree and PERSIST engine numbers on every node. Does not touch visible NAGs. Cheap way to get every position's Stockfish + Lc0 read baked into the file for later reference.
+4. Re-read the file and add NAGs where they carry real signal (see NAG discipline below). Use individual mutation tools for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).
 
 The build-cost math: a 200-move file via individual `add_move` calls is 200 saves ≈ 100+ seconds of tool overhead. The same file via one `apply_mutations` call is one save ≈ 500ms. Use batch by default.
 
@@ -122,7 +122,21 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 | `\|eval\| ≥ 1.3`          | `$18` (+−)              | `$19` (−+)              |
 | Sharp, hard to evaluate | `$13` (∞)               | `$13` (∞)               |
 
-**Prefer auto_evaluate for the NAG.** Don't hand-write NAGs when building — call `auto_evaluate(id)` after your build and it assigns the right glyph to every node from actual engine analysis. Manual `set_nags` is for overrides (mark a novelty with $146, flag a `$5 !?` piece sac).
+**NAGs are editorial, not automatic.** `auto_evaluate` persists engine numbers on every node but does NOT set visible NAGs — because a repertoire full of 0.00 opening theory does not want a `$10` (=) glyph plastered on every move. That's noise, not signal. NAGs are your call: mark moves that carry a judgment a reader can't derive by looking at the board.
+
+Where NAGs actually earn their place:
+
+- **`$146` (novelty)** — a move that hasn't appeared at this level. Only set if you actually know this (e.g. saw 0 games via `get_position_stats`).
+- **`$5 !?` (interesting/speculative)** — a committal move you're recommending anyway (a piece sac, a positional pawn concession).
+- **`$1 !` / `$3 !!`** — objectively good moves the reader might miss.
+- **`$2 ?` / `$4 ??` / `$6 ?!`** — mistakes in a sideline you're showing to reject.
+- **`$14/$15` (⩲/⩱)** and **`$16/$17` (±/∓)** — assessments on positions where the direction of pressure matters for the plan you're teaching. Skip these on 0.00 theory nodes.
+- **`$18/$19` (+−/−+)** — decisive advantages, use where the reader should recognise the position is winning.
+- **`$44` (compensation)** on a genuine gambit; **`$13` (∞)** on a genuinely sharp/unclear position that engines don't resolve.
+
+Where NAGs are noise: every `$10` "=" glyph on every equal position. If the whole tree is 0.00, that's the *default state* — leave it unmarked and the reader understands.
+
+When reading back a file, `node.ceoEval.nag` carries the threshold-derived NAG (`$10` / `$14` / `$16` / `$18` etc.) — treat it as a *suggestion*, not an automatic write. Promote it to a visible NAG only when a glyph on that move actually helps the reader.
 
 **Persisted evals travel with the file.** Every node with an eval gets `ceoEval: { sf: {cp: 25, depth: 32}, lc0: {cp: 30, depth: 18}, nag: "$14" }` on subsequent `read_prep_file` calls. Stored as `[%ceo-eval sf=+0.25/32 lc0=+0.30/18 nag=$14]` inside the PGN comment (an escape tag the app hides from the board view, just like [%cal] / [%csl]). So a re-read after auto_evaluate gives you every position's number without re-running cloud_analyse. Query tools (get_position_stats, get_player_preparation, prep_snapshot) also auto-attach a live `eval` at the request position when a cloud engine is running.
 
@@ -141,8 +155,6 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 - `{With Lc0 nudged toward Black (contempt −15) it still picks Qg6 at 0.00; SF's objective read also 0.00.}`
 
 If you only quote the Lc0 number, disclose the bias in the same sentence — `{Lc0 gives Black +0.30}` with an undisclosed `contempt=-15` is a false objectivity claim.
-
-**Lc0 depth < 15 is a shallow read.** Lc0's node budget is capped per call, so on many positions it stops well before Stockfish. If the Lc0 leg comes back at depth 8–14, treat it as a hint, not a verdict — and weight Stockfish's deeper number more when the two disagree. Don't dress a shallow Lc0 number as authoritative in prose.
 
 ### Before you write any commentary: describe_position
 
