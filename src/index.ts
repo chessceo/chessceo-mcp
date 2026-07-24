@@ -1165,6 +1165,41 @@ async function applyMutation(
   };
 }
 
+// Strip cruft the LLM doesn't need from the DB-position response.
+// Called AFTER trimGamesMovetext so plyNumber survives long enough to
+// slice each game's movetext. Also renames the `transpositions` field
+// to something the LLM can parse without knowing chess-DB jargon.
+function stripPositionResponse(r: unknown): void {
+  if (!r || typeof r !== "object") return;
+  const t = r as Record<string, unknown>;
+  delete t.hash;         // internal zobrist string
+  delete t.source;       // internal "database" marker; we overwrite with our own .source
+  delete t.totalGames;   // duplicates statistics.totalCount often; hasMore covers pagination
+
+  if (Array.isArray(t.moves)) {
+    for (const m of t.moves as Array<Record<string, unknown>>) {
+      if (typeof m.transpositions === "number") {
+        m.reachedViaTransposition = m.transpositions;
+        delete m.transpositions;
+      }
+    }
+  }
+  if (Array.isArray(t.games)) {
+    for (const g of t.games as Array<Record<string, unknown>>) {
+      delete g.gameId;
+      delete g.whiteTitle;
+      delete g.blackTitle;
+      delete g.whiteTeam;
+      delete g.blackTeam;
+      delete g.round;
+      delete g.plyNumber;
+      delete g.relevance;
+      delete g.site;
+      delete g.ply;
+    }
+  }
+}
+
 // Trim every game's `moves` field to just the plies AFTER the queried
 // position, using each game's `plyNumber`. Massive token save — a game
 // 80 plies long queried at ply 12 drops to ~68 plies of movetext. Ports
@@ -1332,6 +1367,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       const converted = convertAvailableMovesToSAN(raw, effectiveFen);
       if (converted && typeof converted === "object") {
         trimGamesMovetext(converted);
+        stripPositionResponse(converted);
         if (ev) (converted as { eval?: CompactEval }).eval = ev;
       }
       return converted;
@@ -1352,6 +1388,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       const converted = convertAvailableMovesToSAN(raw, fen);
       if (converted && typeof converted === "object") {
         trimGamesMovetext(converted);
+        stripPositionResponse(converted);
         (converted as { source?: string }).source = source;
         if (ev) (converted as { eval?: CompactEval }).eval = ev;
       }
