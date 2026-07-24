@@ -1,10 +1,21 @@
-// Compact tree types the LLM works with. No stable ids — chessops
-// regenerates them per parse — so we address nodes by PATH: the array
-// of child indices from the root. [] is the root, [0] is root's first
-// child, [0, 1] is the second child of the first child, etc.
+// Compact tree types the LLM works with.
 //
-// Paths ARE stable across parse/export/reparse cycles because move
-// order is deterministic and we don't rearrange children on export.
+// Nodes are addressed by a stable, content-derived `id`:
+//   root.id = "r"
+//   node.id = first 8 hex chars of sha256(parent.id + "|" + san)
+//
+// The derivation is a pure function of the tree structure, so IDs
+// survive parse → mutate → export → reparse without needing to be
+// persisted in the PGN. Sibling insertions, deletions and variation
+// promotions all leave every other node's ID unchanged — the failure
+// mode of path-based addressing (later paths shifting when an earlier
+// op inserts a sibling) simply cannot happen. See src/pgn/paths.ts
+// for the id → path resolution used to power mutation calls.
+//
+// 32-bit width (8 hex chars) means birthday-collision probability
+// is ~10^-4 even at 1000 nodes — the largest prep files we see are
+// well under that. On the rare parse-time collision we throw a clear
+// error rather than persisting anything ambiguous.
 
 export type PrepArrow = { color: string; from: string; to: string };
 export type PrepHighlight = { color: string; square: string };
@@ -33,13 +44,14 @@ export type StoredEval = {
 };
 
 export type PrepNode = {
+  id: string;                // "r" for root; 8-hex-char content hash otherwise
   san: string | null;        // null for root
   fen: string;
   ply: number;               // 0 for root; +1 per ply
   comment?: string;          // plain text with [%cal]/[%csl]/[%ceo-eval] STRIPPED — those live below
   nags?: string[];           // e.g. ["$1", "$14"]
   annotations?: PrepAnnotations;
-  ceoEval?: StoredEval;      // persisted engine eval, filled by auto_evaluate
+  ceoEval?: StoredEval;      // persisted engine eval, filled by auto_evaluate / cloud_analyse
   children: PrepNode[];      // children[0] is the mainline continuation
 };
 
@@ -51,6 +63,9 @@ export type PrepFile = {
 };
 
 // Path: array of child indices from root. Empty = root itself.
+// PATH is INTERNAL — LLM never sees it. Kept for the mutation
+// implementation, which resolves node_id → path once and then walks
+// the tree the same way it always has.
 export type Path = number[];
 
 // Named colours as they appear in the parsed tree. The wire format uses

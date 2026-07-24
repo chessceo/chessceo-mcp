@@ -1,68 +1,79 @@
 # PGN authoring guide
 
-You author prep files by mutating a tree, not by writing PGN text. The MCP layer holds a parser+exporter (chessops-backed) so every mutation call load-mutates-saves atomically — you only ever address nodes, never raw text. No paren-counting, no move-numbering, no SAN typos surviving your edit.
+You author prep files by mutating a tree, not by writing PGN text. The MCP layer holds a parser+exporter (chessops-backed) so every mutation call load-mutates-saves atomically — you only ever address nodes by id, never raw text or paths. No paren-counting, no move-numbering, no SAN typos surviving your edit, no index drift when a sibling is inserted.
 
-## Path addressing
+## Node id addressing
 
-Nodes are addressed by **path**: an array of child indices from the root.
+Every node has a stable **`id`** — the LLM's handle on that node across mutation calls.
 
-- `[]` — the root position (empty board state, before any move).
-- `[0]` — the first mainline move (root's first child).
-- `[0, 0]` — the second ply on the mainline.
-- `[0, 1]` — a variation branching after the first move (sibling of `[0, 0]`).
-- `[0, 0, 0, 1]` — a variation branching at the third ply.
+- Root id is `"r"`.
+- Every other node id is an 8-hex-char content hash derived from `(parent.id, san)`.
+- **IDs never change when other nodes are added, deleted or promoted.** Sibling insertions do not shift ids. Variation promotion does not shift ids. A node's id is a pure function of its position in the tree's SAN structure.
+- **IDs are self-checking.** If you send a node_id the tree doesn't know, resolution fails immediately with a clear error — the LLM can't "make up" ids and have them silently work.
 
-`children[0]` is always the mainline; `children[1..N]` are alternative variations in declaration order. `promote_variation` swaps this order.
+Every read gives you the id on every node. Every mutation call takes `node_id` (or `parent_id` for add_move / add_line) and returns the id it landed on. You chain ids from one call to the next.
 
 ## Workflow
 
 Reading:
 
-- `read_prep_file(id)` → returns `{version, tags, tree}`. Every node in `tree` has `san`, `fen`, `ply`, optional `comment`, `nags`, `annotations`, and `children`.
+- `read_prep_file(id)` → returns `{version, tags, tree}`. Every node has `id`, `san`, `fen`, `ply`, optional `comment`, `nags`, `annotations`, `ceoEval`, and `children`.
 
 Building (use these — one call for many ops):
 
 - **`apply_mutations(id, mutations[])`** — batch. This is the primary build tool. Send 100 mutations in one call → one load-parse-mutate-save cycle instead of 100. When you're writing a repertoire from scratch, EVERYTHING should go through this. Individual mutation tools are for surgical follow-up edits, not for bulk work.
-- **`auto_evaluate(id, path?)`** — walk the tree from `path` and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every node by running cloud_analyse on each position. **Does NOT set visible NAGs** — the numbers land in a hidden `[%ceo-eval]` tag so you can read them back later. NAG placement (`$1` `!`, `$14` `⩲`, `$16` `±`, `$18` `+−`, etc.) is your editorial call, not an automatic mapping — see the section on NAG discipline below. Skip nodes that already have a stored eval by default.
+- **`add_line(id, parent_id, sans[])`** — a whole linear variation in one op. Cleaner than N `add_move` ops for straight lines.
+- **`auto_evaluate(id, node_id?)`** — walk from a node and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every descendant via cloud_analyse. **Does NOT set visible NAGs** — the numbers land in a hidden `[%ceo-eval]` tag so you can read them back later. NAG placement (`$1` `!`, `$14` `⩲`, `$16` `±`, `$18` `+−`, etc.) is your editorial call. Skip nodes that already have a stored eval by default.
 
 Per-op mutation tools (single-op calls, use for edits after the bulk build):
 
-- `add_move(id, path, san)` — appends a new child. If `path` has children, new node becomes a variation.
-- `set_comment(id, path, comment)` — replace comment (empty string clears).
-- `set_nags(id, path, nags)` — replace NAGs (empty array clears).
-- `set_annotations(id, path, {arrows, highlights})` — replace visual annotations.
-- `delete_subtree(id, path)` — remove node + descendants.
-- `promote_variation(id, path)` — make the node at `path` its parent's mainline.
+- `add_move(id, parent_id, san)` — appends a new child. If the parent has children, new node becomes a variation.
+- `add_line(id, parent_id, sans[])` — appends a whole linear continuation as a sequence of children.
+- `set_comment(id, node_id, comment)` — replace comment (empty string clears).
+- `set_nags(id, node_id, nags)` — replace NAGs (empty array clears).
+- `set_annotations(id, node_id, {arrows, highlights})` — replace visual annotations.
+- `delete_subtree(id, node_id)` — remove node + descendants.
+- `promote_variation(id, node_id)` — make the referenced node its parent's mainline.
 - `set_tag(id, key, value)` — set/clear a game-level PGN tag.
 
 All mutations **auto-save** with optimistic locking. Response includes the new `version`; pass it as `expected_version` on your next call to catch concurrent edits.
 
 ## Typical build order
 
-1. `read_prep_file` — see what's there.
-2. `apply_mutations([...])` — one call with your whole intended build (all `add_move` for the moves and variations, plus any `set_comment`/`set_annotations` you already know at author time, plus any `set_nags` where you already have a clear judgment — novelty `$146`, `!?` speculative sac, obvious `?` blunder in a sideline you're rejecting).
+1. `read_prep_file` — see what's there. Every node has an `id` you'll pass to the mutation and engine/DB tools.
+2. `apply_mutations([...])` — one call with your whole intended build (a mix of `add_move` / `add_line` for structure, plus any `set_comment`/`set_annotations` you already know at author time, plus any `set_nags` where you already have a clear judgment — novelty `$146`, `!?` speculative sac, obvious `?` blunder in a sideline you're rejecting).
 3. `auto_evaluate(id)` — walk the tree and PERSIST engine numbers on every node. Does not touch visible NAGs. Cheap way to get every position's Stockfish + Lc0 read baked into the file for later reference.
 4. Re-read the file and add NAGs where they carry real signal (see NAG discipline below). Use individual mutation tools for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).
 
 The build-cost math: a 200-move file via individual `add_move` calls is 200 saves ≈ 100+ seconds of tool overhead. The same file via one `apply_mutations` call is one save ≈ 500ms. Use batch by default.
 
-### Path math in a batch
+### Chaining node_ids across a batch
 
-Paths in each mutation resolve against the tree AFTER previous ops in the batch. When you `add_move(path=[0], san='c5')`, the new c5 lands at `[0, 0]` if [0] had no children, or `[0, N]` if it had N. Your next mutation in the batch can address the new node directly. The tree is deterministic — you can compute all paths ahead of time.
+Node ids are content-derived, so when you `add_move` inside a batch, the id of the new node is a deterministic function of the parent's id + the SAN. In practice: **use the id the previous op returned as the `parent_id` of the next op** (the batch response gives you each `node_id` in order, and `add_line` gives you the full `line: [{node_id, san}, …]`).
 
-For a linear mainline build from an empty file:
+Concretely, the response to a batch is:
 ```
-{op: "add_move", path: [],        san: "e4"}   // lands at [0]
-{op: "add_move", path: [0],       san: "c5"}   // lands at [0, 0]
-{op: "add_move", path: [0, 0],    san: "Nf3"}  // lands at [0, 0, 0]
-{op: "add_move", path: [0, 0, 0], san: "d6"}   // lands at [0, 0, 0, 0]
-...
+{ ok: true, results: [{node_id: "3c7f592e"}, {node_id: "22012be0"}, ...], version: 42 }
 ```
 
-For a variation at some point:
+If you know the tree ahead of time (writing from scratch), the deterministic recipe means you don't have to guess. But by far the easiest pattern is **`add_line` for straight lines, `add_move` for branch points** — you don't need to compute ids yourself.
+
+### Two clean batch patterns
+
+**Straight mainline:**
 ```
-{op: "add_move", path: [0, 0], san: "Nc3"}   // variation branching after move 2; lands at [0, 0, 1]
-{op: "add_move", path: [0, 0, 1], san: "d5"} // continue the variation; lands at [0, 0, 1, 0]
+{op: "add_line", parent_id: "r", sans: ["e4","c5","Nf3","Nc6","Bb5"]}
+// → returns { node_id: "<id-of-Bb5>", line: [{node_id, san}, ...] }
+```
+
+**Mainline + variation at a branch point:**
+```
+// First, the mainline:
+{op: "add_line", parent_id: "r", sans: ["e4","c5","Nf3","d6"]}
+// → line[2] is the Nf3 node — grab its node_id, call it NF3.
+
+// Then the variation branching after Nf3:
+{op: "add_line", parent_id: NF3, sans: ["Nc6","Bb5","Bd7"]}
 ```
 
 ## Variations vs prose

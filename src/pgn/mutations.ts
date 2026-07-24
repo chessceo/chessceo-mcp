@@ -1,7 +1,7 @@
 // Pure mutation functions on a PrepFile tree. Each returns a new
-// PrepFile (structural sharing where safe) plus the effective path of
-// the touched node, so tools can report where the LLM's request
-// actually landed after any rebalancing.
+// PrepFile (structural sharing where safe) plus the node_id of the
+// touched node (the LLM addresses nodes by content-derived id — see
+// paths.ts — so tools return the id, not the path).
 //
 // All move-making mutations validate SAN against the current FEN via
 // chessops before touching the tree — a bad move surfaces as a thrown
@@ -13,7 +13,7 @@ import { Chess } from "chessops/chess";
 import { parseSan } from "chessops/san";
 import { makeFen } from "chessops/fen";
 
-import { cloneOnPath, getNode, getParent, PathError } from "./paths.js";
+import { cloneOnPath, deriveNodeId, getNode, getParent, PathError } from "./paths.js";
 import type {
   Path,
   PrepAnnotations,
@@ -24,12 +24,17 @@ import type {
 
 export class MutationError extends Error {}
 
-// Apply a SAN move as a new child at `path`. If the target already has
-// children, the new node is appended (becomes a variation, since
-// mainline is children[0]). Use promoteVariation to make the new node
-// the mainline afterwards if that's what you wanted.
-export function addMove(file: PrepFile, path: Path, san: string): { file: PrepFile; path: Path } {
-  const parent = getNode(file.root, path);
+// Result shape returned by every mutation: the new file, and the id of
+// the node the mutation landed on. `id` is what the tool hands back to
+// the LLM; the underlying path is an implementation detail.
+export type MutationResult = { file: PrepFile; id: string };
+
+// Add a SAN move as a new child under `parentPath`. Appends — becomes
+// a variation if the parent already has children (mainline is
+// children[0]). Use promoteVariation afterwards to switch mainline.
+// Returns the new node's stable id (derived from parent.id + san).
+export function addMove(file: PrepFile, parentPath: Path, san: string): MutationResult {
+  const parent = getNode(file.root, parentPath);
   const move = validateSan(parent.fen, san);
   const posSetup = parseFen(parent.fen);
   if (posSetup.isErr) throw new MutationError(`bad parent FEN in tree: ${posSetup.error}`);
@@ -39,57 +44,88 @@ export function addMove(file: PrepFile, path: Path, san: string): { file: PrepFi
   board.play(move);
   const childFen = makeFen(board.toSetup());
 
+  const newId = deriveNodeId(parent.id, san);
   const newNode: PrepNode = {
+    id: newId,
     san,
     fen: childFen,
     ply: parent.ply + 1,
     children: [],
   };
 
-  const { root: newRoot, target } = cloneOnPath(file.root, path);
+  const { root: newRoot, target } = cloneOnPath(file.root, parentPath);
   target.children = [...target.children, newNode];
 
   return {
     file: { tags: file.tags, root: newRoot },
-    path: [...path, target.children.length - 1],
+    id: newId,
   };
+}
+
+// Add a linear sequence of moves under `parentPath` — one call for a
+// whole variation instead of N add_move calls. Each move becomes the
+// mainline child (children[0]) of the previous. Returns the ids and
+// SANs of every added node so the LLM can address any of them next.
+export function addLine(
+  file: PrepFile,
+  parentPath: Path,
+  sans: string[],
+): { file: PrepFile; line: Array<{ id: string; san: string }> } {
+  if (sans.length === 0) throw new MutationError("add_line requires at least one san");
+
+  let cur = file;
+  let curPath = parentPath;
+  const line: Array<{ id: string; san: string }> = [];
+
+  for (const san of sans) {
+    const step = addMove(cur, curPath, san);
+    cur = step.file;
+    // The move we just appended is the parent's last child — extend
+    // the walked path with that child index so the next move lands on
+    // top of it (extending the line, not creating a sibling).
+    const parent = getNode(cur.root, curPath);
+    const childIdx = parent.children.length - 1;
+    curPath = [...curPath, childIdx];
+    line.push({ id: step.id, san });
+  }
+
+  return { file: cur, line };
 }
 
 // Replace the comment on the node at `path`. Passing empty string /
 // null clears it.
-export function setComment(file: PrepFile, path: Path, comment: string | null): { file: PrepFile; path: Path } {
+export function setComment(file: PrepFile, path: Path, comment: string | null): MutationResult {
   const { root: newRoot, target } = cloneOnPath(file.root, path);
   const trimmed = (comment ?? "").trim();
   if (trimmed) target.comment = trimmed;
   else delete target.comment;
-  return { file: { tags: file.tags, root: newRoot }, path };
+  return { file: { tags: file.tags, root: newRoot }, id: target.id };
 }
 
 // Replace the NAG list. Empty array clears.
-export function setNags(file: PrepFile, path: Path, nags: string[]): { file: PrepFile; path: Path } {
+export function setNags(file: PrepFile, path: Path, nags: string[]): MutationResult {
   const cleaned = nags
     .map(s => s.trim())
     .filter(s => /^\$\d+$/.test(s));
   const { root: newRoot, target } = cloneOnPath(file.root, path);
   if (cleaned.length > 0) target.nags = cleaned;
   else delete target.nags;
-  return { file: { tags: file.tags, root: newRoot }, path };
+  return { file: { tags: file.tags, root: newRoot }, id: target.id };
 }
 
 // Replace visual annotations (arrows + highlighted squares). Empty
 // arrows and highlights arrays clear the annotations entirely.
-export function setAnnotations(file: PrepFile, path: Path, ann: PrepAnnotations | null): { file: PrepFile; path: Path } {
+export function setAnnotations(file: PrepFile, path: Path, ann: PrepAnnotations | null): MutationResult {
   const { root: newRoot, target } = cloneOnPath(file.root, path);
   const isEmpty = !ann || (ann.arrows.length === 0 && ann.highlights.length === 0);
   if (isEmpty) delete target.annotations;
   else target.annotations = { arrows: ann!.arrows, highlights: ann!.highlights };
-  return { file: { tags: file.tags, root: newRoot }, path };
+  return { file: { tags: file.tags, root: newRoot }, id: target.id };
 }
 
 // Delete the node at `path` and all its descendants. Refuses to delete
-// the root. Returns the path of the deleted node's parent for the
-// caller's convenience.
-export function deleteSubtree(file: PrepFile, path: Path): { file: PrepFile; path: Path } {
+// the root. Returns the id of the deleted node's parent.
+export function deleteSubtree(file: PrepFile, path: Path): MutationResult {
   if (path.length === 0) throw new MutationError("cannot delete root");
   const parentPath = path.slice(0, -1);
   const removeIdx = path[path.length - 1];
@@ -98,32 +134,37 @@ export function deleteSubtree(file: PrepFile, path: Path): { file: PrepFile; pat
     throw new PathError(`delete index ${removeIdx} out of bounds`, path);
   }
   parent.children = parent.children.filter((_, i) => i !== removeIdx);
-  return { file: { tags: file.tags, root: newRoot }, path: parentPath };
+  return { file: { tags: file.tags, root: newRoot }, id: parent.id };
 }
 
 // Promote the node at `path` to be its parent's first child (the
 // mainline). Silently no-ops if it's already the mainline. Refuses on
-// root (root has no parent to promote against).
-export function promoteVariation(file: PrepFile, path: Path): { file: PrepFile; path: Path } {
+// root (root has no parent to promote against). Returns the promoted
+// node's id (unchanged by the reorder — IDs don't depend on sibling
+// position).
+export function promoteVariation(file: PrepFile, path: Path): MutationResult {
   if (path.length === 0) throw new MutationError("cannot promote root");
   const parentPath = path.slice(0, -1);
   const idx = path[path.length - 1];
-  if (idx === 0) return { file, path }; // already mainline
+  if (idx === 0) {
+    // Already mainline — return the existing id without touching anything.
+    const target = getNode(file.root, path);
+    return { file, id: target.id };
+  }
   const { root: newRoot, target: parent } = cloneOnPath(file.root, parentPath);
   const promoted = parent.children[idx];
   const rest = parent.children.filter((_, i) => i !== idx);
   parent.children = [promoted, ...rest];
-  return { file: { tags: file.tags, root: newRoot }, path: [...parentPath, 0] };
+  return { file: { tags: file.tags, root: newRoot }, id: promoted.id };
 }
 
 // Replace the stored ceoEval on the node at `path`. Passing null clears.
-// This is what auto_evaluate calls per-node; also exposed as an op the
-// LLM can invoke directly if it wants to overwrite a stale eval.
-export function setCeoEval(file: PrepFile, path: Path, ev: StoredEval | null): { file: PrepFile; path: Path } {
+// This is what auto_evaluate / cloud_analyse(node_id) calls per-node.
+export function setCeoEval(file: PrepFile, path: Path, ev: StoredEval | null): MutationResult {
   const { root: newRoot, target } = cloneOnPath(file.root, path);
   if (ev === null || (!ev.sf && !ev.lc0 && !ev.nag)) delete target.ceoEval;
   else target.ceoEval = ev;
-  return { file: { tags: file.tags, root: newRoot }, path };
+  return { file: { tags: file.tags, root: newRoot }, id: target.id };
 }
 
 // Set or clear a tag. Passing null / empty removes.
@@ -148,7 +189,7 @@ function validateSan(fen: string, san: string) {
   const move = parseSan(board, san);
   if (!move) {
     throw new MutationError(
-      `illegal SAN "${san}" at fen "${fen}". Call describe_position on this fen to see the full list of legal moves.`,
+      `illegal SAN "${san}" at fen "${fen}". Call describe_position on this node to see the full list of legal moves.`,
     );
   }
   return move;
@@ -169,4 +210,4 @@ export function pathOf(root: PrepNode, target: PrepNode): Path | null {
 }
 
 // Re-exports so index.ts only imports from mutations.
-export { getNode, getParent } from "./paths.js";
+export { getNode, getParent, buildIdIndex, resolveNodeId, NodeIdError, ROOT_ID } from "./paths.js";

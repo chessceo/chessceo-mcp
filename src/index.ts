@@ -17,6 +17,7 @@ import { parsePGN } from "./pgn/parser.js";
 import { exportPGN } from "./pgn/exporter.js";
 import { describePosition } from "./pgn/describe.js";
 import {
+  addLine,
   addMove,
   deleteSubtree,
   MutationError,
@@ -27,7 +28,7 @@ import {
   setNags,
   setTag,
 } from "./pgn/mutations.js";
-import { PathError } from "./pgn/paths.js";
+import { buildIdIndex, NodeIdError, PathError, resolveNodeId, ROOT_ID } from "./pgn/paths.js";
 import type {
   Path,
   PrepAnnotations,
@@ -104,6 +105,7 @@ const AUTHED_TOOLS = new Set([
   "create_prep_file",
   "delete_prep_file",
   "add_move",
+  "add_line",
   "set_comment",
   "set_nags",
   "set_annotations",
@@ -112,6 +114,7 @@ const AUTHED_TOOLS = new Set([
   "set_tag",
   "apply_mutations",
   "auto_evaluate",
+  "quote_engine_eval",
   "predict_human_move",
 ]);
 
@@ -243,19 +246,27 @@ const TOOLS: Tool[] = [
           enum: ["white", "black"],
           description: "Which colour the player is analysed with.",
         },
+        file_id: {
+          type: "string",
+          description: "Prep file id to address the position from. Combine with `node_id` — the server derives the FEN from the tree, so you don't paste a FEN string. **Prefer this over `fen`/`line`/`moves` when a prep file is open.**",
+        },
+        node_id: {
+          type: "string",
+          description: "Node id inside `file_id` whose position to query. Root is 'r'. When set, overrides `fen`/`line`/`moves`.",
+        },
         line: {
           type: "string",
           description:
-            "Move sequence in SAN from the starting position, space-separated, no move numbers required. Example: 'e4 e5 Nf3'. Leave empty for startpos. Alias: `moves` (same thing).",
+            "Move sequence in SAN from the starting position, space-separated, no move numbers required. Example: 'e4 e5 Nf3'. Leave empty for startpos. Alias: `moves` (same thing). Only used if `node_id` is not set.",
         },
         moves: {
           type: "string",
           description:
-            "SAN moves to apply on top of `fen` (or on top of startpos if no fen). Same shape as `line`. Use this when you have a starting FEN and want to walk from there — e.g. fen='<game tabiya>', moves='b4 a5 c3' to explore that continuation. Wins over `line` if both are set.",
+            "SAN moves to apply on top of `fen` (or on top of startpos if no fen). Same shape as `line`. Wins over `line` if both are set. Only used if `node_id` is not set.",
         },
         fen: {
           type: "string",
-          description: "Starting position as FEN. Combine with `moves` to walk from there, or use alone.",
+          description: "Starting position as FEN. Combine with `moves` to walk from there, or use alone. Only used if `node_id` is not set.",
         },
         limit: {
           type: "integer",
@@ -276,21 +287,29 @@ const TOOLS: Tool[] = [
       "- `gm-classical` — GM classical games (both players ≥2500, real thinking-time). BEST for opening prep — every move is signal, avgElo ~2600 across all listed moves.\n" +
       "- `main` — the whole 11.7M-game DB. Widest coverage but noisiest (includes 1000-Elo blunder-fests in the move stats). Use as fallback when gm-classical's totalCount is too small to be informative.\n\n" +
       "Game movetext is trimmed to the moves AFTER the queried position (using each game's plyNumber). Saves ~70% of the bytes vs full movetext.\n\n" +
-      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read and the corresponding NAG. Do NOT fire cloud_analyse separately for the same FEN.",
+      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read and the corresponding NAG. Do NOT fire cloud_analyse separately for the same FEN. When called with `file_id`+`node_id`, the eval is also auto-stored on that node's `ceoEval` — later readable via quote_engine_eval.",
     inputSchema: {
       type: "object",
       properties: {
+        file_id: {
+          type: "string",
+          description: "Prep file id. **Prefer file_id+node_id over `fen`** when a prep file is open — the server derives the FEN from the tree.",
+        },
+        node_id: {
+          type: "string",
+          description: "Node id inside `file_id`. Root is 'r'. When set, overrides `fen`/`moves`/`line`.",
+        },
         fen: {
           type: "string",
-          description: "Starting position as FEN. Combine with `moves` to walk from there.",
+          description: "Starting position as FEN. Combine with `moves`. Only used if `node_id` is not set.",
         },
         moves: {
           type: "string",
-          description: "Optional SAN moves to apply on top of `fen` (or on top of startpos). Example: fen='<tabiya>', moves='b4 a5'.",
+          description: "Optional SAN moves on top of `fen` (or startpos). Only used if `node_id` is not set.",
         },
         line: {
           type: "string",
-          description: "Synonym for `moves` from the starting position; kept for compatibility.",
+          description: "Synonym for `moves` from startpos; kept for compatibility.",
         },
         limit: {
           type: "integer",
@@ -312,12 +331,14 @@ const TOOLS: Tool[] = [
       "Structured facts about a chess position: piece placements per colour (SAN-style letters), material balance in pawn units, list of every contested piece (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant square, side to move, and the full list of LEGAL MOVES for the side to move. Pure computation — no engine, ~1 ms per call.\n\n" +
       "USE THIS BEFORE COMMENTING ON A POSITION. LLMs are not reliable at reading FEN strings — you'll misplace pieces or invent captures. This tool gives you the same board state a human sees.\n\n" +
       "ALSO USE THIS if `add_move` rejects an illegal SAN — the `.legalMoves` array shows exactly what's playable from that position.\n\n" +
-      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves` to walk from there.",
+      "Position input: prefer `file_id`+`node_id` if you're inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`.",
     inputSchema: {
       type: "object",
       properties: {
-        fen:   { type: "string", description: "Starting position as FEN (defaults to startpos)." },
-        moves: { type: "string", description: "Optional SAN moves to apply on top of `fen`." },
+        file_id: { type: "string", description: "Prep file id. When combined with `node_id`, describes that node's position." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
+        fen:     { type: "string", description: "Starting position as FEN (defaults to startpos). Only used if `node_id` is not set." },
+        moves:   { type: "string", description: "Optional SAN moves to apply on top of `fen`. Only used if `node_id` is not set." },
       },
     },
   },
@@ -332,14 +353,16 @@ const TOOLS: Tool[] = [
       "• After you've found what the opponent SHOULD do (with the engine), check what they'll ACTUALLY do at their rating. If the top human move is a mistake, you have a real practical advantage.\n" +
       "• The WDL head is rating-aware — a 400-point gap will show up as a big win probability even in equal positions (the model has learned that human errors compound).\n" +
       "• Pass `prev_fen` (most recent first) when analysing mid-trade positions — without history the model treats the position as quiet.\n\n" +
-      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. ~1-2s per call. **Premium (or admin/moderator) only** — anonymous calls get 402.",
+      "Position input: prefer `file_id`+`node_id` when inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. ~1-2s per call. **Premium (or admin/moderator) only** — anonymous calls get 402.",
     inputSchema: {
       type: "object",
       properties: {
-        fen: { type: "string", description: "Starting position as FEN." },
+        file_id: { type: "string", description: "Prep file id. Combine with `node_id` to point at a tree node's position." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
+        fen: { type: "string", description: "Starting position as FEN. Only used if `node_id` is not set." },
         moves: {
           type: "string",
-          description: "Optional SAN moves to apply on top of `fen` (or startpos).",
+          description: "Optional SAN moves to apply on top of `fen` (or startpos). Only used if `node_id` is not set.",
         },
         white_elo: {
           type: "integer",
@@ -469,14 +492,17 @@ const TOOLS: Tool[] = [
       "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Practical range -20..+20. Use it to find non-objective 'practical' ideas or when the user needs to steer toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
       "Also useful: pass `moves` on top of `fen` to explore a variation without computing FENs yourself (e.g. fen='<tabiya>', moves='b4 a5 c3'). And the flip-side-to-move threat check documented in the guide is a great free trick.\n\n" +
       "For the full guide including worked examples, call the `read_engine_usage_guide` tool.\n\n" +
-      "Not for casual questions — this costs real money per second. Use the free `analyse` tool (single Stockfish, 2s) or `get_position_stats` for anything that doesn't require deep prep.",
+      "Not for casual questions — this costs real money per second. Use `get_position_stats` for anything that doesn't require deep prep.\n\n" +
+      "**When called with `file_id`+`node_id` (preferred inside a prep file), the resulting eval is auto-stored on that node's `ceoEval` — you can then quote it with quote_engine_eval on any later call.** This is what makes engine attribution trustworthy: prose that says 'engines say X on node Y' can only be true if a call was actually made against node_id=Y.",
     inputSchema: {
       type: "object",
       properties: {
-        fen: { type: "string", description: "Starting position as FEN. Combine with `moves` to walk from there." },
+        file_id: { type: "string", description: "Prep file id. **Prefer file_id+node_id over fen** when inside a prep file — the FEN comes from the tree AND the result is stored on the node." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'. When set, overrides `fen`/`moves`." },
+        fen: { type: "string", description: "Starting position as FEN. Only used if `node_id` is not set." },
         moves: {
           type: "string",
-          description: "Optional SAN moves to apply on top of `fen` (or on top of startpos). Example: fen='<tabiya>', moves='b4 a5 c3' analyses the position after those three moves.",
+          description: "Optional SAN moves to apply on top of `fen` (or startpos). Only used if `node_id` is not set.",
         },
         movetime_ms: {
           type: "integer",
@@ -498,7 +524,6 @@ const TOOLS: Tool[] = [
             "Lc0 contempt bias. 0 = objective (default). Positive favours White, negative favours Black; stay within -20..+20 in practice. Not applied to Stockfish. See engine_usage_primer prompt for when to use.",
         },
       },
-      required: ["fen"],
     },
   },
   {
@@ -522,8 +547,9 @@ const TOOLS: Tool[] = [
   {
     name: "read_prep_file",
     description:
-      "Read one prep file. Returns a compact tree (path-addressable, one node per move) plus tags and the `version` for optimistic locking on subsequent mutations. NO raw PGN — all edits go through the mutation tools (add_move / set_comment / set_nags / set_annotations / delete_subtree / promote_variation / set_tag), which validate SAN and structure for you.\n\n" +
-      "Path addressing: paths are arrays of child indices. `[]` = root position. `[0]` = the first mainline move. `[0, 1]` = the second variation branching after the first move. `[0, 0, 0]` = three plies deep on the mainline. Every mutation returns the effective path it landed at.",
+      "Read one prep file. Returns a compact tree (each node carries a stable `id`, `san`, `fen`, `ply`, optional `comment`/`nags`/`annotations`/`ceoEval`, and `children`) plus tags and the `version` for optimistic locking on subsequent mutations. NO raw PGN — all edits go through the mutation tools (add_move / add_line / set_comment / set_nags / set_annotations / delete_subtree / promote_variation / set_tag), which validate SAN and structure for you.\n\n" +
+      "**Node addressing.** Every node has a stable `id` — root is `'r'`, every other node is an 8-hex-char content hash derived from its parent's id + its SAN. Sibling insertions, deletions and variation promotions do NOT change any other node's id. Pass this id as `node_id` (or `parent_id` for add_move / add_line) to every mutation and engine/DB tool.\n\n" +
+      "**Every engine/DB tool accepts `file_id`+`node_id`** (get_position_stats, cloud_analyse, describe_position, predict_human_move, prep_snapshot, get_player_preparation, quote_engine_eval). Use it whenever a file is open — the server derives the FEN from the tree, so you can't 'analyse the wrong position' by mis-typing a FEN.",
     inputSchema: {
       type: "object",
       properties: {
@@ -563,59 +589,75 @@ const TOOLS: Tool[] = [
   {
     name: "add_move",
     description:
-      "Append a move as a new child of the node at `path`. If the node already has children, the new move becomes a variation (appended at the end). Use promote_variation afterwards if you want it to be the mainline. SAN is validated against the position — illegal moves are rejected with a clear error.\n\n" +
-      "Auto-saves. Returns `{path, version}` — the effective path the new node landed at (which you pass to follow-up set_comment / set_nags / etc.) and the new file version for optimistic locking on your next mutation.",
+      "Append a move as a new child of the node identified by `parent_id`. If the parent already has children, the new move becomes a variation (appended at the end); use promote_variation afterwards to make it the mainline. SAN is validated against the position — illegal moves are rejected with a clear error.\n\n" +
+      "Auto-saves. Returns `{node_id, version}` — the id of the new node (pass this to follow-up set_comment / set_nags / etc.) and the new file version for optimistic locking. **Node ids are content-derived and stable** — sibling insertions, deletions, and promotions do NOT change any other node's id.",
     inputSchema: {
       type: "object",
       properties: {
-        id:   { type: "string", description: "Prep file id." },
-        path: { type: "array", items: { type: "integer", minimum: 0 }, description: "Path to the parent node the move is played FROM." },
-        san:  { type: "string", description: "The move in SAN notation (e.g. 'Nf3', 'exd5', 'O-O', 'Qxf7+')." },
+        id:        { type: "string", description: "Prep file id." },
+        parent_id: { type: "string", description: "Node id of the parent (the position the move is played FROM). Root id is 'r'." },
+        san:       { type: "string", description: "The move in SAN notation (e.g. 'Nf3', 'exd5', 'O-O', 'Qxf7+')." },
         expected_version: { type: "integer", description: "Optimistic-lock check; pass the `version` from your last read." },
       },
-      required: ["id", "path", "san"],
+      required: ["id", "parent_id", "san"],
+    },
+  },
+  {
+    name: "add_line",
+    description:
+      "Append a linear sequence of moves under `parent_id`. Each SAN in the list becomes the mainline child of the previous — one call instead of N add_move calls for a straight variation. If the parent already has other children, this whole line is appended as a variation (promote_variation the first move if you want it as the mainline).\n\n" +
+      "Auto-saves. Returns `{node_id, line: [{node_id, san}, ...], version}` — `node_id` is the last (leaf) node's id, `line` is every node created in order so you can address any of them next.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:        { type: "string", description: "Prep file id." },
+        parent_id: { type: "string", description: "Node id of the parent to build from. Root is 'r'." },
+        sans:      { type: "array", items: { type: "string" }, minItems: 1, description: "SAN moves in order, e.g. ['e4','e5','Nf3','Nc6','Bb5']." },
+        expected_version: { type: "integer" },
+      },
+      required: ["id", "parent_id", "sans"],
     },
   },
   {
     name: "set_comment",
     description:
-      "Set (or clear, with empty string) the text comment on the node at `path`. Comments are for plans, prep-signal, and interpretation the app can't derive — NOT for describing moves that should be variations instead. Auto-saves.",
+      "Set (or clear, with empty string) the text comment on the node identified by `node_id`. Comments are for plans, prep-signal, and interpretation the app can't derive — NOT for describing moves that should be variations instead. Auto-saves.",
     inputSchema: {
       type: "object",
       properties: {
         id:      { type: "string", description: "Prep file id." },
-        path:    { type: "array", items: { type: "integer", minimum: 0 } },
+        node_id: { type: "string", description: "Node id from read_prep_file / add_move." },
         comment: { type: "string", description: "New comment text. Empty string clears." },
         expected_version: { type: "integer" },
       },
-      required: ["id", "path", "comment"],
+      required: ["id", "node_id", "comment"],
     },
   },
   {
     name: "set_nags",
     description:
-      "Replace the list of NAGs on the node at `path`. Empty array clears them. See read_pgn_authoring_guide for the full NAG table and eval→NAG thresholds (|eval|<0.25 → $10; <0.6 → $14/$15; <1.3 → $16/$17; ≥1.3 → $18/$19). Auto-saves.",
+      "Replace the list of NAGs on the node identified by `node_id`. Empty array clears them. NAGs are your EDITORIAL call — see read_pgn_authoring_guide for the discipline (novelty $146, sharp choice $5, decisive $18/$19, etc.). Do NOT set $10 '=' on every equal position; that's board noise. Auto-saves.",
     inputSchema: {
       type: "object",
       properties: {
-        id:   { type: "string" },
-        path: { type: "array", items: { type: "integer", minimum: 0 } },
-        nags: { type: "array", items: { type: "string", pattern: "^\\$\\d+$" }, description: "NAG list, e.g. ['$14'] or ['$146', '$44']." },
+        id:      { type: "string" },
+        node_id: { type: "string" },
+        nags:    { type: "array", items: { type: "string", pattern: "^\\$\\d+$" }, description: "NAG list, e.g. ['$14'] or ['$146', '$44']." },
         expected_version: { type: "integer" },
       },
-      required: ["id", "path", "nags"],
+      required: ["id", "node_id", "nags"],
     },
   },
   {
     name: "set_annotations",
     description:
-      "Replace the visual annotations (arrows + coloured squares) on the node at `path`. Passing empty arrays clears them.\n\n" +
+      "Replace the visual annotations (arrows + coloured squares) on the node identified by `node_id`. Passing empty arrays clears them.\n\n" +
       "Colours: green, red, yellow, light-blue, dark-blue, orange. Keep it LIGHT: 1-3 arrows and 2-3 squares per move maximum. Twenty arrows is noise, not signal. Auto-saves.",
     inputSchema: {
       type: "object",
       properties: {
-        id:   { type: "string" },
-        path: { type: "array", items: { type: "integer", minimum: 0 } },
+        id:      { type: "string" },
+        node_id: { type: "string" },
         arrows: {
           type: "array",
           items: {
@@ -641,43 +683,43 @@ const TOOLS: Tool[] = [
         },
         expected_version: { type: "integer" },
       },
-      required: ["id", "path"],
+      required: ["id", "node_id"],
     },
   },
   {
     name: "delete_subtree",
     description:
-      "Delete the node at `path` and all its descendants. Refuses to delete the root. Auto-saves.",
+      "Delete the node identified by `node_id` and all its descendants. Refuses to delete the root. Auto-saves.",
     inputSchema: {
       type: "object",
       properties: {
-        id:   { type: "string" },
-        path: { type: "array", items: { type: "integer", minimum: 0 } },
+        id:      { type: "string" },
+        node_id: { type: "string" },
         expected_version: { type: "integer" },
       },
-      required: ["id", "path"],
+      required: ["id", "node_id"],
     },
   },
   {
     name: "promote_variation",
     description:
-      "Make the node at `path` its parent's mainline (children[0]), demoting the current mainline (and any other siblings) into variation order. Silently no-op if already the mainline. Auto-saves.",
+      "Make the node identified by `node_id` its parent's mainline (children[0]), demoting the current mainline (and any other siblings) into variation order. Silently no-op if already the mainline. Auto-saves.",
     inputSchema: {
       type: "object",
       properties: {
-        id:   { type: "string" },
-        path: { type: "array", items: { type: "integer", minimum: 0 }, description: "Path to the node to promote. Length ≥ 1." },
+        id:      { type: "string" },
+        node_id: { type: "string", description: "Node id of the variation to promote. Cannot be root." },
         expected_version: { type: "integer" },
       },
-      required: ["id", "path"],
+      required: ["id", "node_id"],
     },
   },
   {
     name: "apply_mutations",
     description:
       "Batch: apply a list of mutations in one call. One load-parse-mutate-export-save cycle for N ops, so building a 100-move repertoire costs one HTTP round-trip and one save instead of 100. This is the RIGHT way to build a file — use single mutations only for surgical follow-up edits.\n\n" +
-      "Each mutation is `{op, path, ...args}` where `op` is one of: add_move, set_comment, set_nags, set_annotations, delete_subtree, promote_variation, set_tag. Same arg shape as the individual tools. Ops apply in order; `path` is resolved against the tree AFTER preceding ops in the batch — so after `{op: 'add_move', path: [0], san: 'Nc3'}` the new node's path is `[0, N]` where N is the parent's previous children count (or `[0, 0]` if it was empty).\n\n" +
-      "Any op error aborts the batch (nothing saved). Response is `{ok, results: [{path}], version}` giving the effective path each op landed at plus the new file version.",
+      "Each mutation is `{op, node_id | parent_id, ...args}` where `op` is one of: add_move, add_line, set_comment, set_nags, set_annotations, delete_subtree, promote_variation, set_tag. Same arg shape as the individual tools. Ops apply in order; because node ids are content-derived (hash of parent_id + san), a node created by an early op has a deterministic id you can reference in later ops in the same batch.\n\n" +
+      "Any op error aborts the batch (nothing saved). Response is `{ok, results: [{node_id, line?}], version}` — one entry per op with the id it landed on (add_line also returns the full line array).",
     inputSchema: {
       type: "object",
       properties: {
@@ -689,9 +731,11 @@ const TOOLS: Tool[] = [
           items: {
             type: "object",
             properties: {
-              op: { type: "string", enum: ["add_move", "set_comment", "set_nags", "set_annotations", "delete_subtree", "promote_variation", "set_tag"] },
-              path: { type: "array", items: { type: "integer", minimum: 0 } },
-              san: { type: "string" },
+              op: { type: "string", enum: ["add_move", "add_line", "set_comment", "set_nags", "set_annotations", "delete_subtree", "promote_variation", "set_tag"] },
+              node_id:   { type: "string" },
+              parent_id: { type: "string" },
+              san:  { type: "string" },
+              sans: { type: "array", items: { type: "string" } },
               comment: { type: "string" },
               nags: { type: "array", items: { type: "string", pattern: "^\\$\\d+$" } },
               arrows: { type: "array" },
@@ -709,20 +753,34 @@ const TOOLS: Tool[] = [
   {
     name: "auto_evaluate",
     description:
-      "Walk the tree from `path` (default `[]` = whole file) and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every node via cloud_analyse. Requires a running cloud combo instance.\n\n" +
-      "**Does NOT set visible NAGs.** NAG placement is your call, not the engine's — an opening tree full of 0.00 positions doesn't need a `$10` (=) glyph on every move (that's just noise on the board), and a `!` on a novelty or a `?!` on a risky committal is a judgment call the engine can't make. Use this tool to persist the raw numbers on every node, then re-read the file and hand-pick NAGs on the moves where a glyph carries real signal (novelty, sharp choice, real mistake, decisive advantage).\n\n" +
-      "On re-read every node with a stored eval carries `ceoEval: { sf: {cp, depth}, lc0: {cp, depth} }` — the numbers travel with the file. Use `only_missing=true` (default) to skip nodes already evaluated on repeat runs.\n\n" +
+      "Walk the tree from `node_id` (default `'r'` = whole file) and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every descendant via cloud_analyse. Requires a running cloud combo instance.\n\n" +
+      "**Does NOT set visible NAGs.** NAG placement is your call, not the engine's — an opening tree full of 0.00 positions doesn't need a `$10` (=) glyph on every move (that's just noise on the board), and a `!` on a novelty or a `?!` on a risky committal is a judgment call the engine can't make. Use this tool to persist the raw numbers on every node, then re-read the file and hand-pick NAGs on the moves where a glyph carries real signal.\n\n" +
+      "On re-read every evaluated node carries `ceoEval: { sf: {cp, depth}, lc0: {cp, depth} }` — the numbers travel with the file. Read those back with quote_engine_eval before writing prose that references engine numbers. Use `only_missing=true` (default) to skip nodes already evaluated on repeat runs.\n\n" +
       "Costs real money — hits cloud_analyse per node. A 200-node tree at 1.5s/node = ~5 min of engine time. Runs 4 evaluations in parallel to save wall time.",
     inputSchema: {
       type: "object",
       properties: {
         id:            { type: "string" },
-        path:          { type: "array", items: { type: "integer", minimum: 0 }, description: "Subtree root (default = whole file)." },
+        node_id:       { type: "string", description: "Subtree root (default 'r' = whole file)." },
         only_missing:  { type: "boolean", description: "Skip nodes that already carry a stored ceoEval (default true)." },
         movetime_ms:   { type: "integer", minimum: 500, maximum: 5000, description: "Per-node cloud_analyse think time (default 1500)." },
         expected_version: { type: "integer" },
       },
       required: ["id"],
+    },
+  },
+  {
+    name: "quote_engine_eval",
+    description:
+      "Return the stored engine eval for a node, or null if that node was never analysed. **Call this before writing prose or NAGs that quote engine numbers** — if it returns null, you have no measurement to cite. Do NOT infer an eval for the node from siblings or children; either analyse it (cloud_analyse with node_id) or omit the number from your prose.\n\n" +
+      "Response: `{ ceoEval: { sf: {cp, depth}, lc0: {cp, depth}, nag } | null }`. `cp` is White-POV centipawns as an integer (+20 = +0.20). `nag` is the threshold-derived glyph as a SUGGESTION — promote to a visible NAG via set_nags only when a glyph on that move carries editorial signal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:      { type: "string", description: "Prep file id." },
+        node_id: { type: "string", description: "Node id whose stored eval you want to quote." },
+      },
+      required: ["id", "node_id"],
     },
   },
   {
@@ -775,14 +833,16 @@ const TOOLS: Tool[] = [
         fide_id_me: { type: "integer", description: "Your FIDE ID." },
         fide_id_opponent: { type: "integer", description: "Opponent's FIDE ID." },
         my_color: { type: "string", enum: ["white", "black"], description: "The colour YOU will play." },
+        file_id: { type: "string", description: "Prep file id. **Prefer file_id+node_id** when inside a prep file." },
+        node_id: { type: "string", description: "Node id inside `file_id`. When set, overrides `line`/`fen`." },
         line: {
           type: "string",
           description:
-            "Move sequence in SAN, space-separated. Empty = starting position. Example: 'e4 c5 Nf3'. Either line or fen (or neither for the starting position).",
+            "Move sequence in SAN, space-separated. Empty = starting position. Only used if `node_id` is not set.",
         },
         fen: {
           type: "string",
-          description: "Alternative to line — raw FEN of the target position.",
+          description: "Alternative to line — raw FEN of the target position. Only used if `node_id` is not set.",
         },
       },
       required: ["fide_id_me", "fide_id_opponent", "my_color"],
@@ -887,58 +947,77 @@ type EngineBlock = {
   bestMove?: string;
 };
 
-// Path arg parsing for the mutation tools. Rejects malformed input
-// with a clear message the LLM can act on.
-function argPath(args: Args): Path {
-  const raw = args.path;
-  if (!Array.isArray(raw)) throw new Error("`path` must be an array of non-negative integers");
-  const out: Path = [];
-  for (let i = 0; i < raw.length; i++) {
-    const n = raw[i];
-    if (typeof n !== "number" || !Number.isInteger(n) || n < 0) {
-      throw new Error(`path[${i}] must be a non-negative integer (got ${JSON.stringify(n)})`);
-    }
-    out.push(n);
+// Extract a node id from the args. Accepts either `node_id` or a
+// `parent_id` alias for the add-style tools. Throws with a helpful
+// message if malformed.
+function argNodeId(args: Args, key: "node_id" | "parent_id" = "node_id"): string {
+  const raw = args[key];
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new Error(`\`${key}\` is required (call read_prep_file to get valid node ids)`);
   }
-  return out;
+  return raw.trim();
 }
 
-// Dispatch table for the batch tool: name → mutator that returns the
-// standard { file, path } shape. Reused for individual and batch calls.
-function dispatchMutation(file: PrepFile, op: Record<string, unknown>): { file: PrepFile; path: Path } {
+// Dispatch table for the batch tool: name → mutator that returns
+// { file, id } where id is the node the mutation touched. The batch
+// caller rebuilds the id → path index between ops so newly-created
+// nodes are addressable within the same batch.
+function dispatchMutation(
+  file: PrepFile,
+  idIndex: Map<string, Path>,
+  op: Record<string, unknown>,
+): { file: PrepFile; id: string; results?: Array<{ id: string; san: string }> } {
   const kind = String(op.op);
-  const path = Array.isArray(op.path) ? (op.path as number[]) : [];
+  // Small local helper — resolves a node_id (or parent_id) op field to
+  // a path against the CURRENT tree state.
+  const nodeIdField = (key: "node_id" | "parent_id"): string => {
+    const raw = op[key];
+    if (typeof raw !== "string" || raw.length === 0) {
+      throw new Error(`\`${key}\` required on op ${kind}`);
+    }
+    return raw.trim();
+  };
+  const resolve = (id: string): Path => resolveNodeId(idIndex, id);
   switch (kind) {
     case "add_move":
-      return addMove(file, path, String(op.san));
+      return addMove(file, resolve(nodeIdField("parent_id")), String(op.san));
+    case "add_line": {
+      const sans = Array.isArray(op.sans) ? (op.sans as unknown[]).map(String) : [];
+      const parentPath = resolve(nodeIdField("parent_id"));
+      const step = addLine(file, parentPath, sans);
+      const lastId = step.line.length > 0 ? step.line[step.line.length - 1].id : nodeIdField("parent_id");
+      return { file: step.file, id: lastId, results: step.line };
+    }
     case "set_comment":
-      return setComment(file, path, typeof op.comment === "string" ? op.comment : "");
+      return setComment(file, resolve(nodeIdField("node_id")), typeof op.comment === "string" ? op.comment : "");
     case "set_nags":
-      return setNags(file, path, Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : []);
+      return setNags(file, resolve(nodeIdField("node_id")), Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : []);
     case "set_annotations": {
       const arrows = Array.isArray(op.arrows) ? (op.arrows as PrepArrow[]) : [];
       const highlights = Array.isArray(op.highlights) ? (op.highlights as PrepHighlight[]) : [];
       const ann: PrepAnnotations | null =
         arrows.length === 0 && highlights.length === 0 ? null : { arrows, highlights };
-      return setAnnotations(file, path, ann);
+      return setAnnotations(file, resolve(nodeIdField("node_id")), ann);
     }
     case "set_ceo_eval": {
       const ev = op.ceoEval as StoredEval | null | undefined;
-      return setCeoEval(file, path, ev ?? null);
+      return setCeoEval(file, resolve(nodeIdField("node_id")), ev ?? null);
     }
     case "delete_subtree":
-      return deleteSubtree(file, path);
+      return deleteSubtree(file, resolve(nodeIdField("node_id")));
     case "promote_variation":
-      return promoteVariation(file, path);
+      return promoteVariation(file, resolve(nodeIdField("node_id")));
     case "set_tag":
-      return { file: setTag(file, String(op.key), String(op.value ?? "")), path: [] };
+      return { file: setTag(file, String(op.key), String(op.value ?? "")), id: ROOT_ID };
     default:
       throw new Error(`unknown mutation op: ${kind}`);
   }
 }
 
-// Batch: load, parse, apply N mutations in order, export, save. All-or-nothing —
-// any error aborts and nothing is saved.
+// Batch: load, parse, apply N mutations in order, export, save.
+// All-or-nothing — any error aborts and nothing is saved. The id index
+// is rebuilt after each op so nodes created earlier in the batch can be
+// addressed by later ops via their newly-derived node_id.
 async function applyBatchMutations(args: Args): Promise<unknown> {
   const id = String(args.id);
   const mutations = Array.isArray(args.mutations) ? args.mutations : [];
@@ -949,13 +1028,15 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
   if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
 
   let file = parsePGN(g.pgnContent);
-  const results: Array<{ path: Path }> = [];
+  let idIndex = buildIdIndex(file.root);
+  const results: Array<{ node_id: string; line?: unknown }> = [];
   for (let i = 0; i < mutations.length; i++) {
     const op = mutations[i] as Record<string, unknown>;
     try {
-      const step = dispatchMutation(file, op);
+      const step = dispatchMutation(file, idIndex, op);
       file = step.file;
-      results.push({ path: step.path });
+      idIndex = buildIdIndex(file.root);
+      results.push({ node_id: step.id, ...(step.results !== undefined ? { line: step.results } : {}) });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`mutation #${i} (${String(op.op)}) failed: ${msg}`);
@@ -978,7 +1059,9 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
 // mutation at the end so a 200-node evaluate is one save.
 async function autoEvaluate(args: Args): Promise<unknown> {
   const id = String(args.id);
-  const startPath: Path = Array.isArray(args.path) ? (args.path as number[]) : [];
+  const startNodeId = typeof args.node_id === "string" && args.node_id.length > 0
+    ? String(args.node_id)
+    : ROOT_ID;
   const onlyMissing = args.only_missing !== false; // default true
   const movetimeMs = typeof args.movetime_ms === "number" ? args.movetime_ms : 1500;
 
@@ -986,28 +1069,32 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   const g = raw as { pgnContent?: string; version?: number };
   if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
   const file = parsePGN(g.pgnContent);
+  const idIndex = buildIdIndex(file.root);
+  const startPath = resolveNodeId(idIndex, startNodeId);
 
   // Collect eligible nodes (skip root — no move to evaluate). `onlyMissing`
   // gates on stored `ceoEval` (the raw persisted numbers), not on visible
   // NAGs — this tool never sets NAGs, so gating on NAGs would incorrectly
   // re-evaluate hand-annotated moves whose eval hasn't been stored yet.
-  type Target = { path: Path; fen: string };
+  type Target = { nodeId: string; fen: string };
   const targets: Target[] = [];
-  const walk = (node: PrepNode, path: Path) => {
-    if (path.length > 0) {
+  const walk = (node: PrepNode, isStartAndRoot: boolean) => {
+    if (!isStartAndRoot) {
       if (!onlyMissing || !node.ceoEval) {
-        targets.push({ path, fen: node.fen });
+        targets.push({ nodeId: node.id, fen: node.fen });
       }
     }
-    for (let i = 0; i < node.children.length; i++) walk(node.children[i], [...path, i]);
+    for (const child of node.children) walk(child, false);
   };
-  const startNode = pathIntoTree(file.root, startPath);
-  walk(startNode, startPath);
+  const startNode = getNodeByPath(file.root, startPath);
+  // If the caller anchored at the root, skip evaluating the root itself
+  // (no move); otherwise the anchor node IS a real move and gets evaluated.
+  walk(startNode, startNode.id === ROOT_ID);
   if (targets.length === 0) return { ok: true, evaluated: 0, skipped: 0, version: g.version };
 
   // Dispatch cloud_analyse in parallel with a 4-way cap so we don't
   // over-saturate the engine-ws connection cap (single-client per port).
-  const stored: { path: Path; ev: StoredEval }[] = [];
+  const stored: { nodeId: string; ev: StoredEval }[] = [];
   const CONCURRENCY = 4;
   let cursor = 0;
   async function worker() {
@@ -1021,7 +1108,7 @@ async function autoEvaluate(args: Args): Promise<unknown> {
           { fen: t.fen, movetime_ms: movetimeMs, multipv: 1 },
         );
         const ev = analysisToStoredEval(analysis, t.fen);
-        if (ev) stored.push({ path: t.path, ev });
+        if (ev) stored.push({ nodeId: t.nodeId, ev });
       } catch {
         // best-effort — a single failed node shouldn't kill the batch
       }
@@ -1038,10 +1125,9 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   // The threshold-derived NAG still lives INSIDE `ceoEval.nag` so the
   // LLM can read it back and decide whether to promote it to a visible
   // NAG on a case-by-case basis.
-  type BatchOp = { op: string; path: Path; ceoEval?: StoredEval };
-  const batchMutations: BatchOp[] = [];
+  const batchMutations: Array<{ op: string; node_id: string; ceoEval?: StoredEval }> = [];
   for (const s of stored) {
-    batchMutations.push({ op: "set_ceo_eval", path: s.path, ceoEval: s.ev });
+    batchMutations.push({ op: "set_ceo_eval", node_id: s.nodeId, ceoEval: s.ev });
   }
   const saveResult = await applyBatchMutations({ id, mutations: batchMutations, expected_version: g.version } as Args);
   const sr = saveResult as { version?: number };
@@ -1136,10 +1222,12 @@ function storedEvalToCompact(ev: StoredEval | null, analysis: unknown): CompactE
 
 // Load-mutate-save: fetch current PGN, parse, apply mutation, re-export,
 // save with optimistic lock. Auto-saves so every tool call is atomic;
-// the LLM never sees intermediate state.
+// the LLM never sees intermediate state. The mutator is called with
+// both the parsed file and its id → path index, so the mutation can
+// resolve node_ids without rebuilding the index itself.
 async function applyMutation(
   args: Args,
-  mutator: (file: PrepFile) => { file: PrepFile; path: Path },
+  mutator: (file: PrepFile, idIndex: Map<string, Path>) => { file: PrepFile; id: string; results?: unknown },
 ): Promise<unknown> {
   const id = String(args.id);
   const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
@@ -1147,11 +1235,12 @@ async function applyMutation(
   if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
 
   const file = parsePGN(g.pgnContent);
-  let result: { file: PrepFile; path: Path };
+  const idIndex = buildIdIndex(file.root);
+  let result: { file: PrepFile; id: string; results?: unknown };
   try {
-    result = mutator(file);
+    result = mutator(file, idIndex);
   } catch (err) {
-    if (err instanceof MutationError || err instanceof PathError) {
+    if (err instanceof MutationError || err instanceof PathError || err instanceof NodeIdError) {
       throw new Error(`mutation rejected: ${err.message}`);
     }
     throw err;
@@ -1166,7 +1255,8 @@ async function applyMutation(
   const savedRow = saved as { version?: number };
   return {
     ok: true,
-    path: result.path,
+    node_id: result.id,
+    ...(result.results !== undefined ? { line: result.results } : {}),
     version: savedRow.version,
   };
 }
@@ -1313,6 +1403,77 @@ function resolveFenFromArgs(args: Args): string {
   return board.fen();
 }
 
+// Handle to a loaded prep-file when an engine/DB tool was called with
+// file_id+node_id. Carries enough state to (a) know which FEN to query,
+// and (b) write ceoEval back onto the node without another parse.
+type FileHandle = {
+  id: string;
+  version: number;
+  parsedFile: PrepFile;
+  idIndex: Map<string, Path>;
+  nodePath: Path;
+  fen: string;
+};
+
+// Async resolver used by every engine / DB tool. If the caller supplied
+// file_id + node_id (preferred), load the file, resolve the node, and
+// return both the FEN and a handle we can use to persist ceoEval later.
+// Otherwise fall back to the raw fen/moves/line inputs.
+async function resolveFromNodeOrFen(args: Args): Promise<{ fen: string; file?: FileHandle }> {
+  const fileId = typeof args.file_id === "string" ? args.file_id.trim() : "";
+  const nodeId = typeof args.node_id === "string" ? args.node_id.trim() : "";
+  if (fileId && nodeId) {
+    const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
+    const g = raw as { pgnContent?: string; version?: number };
+    if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+    const parsedFile = parsePGN(g.pgnContent);
+    const idIndex = buildIdIndex(parsedFile.root);
+    const nodePath = resolveNodeId(idIndex, nodeId);
+    const node = getNodeByPath(parsedFile.root, nodePath);
+    return {
+      fen: node.fen,
+      file: {
+        id: fileId,
+        version: g.version ?? 0,
+        parsedFile,
+        idIndex,
+        nodePath,
+        fen: node.fen,
+      },
+    };
+  }
+  return { fen: resolveFenFromArgs(args) };
+}
+
+// Local wrapper — the mutation module re-exports paths.getNode so this
+// import stays consistent with the rest of the file's imports.
+function getNodeByPath(root: PrepNode, path: Path): PrepNode {
+  let cur = root;
+  for (const idx of path) {
+    if (idx < 0 || idx >= cur.children.length) throw new Error(`invalid node path segment ${idx}`);
+    cur = cur.children[idx];
+  }
+  return cur;
+}
+
+// Persist a fresh ceoEval on the node referenced by the file handle.
+// Best-effort — if the file version raced (another agent saved
+// between our GET and our PUT), we silently drop the store rather
+// than fail the analysis the LLM actually asked for. The eval is
+// still returned in the response either way.
+async function storeEvalOnNode(handle: FileHandle, ev: StoredEval): Promise<void> {
+  try {
+    const step = setCeoEval(handle.parsedFile, handle.nodePath, ev);
+    const newPgn = exportPGN(step.file);
+    await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(handle.id)}`, {
+      pgn: newPgn,
+      expected_version: handle.version,
+    });
+  } catch {
+    // Best-effort — the analysis result is what the LLM asked for.
+  }
+}
+
 function stringifyForLog(v: unknown): string {
   let s: string;
   try {
@@ -1351,28 +1512,19 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return get("/api/chess/players/profile", { fideId: Number(args.fide_id) });
 
     case "get_player_preparation": {
-      // Prefer sending `line` to the backend when the caller specified moves
-      // WITHOUT a fen — the backend then attaches the cumulative-line SAN to
-      // each move in the response (nicer for the LLM's follow-up walks).
-      // When a fen was supplied, always resolve the effective position
-      // client-side and send just fen — the backend can't reconstruct
-      // history it didn't see anyway.
-      const fenArg = typeof args.fen === "string" ? args.fen.trim() : "";
-      const movesArg = typeof args.moves === "string" ? args.moves.trim() : "";
-      const lineArg = typeof args.line === "string" ? args.line.trim() : "";
+      // Node-first: if file_id+node_id was given, derive the FEN from the
+      // tree (never trust an LLM-supplied FEN when a node reference is
+      // available). Otherwise fall back to fen/moves/line.
+      const resolved = await resolveFromNodeOrFen(args);
+      const effectiveFen = resolved.fen;
       const params: Record<string, string | number | undefined> = {
         fideId: Number(args.fide_id),
         color: String(args.color),
         compact: "true",
+        fen: effectiveFen,
       };
-      if (fenArg || movesArg) {
-        params.fen = resolveFenFromArgs(args);
-      } else if (lineArg) {
-        params.line = lineArg;
-      }
       if (typeof args.limit === "number") params.limit = args.limit;
       if (typeof args.offset === "number") params.offset = args.offset;
-      const effectiveFen = resolveFenFromArgs(args);
       const [raw, ev] = await Promise.all([
         get("/api/chess/prep/by-player", params),
         fetchCompactEval(effectiveFen),
@@ -1387,7 +1539,8 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     }
 
     case "get_position_stats": {
-      const fen = resolveFenFromArgs(args);
+      const resolved = await resolveFromNodeOrFen(args);
+      const fen = resolved.fen;
       const rawSource = typeof args.source === "string" ? args.source : "gm-classical";
       const source = rawSource === "main" ? "main" : "gm-classical";
       const [raw, ev] = await Promise.all([
@@ -1408,11 +1561,14 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return converted;
     }
 
-    case "describe_position":
-      return describePosition(resolveFenFromArgs(args));
+    case "describe_position": {
+      const resolved = await resolveFromNodeOrFen(args);
+      return describePosition(resolved.fen);
+    }
 
     case "predict_human_move": {
-      const fen = resolveFenFromArgs(args);
+      const resolved = await resolveFromNodeOrFen(args);
+      const fen = resolved.fen;
       const qs = new URLSearchParams();
       qs.set("fen", fen);
       if (typeof args.white_elo === "number") qs.set("white_elo", String(args.white_elo));
@@ -1459,13 +1615,25 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return authedRequest("DELETE", `/api/agent/cloud-engines/${encodeURIComponent(String(args.contract_id))}`);
 
     case "cloud_analyse": {
-      const fen = resolveFenFromArgs(args);
+      const resolved = await resolveFromNodeOrFen(args);
+      const fen = resolved.fen;
       const body: Record<string, unknown> = { fen };
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") body.multipv = args.multipv;
       if (typeof args.contempt === "number") body.contempt = args.contempt;
       const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
-      return convertCloudSnapshotResponse(raw, fen);
+      const converted = convertCloudSnapshotResponse(raw, fen);
+      // Node-addressed calls: persist the result on the node's ceoEval
+      // so a later quote_engine_eval can cite this measurement. This is
+      // the anti-hallucination hinge — prose that says "engines say X
+      // on node Y" can only trace back to a call actually made against
+      // node_id=Y, because the store only fires when file_id+node_id
+      // was supplied and the eval survives via the [%ceo-eval] escape.
+      if (resolved.file) {
+        const ev = analysisToStoredEval(converted, fen);
+        if (ev) await storeEvalOnNode(resolved.file, ev);
+      }
+      return converted;
     }
 
     case "list_prep_files":
@@ -1496,13 +1664,28 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return authedRequest("DELETE", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
 
     case "add_move":
-      return applyMutation(args, file => addMove(file, argPath(args), String(args.san)));
+      return applyMutation(args, (file, idIndex) =>
+        addMove(file, resolveNodeId(idIndex, argNodeId(args, "parent_id")), String(args.san)),
+      );
+
+    case "add_line":
+      return applyMutation(args, (file, idIndex) => {
+        const sans = Array.isArray(args.sans) ? (args.sans as unknown[]).map(String) : [];
+        const parentPath = resolveNodeId(idIndex, argNodeId(args, "parent_id"));
+        const step = addLine(file, parentPath, sans);
+        const lastId = step.line.length > 0 ? step.line[step.line.length - 1].id : argNodeId(args, "parent_id");
+        return { file: step.file, id: lastId, results: step.line };
+      });
 
     case "set_comment":
-      return applyMutation(args, file => setComment(file, argPath(args), typeof args.comment === "string" ? args.comment : ""));
+      return applyMutation(args, (file, idIndex) =>
+        setComment(file, resolveNodeId(idIndex, argNodeId(args)), typeof args.comment === "string" ? args.comment : ""),
+      );
 
     case "set_nags":
-      return applyMutation(args, file => setNags(file, argPath(args), Array.isArray(args.nags) ? (args.nags as unknown[]).map(String) : []));
+      return applyMutation(args, (file, idIndex) =>
+        setNags(file, resolveNodeId(idIndex, argNodeId(args)), Array.isArray(args.nags) ? (args.nags as unknown[]).map(String) : []),
+      );
 
     case "set_annotations": {
       const arrowsRaw = Array.isArray(args.arrows) ? args.arrows as PrepArrow[] : [];
@@ -1511,19 +1694,19 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
         (arrowsRaw.length === 0 && highlightsRaw.length === 0)
           ? null
           : { arrows: arrowsRaw, highlights: highlightsRaw };
-      return applyMutation(args, file => setAnnotations(file, argPath(args), ann));
+      return applyMutation(args, (file, idIndex) => setAnnotations(file, resolveNodeId(idIndex, argNodeId(args)), ann));
     }
 
     case "delete_subtree":
-      return applyMutation(args, file => deleteSubtree(file, argPath(args)));
+      return applyMutation(args, (file, idIndex) => deleteSubtree(file, resolveNodeId(idIndex, argNodeId(args))));
 
     case "promote_variation":
-      return applyMutation(args, file => promoteVariation(file, argPath(args)));
+      return applyMutation(args, (file, idIndex) => promoteVariation(file, resolveNodeId(idIndex, argNodeId(args))));
 
     case "set_tag":
       return applyMutation(args, file => ({
         file: setTag(file, String(args.key), String(args.value ?? "")),
-        path: [],
+        id: ROOT_ID,
       }));
 
     case "apply_mutations":
@@ -1531,6 +1714,19 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "auto_evaluate":
       return autoEvaluate(args);
+
+    case "quote_engine_eval": {
+      const fileId = String(args.id);
+      const nodeId = argNodeId(args);
+      const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
+      const g = raw as { pgnContent?: string };
+      if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+      const file = parsePGN(g.pgnContent);
+      const idIndex = buildIdIndex(file.root);
+      const path = resolveNodeId(idIndex, nodeId);
+      const node = getNodeByPath(file.root, path);
+      return { ceoEval: node.ceoEval ?? null };
+    }
 
     case "read_engine_usage_guide":
       return { guide: ENGINE_USAGE_DOC };
@@ -1549,35 +1745,17 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       const opp = Number(args.fide_id_opponent);
       const myColor = String(args.my_color);
       const oppColor = myColor === "white" ? "black" : "white";
-      const line = typeof args.line === "string" ? args.line.trim() : "";
-      let fen = typeof args.fen === "string" ? args.fen.trim() : "";
 
-      // General DB lookup needs a FEN. If we only have a line, compute it
-      // locally with chess.js — one dep, keeps the three data-fetches truly
-      // parallel instead of doing a preliminary round-trip.
-      if (!fen) {
-        const board = new Chess();
-        if (line.length > 0) {
-          for (const raw of line.split(/\s+/)) {
-            // Tolerant of move-number tokens like "1." / "12..." that some
-            // clients include; chess.js rejects those outright.
-            const san = raw.replace(/^\d+\.+/, "");
-            if (!san) continue;
-            try {
-              board.move(san);
-            } catch {
-              throw new Error(`bad SAN token '${raw}' in line`);
-            }
-          }
-        }
-        fen = board.fen();
-      }
+      // Prefer file_id+node_id — derives FEN from the tree, no LLM-typed
+      // FEN in the loop. Falls back to line/fen for scratch positions.
+      const resolved = await resolveFromNodeOrFen(args);
+      const fen = resolved.fen;
 
       const prepParams = (fideId: number, color: string) => ({
         fideId,
         color,
         compact: "true",
-        ...(line.length > 0 ? { line } : { fen }),
+        fen,
       });
 
       const [opponent, you, general, ev] = await Promise.all([
@@ -1588,7 +1766,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       ]);
 
       return {
-        position: { line, fen, my_color: myColor },
+        position: { fen, my_color: myColor, ...(resolved.file ? { node_id: typeof args.node_id === "string" ? args.node_id : undefined } : {}) },
         eval: ev,
         opponent: convertAvailableMovesToSAN(opponent, fen),
         you: convertAvailableMovesToSAN(you, fen),

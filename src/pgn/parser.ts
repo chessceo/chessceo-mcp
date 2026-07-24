@@ -22,6 +22,7 @@ import {
   type StoredEngineEval,
   type StoredEval,
 } from "./types.js";
+import { deriveNodeId, ROOT_ID } from "./paths.js";
 
 const CAL_RE = /\[%cal\s+([^\]]+)\]/g;
 const CSL_RE = /\[%csl\s+([^\]]+)\]/g;
@@ -116,7 +117,7 @@ export function parsePGN(pgn: string): PrepFile {
   const startPos = startResult.value;
 
   const rootFen = makeFen(startPos.toSetup());
-  const root: PrepNode = { san: null, fen: rootFen, ply: 0, children: [] };
+  const root: PrepNode = { id: ROOT_ID, san: null, fen: rootFen, ply: 0, children: [] };
 
   // Root-level comment on the game (rare, but supported).
   const gameComments = (game.moves as { comments?: string[] }).comments;
@@ -144,7 +145,13 @@ export function parsePGN(pgn: string): PrepFile {
       nodeFen = makeFen(pos.toSetup());
     }
 
-    const node: PrepNode = { san, fen: nodeFen, ply, children: [] };
+    const node: PrepNode = {
+      id: deriveNodeId(treeParent.id, san),
+      san,
+      fen: nodeFen,
+      ply,
+      children: [],
+    };
 
     // Comment on this move (both "starting comments" attached to
     // variations and "after-move comments" — we fold both into the

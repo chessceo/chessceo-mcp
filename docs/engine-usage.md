@@ -6,6 +6,16 @@ When you call `cloud_analyse`, chess.ceo runs Stockfish and Lc0 in parallel on t
 
 **Every claim you make about a position must trace back to actual engine output from this session.** Not from a book you were trained on, not from generic chess principles, not from a plausible-sounding pattern. If you don't have a Stockfish or Lc0 line for the exact FEN you're discussing, run one. Compute is cheap — `cloud_analyse` at ~2s each is fine to call 5-10 times while walking a tree; you can burn 20-30 seconds of billable time and it's still cents.
 
+### The node-id + quote_engine_eval protocol
+
+**When you're inside a prep file, call `cloud_analyse` with `file_id`+`node_id` — never with a hand-typed FEN.** The server derives the FEN from the tree node and, critically, **auto-stores the resulting eval on that node's `ceoEval`**. This is what makes engine attribution trustworthy end-to-end:
+
+1. `cloud_analyse({ id, node_id })` — runs analysis on the node's exact position, stores `{sf, lc0, nag}` on the node.
+2. Later, before you write "engines say X on this position" in a comment, call `quote_engine_eval({ id, node_id })` — it returns the stored eval or `null`.
+3. If `quote_engine_eval` returns `null`, you have no measurement to cite. **Do NOT infer an eval for a node from siblings, from children, or from a "position that looks similar."** Either analyse the node (`cloud_analyse`) or omit the number from your prose entirely.
+
+Concrete failure this rule blocks: the LLM says *"9...Bb7: both engines 0.00"* after only calling `cloud_analyse` on the child positions (post-1.d4, post-castling). Both continuations really returned 0.00, but the Bb7 node was never analysed, and the claim reads to the user as a measurement. With this protocol, `quote_engine_eval(node_id=Bb7)` would return null and the LLM would either analyse it or reword to *"both continuations run to 0.00, so this position looks balanced"* (soft inference, honestly labelled).
+
 **Concrete failure modes to avoid:**
 
 - Inventing an evaluation. If you say "this is +0.4 for White", that number must come from an engine call. Not a guess, not a vibe.

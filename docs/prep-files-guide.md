@@ -6,14 +6,20 @@ You can save chess prep to the user's chess.ceo account and read it back across 
 
 The user has **one** collection dedicated to your work — labelled "AI Prep" in their chess.ceo app with a 🤖 icon. Inside it, each **prep file** is one PGN game with variations. You never see the collection itself; the tools operate directly on the files inside it.
 
-Six tools:
+File-level tools:
 
 - `list_prep_files` — show me all my prep files
 - `search_prep_files(query)` — find by opponent name / opening keyword
-- `read_prep_file(id)` — full PGN + parsed mainline tree + `version`
-- `create_prep_file(name, pgn?)` — new file, `name` becomes the [Event] tag
-- `save_prep_file(id, pgn, expected_version)` — replace the whole PGN
+- `read_prep_file(id)` — parsed tree (every node carries a stable `id`) + tags + `version`
+- `create_prep_file(name)` — new empty file, `name` becomes the [Event] tag
 - `delete_prep_file(id)` — soft delete (user can restore from app)
+
+Mutation tools (edit an existing file — you never touch raw PGN):
+
+- `apply_mutations(id, [...])` — batch: N ops in one save. **Primary build tool.**
+- `add_move`, `add_line`, `set_comment`, `set_nags`, `set_annotations`, `delete_subtree`, `promote_variation`, `set_tag` — individual ops for surgical follow-ups. See `read_pgn_authoring_guide` for the full mutation vocabulary.
+
+Every mutation call takes a `node_id` (or `parent_id` for add-style ops) and auto-saves. Nodes are addressed by stable content-derived id, not by path — sibling insertions / deletions / promotions never shift ids. Root id is `"r"`.
 
 ## The single most important habit
 
@@ -40,23 +46,22 @@ Full details, NAG table, arrow/highlight syntax, and worked example: `read_pgn_a
 
 ## Editing without breaking the tree
 
-You get the whole PGN back from `read_prep_file`, edit it in your head, send back via `save_prep_file`. There's no partial-patch API — small edits still resend the full text. The file is small (repertoire = maybe 5-20 KB), that's fine.
+You never send raw PGN. `read_prep_file` gives you the parsed tree with stable node ids; the mutation tools accept those ids and handle the parse/edit/serialize cycle for you. SAN is validated per mutation, move numbers are automatic, parenthesised variations are impossible to leave unbalanced.
 
-Common LLM failure modes to catch yourself doing:
+Failure modes the tool layer now blocks (that used to trip LLMs writing raw PGN):
 
-- **Unbalanced parentheses.** Every `(` needs a matching `)`. Count them if you added variations. The backend parses on save; if invalid, you get 400 with the parser error and have to retry.
-- **Bad SAN.** `Nfd7` where you meant `Nbd7`. Always trace the position in your head (or use the tree from read_prep_file's response) before writing a move.
-- **Forgotten move numbers.** `1. e4 c5 2. Nf3` — after each White move you need `<num>.`, after each Black move the number continues implicitly until the next full move. In variations at Black's move, PGN wants `2... Nc6`.
-- **Nested variations losing context.** `1.e4 e5 (1...c5 (2.Nf3 d6))` — the inner variation branches at `2.Nf3` off the c5 sideline, not off the mainline. This gets confusing fast; two levels is usually enough.
-- **Blank Event tag** — the user's list_prep_files response shows the Event tag as the name. Empty tag = "Untitled" everywhere.
+- **Unbalanced parentheses** — no longer possible; you address nodes, not text.
+- **Bad SAN** — every `add_move` / `add_line` validates against the parent's FEN. Illegal moves are rejected with the position's FEN in the error so you can call `describe_position` to see legal moves.
+- **Forgotten move numbers** — the exporter reconstructs them.
+- **Nested variations losing context** — `add_move(parent_id=X, san=…)` binds unambiguously to node X.
 
 ## Optimistic locking
 
-`read_prep_file` returns a `version` integer. Pass it back as `expected_version` on `save_prep_file`. If someone else (the user in the app, or a parallel agent session) updated the file since you read it, save returns `409 Conflict` with the current version. You should:
+`read_prep_file` returns a `version` integer. Pass it back as `expected_version` on any mutation. If someone else (the user in the app, or a parallel agent session) updated the file since you read it, the save returns `409 Conflict` with the current version. You should:
 
-1. Re-read the file to see what changed.
-2. Merge your edits with theirs.
-3. Retry the save with the new version.
+1. Re-read the file to see what changed (node ids are stable across the concurrent edit, so your local references may still work).
+2. Decide whether to merge or override.
+3. Retry with the new version.
 
 If you don't pass `expected_version`, it's last-write-wins — you might silently overwrite the user's manual edits. Only skip it when you know the file is untouched (e.g. you just created it).
 
