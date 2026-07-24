@@ -271,8 +271,12 @@ const TOOLS: Tool[] = [
   {
     name: "get_position_stats",
     description:
-      "Move statistics from all 11.7M+ indexed games at a given position — game counts, win percentages, top continuations. Answers 'from position P, how often does White play 4. O-O vs 4. d3, and which scores better'.\n\n" +
-      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read (top move + score + PV) and the corresponding NAG. Do NOT fire a separate cloud_analyse for the same FEN — the eval is right there.",
+      "Move statistics + example games at a position. Answers 'how often is 4.O-O vs 4.d3 played here and which scores better'.\n\n" +
+      "SOURCE (default: `gm-classical`) selects a pre-aggregated database shard:\n" +
+      "- `gm-classical` — GM classical games (both players ≥2500, real thinking-time). BEST for opening prep — every move is signal, avgElo ~2600 across all listed moves.\n" +
+      "- `main` — the whole 11.7M-game DB. Widest coverage but noisiest (includes 1000-Elo blunder-fests in the move stats). Use as fallback when gm-classical's totalCount is too small to be informative.\n\n" +
+      "Game movetext is trimmed to the moves AFTER the queried position (using each game's plyNumber). Saves ~70% of the bytes vs full movetext.\n\n" +
+      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read and the corresponding NAG. Do NOT fire cloud_analyse separately for the same FEN.",
     inputSchema: {
       type: "object",
       properties: {
@@ -292,7 +296,12 @@ const TOOLS: Tool[] = [
           type: "integer",
           minimum: 1,
           maximum: 50,
-          description: "Number of top continuations to return.",
+          description: "Number of example games to return (default 10).",
+        },
+        source: {
+          type: "string",
+          enum: ["gm-classical", "main"],
+          description: "Which database shard to query. Default `gm-classical`. Switch to `main` only when gm-classical's totalCount is too low.",
         },
       },
     },
@@ -1156,6 +1165,57 @@ async function applyMutation(
   };
 }
 
+// Trim every game's `moves` field to just the plies AFTER the queried
+// position, using each game's `plyNumber`. Massive token save — a game
+// 80 plies long queried at ply 12 drops to ~68 plies of movetext. Ports
+// the frontend's GamesTable.getMoveDisplay() trim logic.
+function trimGamesMovetext(response: unknown): void {
+  if (!response || typeof response !== "object") return;
+  const r = response as { games?: Array<{ moves?: string; plyNumber?: number; totalPly?: number; ply?: number }> };
+  if (!Array.isArray(r.games)) return;
+  for (const g of r.games) {
+    if (typeof g.moves === "string" && typeof g.plyNumber === "number" && g.plyNumber > 0) {
+      g.moves = trimMovesToPly(g.moves, g.plyNumber);
+    }
+  }
+}
+
+function trimMovesToPly(moves: string, plyNumber: number): string {
+  // Split into plain SAN tokens, dropping standalone move-number tokens
+  // ("1.", "12...") and any glued number prefix on a SAN token ("1.e4").
+  // Result markers ("*", "1-0", "0-1", "1/2-1/2") are stripped so they
+  // don't get counted as plies.
+  const tokens: string[] = [];
+  for (const chunk of moves.split(/\s+/)) {
+    if (!chunk) continue;
+    const cleaned = chunk.replace(/^\d+\.+/, "");
+    if (!cleaned) continue;
+    if (/^(1-0|0-1|1\/2-1\/2|\*)$/.test(cleaned)) continue;
+    tokens.push(cleaned);
+  }
+  const remaining = tokens.slice(plyNumber);
+  if (remaining.length === 0) return "";
+
+  // Reconstruct with move numbering. First move gets "N..." if it's
+  // Black's move (starting the slice mid-move-pair), so the reader knows
+  // moves were dropped.
+  const out: string[] = [];
+  let ply = plyNumber;
+  for (let i = 0; i < remaining.length; i++) {
+    const san = remaining[i];
+    const moveNumber = Math.floor(ply / 2) + 1;
+    if (ply % 2 === 0) {
+      out.push(`${moveNumber}. ${san}`);
+    } else if (i === 0) {
+      out.push(`${moveNumber}... ${san}`);
+    } else {
+      out.push(san);
+    }
+    ply++;
+  }
+  return out.join(" ");
+}
+
 // Rewrite availableMoves[].move UCI → SAN. The prep + position-stats
 // endpoints return moves in UCI on the wire — same LLM-readability
 // concern as engine PVs, and the same wrapper-only fix. Passes the
@@ -1270,22 +1330,31 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
         fetchCompactEval(effectiveFen),
       ]);
       const converted = convertAvailableMovesToSAN(raw, effectiveFen);
-      if (ev && converted && typeof converted === "object") (converted as { eval?: CompactEval }).eval = ev;
+      if (converted && typeof converted === "object") {
+        trimGamesMovetext(converted);
+        if (ev) (converted as { eval?: CompactEval }).eval = ev;
+      }
       return converted;
     }
 
     case "get_position_stats": {
       const fen = resolveFenFromArgs(args);
+      const rawSource = typeof args.source === "string" ? args.source : "gm-classical";
+      const source = rawSource === "main" ? "main" : "gm-classical";
       const [raw, ev] = await Promise.all([
-        get("/api/chess/database/main", {
+        get(`/api/chess/database/${source}`, {
           fen,
-          limit: typeof args.limit === "number" ? args.limit : 20,
+          limit: typeof args.limit === "number" ? args.limit : 10,
           sort: "relevance",
         }),
         fetchCompactEval(fen),
       ]);
       const converted = convertAvailableMovesToSAN(raw, fen);
-      if (ev && converted && typeof converted === "object") (converted as { eval?: CompactEval }).eval = ev;
+      if (converted && typeof converted === "object") {
+        trimGamesMovetext(converted);
+        (converted as { source?: string }).source = source;
+        if (ev) (converted as { eval?: CompactEval }).eval = ev;
+      }
       return converted;
     }
 
