@@ -1182,6 +1182,13 @@ function stripPositionResponse(r: unknown): void {
         m.reachedViaTransposition = m.transpositions;
         delete m.transpositions;
       }
+      // Backend calls it "hotness" — a 0-100 time-decayed popularity score
+      // (recent + played often = high). Rename to something an LLM can read
+      // without guessing it means "on a winning streak".
+      if (typeof m.hotness === "number") {
+        m.fashionScore = m.hotness;
+        delete m.hotness;
+      }
     }
   }
   if (Array.isArray(t.games)) {
