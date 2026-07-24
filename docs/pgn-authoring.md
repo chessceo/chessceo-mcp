@@ -16,29 +16,54 @@ Nodes are addressed by **path**: an array of child indices from the root.
 
 ## Workflow
 
-The mutation tool set is:
+Reading:
 
 - `read_prep_file(id)` → returns `{version, tags, tree}`. Every node in `tree` has `san`, `fen`, `ply`, optional `comment`, `nags`, `annotations`, and `children`.
-- `add_move(id, path, san)` — appends a new child of `path`. If `path` already has children, the new node becomes a variation. Returns the effective path of the new node.
-- `set_comment(id, path, comment)` — replace comment. Empty string clears.
-- `set_nags(id, path, nags)` — replace NAG list. Empty array clears.
-- `set_annotations(id, path, {arrows, highlights})` — replace visual annotations. Empty arrays clear.
-- `delete_subtree(id, path)` — remove node + descendants. Refuses to delete the root.
-- `promote_variation(id, path)` — make the node at `path` its parent's mainline.
-- `set_tag(id, key, value)` — set/clear a game-level tag.
 
-Every mutation **auto-saves** with optimistic locking. Response is `{ok: true, path, version}`. Pass the returned `version` as `expected_version` on your next mutation to catch concurrent edits.
+Building (use these — one call for many ops):
+
+- **`apply_mutations(id, mutations[])`** — batch. This is the primary build tool. Send 100 mutations in one call → one load-parse-mutate-save cycle instead of 100. When you're writing a repertoire from scratch, EVERYTHING should go through this. Individual mutation tools are for surgical follow-up edits, not for bulk work.
+- **`auto_evaluate(id, path?)`** — walk the tree from `path` and auto-assign the right NAG to every node by running cloud_analyse on each position. Standard threshold table (below). Costs real engine time but frees you from hand-annotating evals. Skip nodes that already have a NAG by default.
+
+Per-op mutation tools (single-op calls, use for edits after the bulk build):
+
+- `add_move(id, path, san)` — appends a new child. If `path` has children, new node becomes a variation.
+- `set_comment(id, path, comment)` — replace comment (empty string clears).
+- `set_nags(id, path, nags)` — replace NAGs (empty array clears).
+- `set_annotations(id, path, {arrows, highlights})` — replace visual annotations.
+- `delete_subtree(id, path)` — remove node + descendants.
+- `promote_variation(id, path)` — make the node at `path` its parent's mainline.
+- `set_tag(id, key, value)` — set/clear a game-level PGN tag.
+
+All mutations **auto-save** with optimistic locking. Response includes the new `version`; pass it as `expected_version` on your next call to catch concurrent edits.
 
 ## Typical build order
 
 1. `read_prep_file` — see what's there.
-2. `add_move` to extend the mainline: `add_move(id, [], "e4")` then `add_move(id, [0], "c5")` etc.
-3. `add_move` for a variation at some node: `add_move(id, [0, 0], "Nc3")` adds Nc3 as a sibling of the current mainline's move 2.
-4. `set_comment` for plans / prep-signal, `set_nags` for evaluations, `set_annotations` for arrows and squares — always on the node the annotation belongs to.
-5. `promote_variation` if a variation is more important than the current mainline.
-6. `delete_subtree` to prune.
+2. `apply_mutations([...])` — one call with your whole intended build (all `add_move` for the moves and variations, plus any `set_comment`/`set_annotations` you already know at author time). Skip `set_nags` — auto_evaluate handles that.
+3. `auto_evaluate(id)` — walk the tree, get engine evals, assign NAGs. One shot.
+4. Individual mutation tools ONLY for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).
 
-Every step returns the new `version`; carry it forward.
+The build-cost math: a 200-move file via individual `add_move` calls is 200 saves ≈ 100+ seconds of tool overhead. The same file via one `apply_mutations` call is one save ≈ 500ms. Use batch by default.
+
+### Path math in a batch
+
+Paths in each mutation resolve against the tree AFTER previous ops in the batch. When you `add_move(path=[0], san='c5')`, the new c5 lands at `[0, 0]` if [0] had no children, or `[0, N]` if it had N. Your next mutation in the batch can address the new node directly. The tree is deterministic — you can compute all paths ahead of time.
+
+For a linear mainline build from an empty file:
+```
+{op: "add_move", path: [],        san: "e4"}   // lands at [0]
+{op: "add_move", path: [0],       san: "c5"}   // lands at [0, 0]
+{op: "add_move", path: [0, 0],    san: "Nf3"}  // lands at [0, 0, 0]
+{op: "add_move", path: [0, 0, 0], san: "d6"}   // lands at [0, 0, 0, 0]
+...
+```
+
+For a variation at some point:
+```
+{op: "add_move", path: [0, 0], san: "Nc3"}   // variation branching after move 2; lands at [0, 0, 1]
+{op: "add_move", path: [0, 0, 1], san: "d5"} // continue the variation; lands at [0, 0, 1, 0]
+```
 
 ## Variations vs prose
 
@@ -56,6 +81,7 @@ Prose is NEVER for:
 - Move sequences ("then Nf3, then Bg5, ...") — use variations.
 - Move recommendations ("here White should play h4") — add_move it.
 - Restating the eval a NAG already conveys.
+- **Describing a sibling variation you already added as a branch.** If move A has variation B added as `add_move(A, sibling)`, don't ALSO write `{if B then ...}` on A. The reader clicks B on the board — the branch is already there.
 
 ## Move-judgment symbols (NAGs)
 
@@ -96,9 +122,14 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 | `\|eval\| ≥ 1.3`          | `$18` (+−)              | `$19` (−+)              |
 | Sharp, hard to evaluate | `$13` (∞)               | `$13` (∞)               |
 
-**Don't paste raw engine numbers into comments.** `{Stockfish gives +0.35}` is noise — `$14` is the signal. Same for `{Lc0 says +0.15}`.
+**Prefer auto_evaluate for the NAG.** Don't hand-write NAGs when building — call `auto_evaluate(id)` after your build and it assigns the right glyph to every node from actual engine analysis. Manual `set_nags` is for overrides (mark a novelty with $146, flag a `$5 !?` piece sac).
 
-**Don't name the engine unless it adds signal.** Naming Stockfish adds nothing to a `$14` on a routine position. Naming it makes sense when there's a mismatch worth flagging: `$14 {Human predictor gives 47% win at 2200 vs 2600 — the Elo gap does the practical work.}`
+**Engine numbers in prose: brief only.** If you must reference a number, keep it compact:
+
+- Good: `{... +0.2}` — bare number at the end of a note
+- Bad: `{Stockfish depth 22 shows +0.25, Lc0 depth 18 shows +0.4, both engines agree}` — verbose noise
+
+**Don't name the engine unless it adds signal.** "SF: +0.15" for a routine position is noise. Name it when there's a mismatch worth flagging: `{Human predictor gives Black 47% win despite the -0.35 objective eval — Elo gap does the work.}`
 
 ### When prose ADDS to the NAG
 

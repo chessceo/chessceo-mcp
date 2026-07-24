@@ -106,6 +106,8 @@ const AUTHED_TOOLS = new Set([
   "delete_subtree",
   "promote_variation",
   "set_tag",
+  "apply_mutations",
+  "auto_evaluate",
   "predict_human_move",
 ]);
 
@@ -285,36 +287,6 @@ const TOOLS: Tool[] = [
           minimum: 1,
           maximum: 50,
           description: "Number of top continuations to return.",
-        },
-      },
-    },
-  },
-  {
-    name: "analyse",
-    description:
-      "Short Stockfish evaluation at a position. Returns the top-N candidate moves with score (centipawns from side-to-move POV, positive = advantage; or mate distance) and the principal variation for each. Defaults: 2s think time, top-3 lines. PV moves come back in SAN (e4, Nf3, Bxc4 — not UCI). Free (no cloud instance needed) — use liberally.\n\n" +
-      "GROUNDING: cite this tool's actual output when you claim things about positions. Don't invent evaluations from general principles or training data — if you don't have engine output for a FEN, call this. Compute is cheap.\n\n" +
-      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves` to walk from an arbitrary position. Also see the flip-side-to-move threat check in read_engine_usage_guide.\n\n" +
-      "Use this to sanity-check candidate lines from get_position_stats or get_player_preparation — human game frequency tells you what people play, engine evaluation tells you what's actually good.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        fen: { type: "string", description: "Starting position as FEN (defaults to startpos)." },
-        moves: {
-          type: "string",
-          description: "Optional SAN moves to apply on top of `fen` (or on top of startpos). Example: fen='<tabiya>', moves='b4 a5'.",
-        },
-        movetime_ms: {
-          type: "integer",
-          minimum: 100,
-          maximum: 10000,
-          description: "Think time in milliseconds (default 2000).",
-        },
-        multipv: {
-          type: "integer",
-          minimum: 1,
-          maximum: 10,
-          description: "Number of candidate lines to return (default 3).",
         },
       },
     },
@@ -671,6 +643,58 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "apply_mutations",
+    description:
+      "Batch: apply a list of mutations in one call. One load-parse-mutate-export-save cycle for N ops, so building a 100-move repertoire costs one HTTP round-trip and one save instead of 100. This is the RIGHT way to build a file — use single mutations only for surgical follow-up edits.\n\n" +
+      "Each mutation is `{op, path, ...args}` where `op` is one of: add_move, set_comment, set_nags, set_annotations, delete_subtree, promote_variation, set_tag. Same arg shape as the individual tools. Ops apply in order; `path` is resolved against the tree AFTER preceding ops in the batch — so after `{op: 'add_move', path: [0], san: 'Nc3'}` the new node's path is `[0, N]` where N is the parent's previous children count (or `[0, 0]` if it was empty).\n\n" +
+      "Any op error aborts the batch (nothing saved). Response is `{ok, results: [{path}], version}` giving the effective path each op landed at plus the new file version.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        expected_version: { type: "integer" },
+        mutations: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              op: { type: "string", enum: ["add_move", "set_comment", "set_nags", "set_annotations", "delete_subtree", "promote_variation", "set_tag"] },
+              path: { type: "array", items: { type: "integer", minimum: 0 } },
+              san: { type: "string" },
+              comment: { type: "string" },
+              nags: { type: "array", items: { type: "string", pattern: "^\\$\\d+$" } },
+              arrows: { type: "array" },
+              highlights: { type: "array" },
+              key: { type: "string" },
+              value: { type: "string" },
+            },
+            required: ["op"],
+          },
+        },
+      },
+      required: ["id", "mutations"],
+    },
+  },
+  {
+    name: "auto_evaluate",
+    description:
+      "Walk the tree from `path` (default `[]` = whole file) and auto-assign NAGs to every node based on the Stockfish eval from cloud_analyse. Uses the standard eval → NAG thresholds (|eval|<0.25 → $10, <0.6 → $14/$15, <1.3 → $16/$17, ≥1.3 → $18/$19). Requires a running cloud combo instance.\n\n" +
+      "This is the automate-the-boring-part tool. Instead of hand-annotating each move with a NAG, you build the tree via apply_mutations (no NAGs needed), then call auto_evaluate once and every node gets the right glyph.\n\n" +
+      "Costs real money — hits cloud_analyse per node. A 200-node tree at 1.5s/node = ~5 min of engine time. Use `only_missing=true` (default) to skip nodes that already have a NAG on subsequent runs. Runs 4 evaluations in parallel to save wall time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:            { type: "string" },
+        path:          { type: "array", items: { type: "integer", minimum: 0 }, description: "Subtree root (default = whole file)." },
+        only_missing:  { type: "boolean", description: "Skip nodes that already carry a NAG (default true)." },
+        movetime_ms:   { type: "integer", minimum: 500, maximum: 5000, description: "Per-node cloud_analyse think time (default 1500)." },
+        expected_version: { type: "integer" },
+      },
+      required: ["id"],
+    },
+  },
+  {
     name: "set_tag",
     description:
       "Set or clear a game-level PGN tag (Event, Site, Date, White, Black, Result, or any custom tag). Passing empty string removes the tag. Auto-saves.",
@@ -787,19 +811,6 @@ function uciMoveToSAN(startFen: string, uci: string): string {
   }
 }
 
-// Rewrite the local /chess/database/analyse response (single engine)
-// so PVs come back in SAN.
-function convertAnalyseResponse(raw: unknown, startFen: string): unknown {
-  if (!raw || typeof raw !== "object") return raw;
-  const r = raw as { lines?: Array<{ pv?: string[] }> };
-  if (Array.isArray(r.lines)) {
-    for (const line of r.lines) {
-      if (Array.isArray(line.pv)) line.pv = uciLineToSAN(startFen, line.pv);
-    }
-  }
-  return raw;
-}
-
 // Rewrite the /api/agent/cloud-engines/analyse response (two engines,
 // each with lines[] and a bestMove) so PVs and bestMove come back in SAN.
 function convertCloudSnapshotResponse(raw: unknown, startFen: string): unknown {
@@ -836,6 +847,171 @@ function argPath(args: Args): Path {
     out.push(n);
   }
   return out;
+}
+
+// Dispatch table for the batch tool: name → mutator that returns the
+// standard { file, path } shape. Reused for individual and batch calls.
+function dispatchMutation(file: PrepFile, op: Record<string, unknown>): { file: PrepFile; path: Path } {
+  const kind = String(op.op);
+  const path = Array.isArray(op.path) ? (op.path as number[]) : [];
+  switch (kind) {
+    case "add_move":
+      return addMove(file, path, String(op.san));
+    case "set_comment":
+      return setComment(file, path, typeof op.comment === "string" ? op.comment : "");
+    case "set_nags":
+      return setNags(file, path, Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : []);
+    case "set_annotations": {
+      const arrows = Array.isArray(op.arrows) ? (op.arrows as PrepArrow[]) : [];
+      const highlights = Array.isArray(op.highlights) ? (op.highlights as PrepHighlight[]) : [];
+      const ann: PrepAnnotations | null =
+        arrows.length === 0 && highlights.length === 0 ? null : { arrows, highlights };
+      return setAnnotations(file, path, ann);
+    }
+    case "delete_subtree":
+      return deleteSubtree(file, path);
+    case "promote_variation":
+      return promoteVariation(file, path);
+    case "set_tag":
+      return { file: setTag(file, String(op.key), String(op.value ?? "")), path: [] };
+    default:
+      throw new Error(`unknown mutation op: ${kind}`);
+  }
+}
+
+// Batch: load, parse, apply N mutations in order, export, save. All-or-nothing —
+// any error aborts and nothing is saved.
+async function applyBatchMutations(args: Args): Promise<unknown> {
+  const id = String(args.id);
+  const mutations = Array.isArray(args.mutations) ? args.mutations : [];
+  if (mutations.length === 0) throw new Error("mutations array required");
+
+  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
+  const g = raw as { pgnContent?: string; version?: number };
+  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+
+  let file = parsePGN(g.pgnContent);
+  const results: Array<{ path: Path }> = [];
+  for (let i = 0; i < mutations.length; i++) {
+    const op = mutations[i] as Record<string, unknown>;
+    try {
+      const step = dispatchMutation(file, op);
+      file = step.file;
+      results.push({ path: step.path });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`mutation #${i} (${String(op.op)}) failed: ${msg}`);
+    }
+  }
+  const newPgn = exportPGN(file);
+  const expected = typeof args.expected_version === "number" ? args.expected_version : g.version;
+  const saved = await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(id)}`, {
+    pgn: newPgn,
+    expected_version: expected,
+  });
+  const savedRow = saved as { version?: number };
+  return { ok: true, results, version: savedRow.version };
+}
+
+// Auto-evaluate: walk the tree from `path`, run cloud_analyse on each node,
+// convert the SF score to a NAG per the standard thresholds, and apply
+// everything in one batch mutation. Uses batching to avoid N saves.
+async function autoEvaluate(args: Args): Promise<unknown> {
+  const id = String(args.id);
+  const startPath: Path = Array.isArray(args.path) ? (args.path as number[]) : [];
+  const onlyMissing = args.only_missing !== false; // default true
+  const movetimeMs = typeof args.movetime_ms === "number" ? args.movetime_ms : 1500;
+
+  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
+  const g = raw as { pgnContent?: string; version?: number };
+  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+  const file = parsePGN(g.pgnContent);
+
+  // Collect eligible nodes (skip root — no move to evaluate).
+  type Target = { path: Path; fen: string };
+  const targets: Target[] = [];
+  const walk = (node: PrepNode, path: Path) => {
+    if (path.length > 0) {
+      if (!onlyMissing || !(node.nags && node.nags.length > 0)) {
+        targets.push({ path, fen: node.fen });
+      }
+    }
+    for (let i = 0; i < node.children.length; i++) walk(node.children[i], [...path, i]);
+  };
+  const startNode = pathIntoTree(file.root, startPath);
+  walk(startNode, startPath);
+  if (targets.length === 0) return { ok: true, evaluated: 0, skipped: 0, version: g.version };
+
+  // Dispatch cloud_analyse in parallel with a 4-way cap so we don't
+  // over-saturate the engine's WS connection cap (single-client per port).
+  const nags: { path: Path; nag: string }[] = [];
+  const CONCURRENCY = 4;
+  let cursor = 0;
+  async function worker() {
+    while (cursor < targets.length) {
+      const idx = cursor++;
+      const t = targets[idx];
+      try {
+        const analysis = await authedRequest(
+          "POST",
+          "/api/agent/cloud-engines/analyse",
+          { fen: t.fen, movetime_ms: movetimeMs, multipv: 1 },
+        );
+        const nag = analysisToNag(analysis);
+        if (nag) nags.push({ path: t.path, nag });
+      } catch {
+        // ignore per-node failures — best-effort auto-annotation
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+
+  if (nags.length === 0) return { ok: true, evaluated: 0, skipped: targets.length, version: g.version };
+
+  // Apply all NAGs as a single batch.
+  const batchMutations = nags.map(n => ({ op: "set_nags", path: n.path, nags: [n.nag] }));
+  const saveResult = await applyBatchMutations({ id, mutations: batchMutations, expected_version: g.version } as Args);
+  const sr = saveResult as { version?: number };
+  return { ok: true, evaluated: nags.length, skipped: targets.length - nags.length, version: sr.version };
+}
+
+// Walk chess.js-free: resolve a path against a tree, throw if invalid.
+function pathIntoTree(root: PrepNode, path: Path): PrepNode {
+  let cur = root;
+  for (let i = 0; i < path.length; i++) {
+    if (path[i] < 0 || path[i] >= cur.children.length) {
+      throw new Error(`path segment ${i}=${path[i]} out of bounds`);
+    }
+    cur = cur.children[path[i]];
+  }
+  return cur;
+}
+
+// Read Stockfish's rank-1 line, convert to White-POV centipawns, and
+// bucket into a NAG per the standard threshold table. Returns null if
+// the response shape doesn't carry a usable score.
+function analysisToNag(analysis: unknown): string | null {
+  if (!analysis || typeof analysis !== "object") return null;
+  const r = analysis as { stockfish?: { lines?: Array<{ scoreCp?: number; mate?: number }>; }; fen?: string };
+  const line = r.stockfish?.lines?.[0];
+  if (!line) return null;
+  // Determine side to move from the FEN so we can convert side-to-move
+  // POV score to White POV.
+  const whiteToMove = typeof r.fen === "string" && / w /.test(r.fen);
+  let cp: number;
+  if (typeof line.mate === "number") {
+    cp = line.mate > 0 ? 10000 : -10000;
+  } else if (typeof line.scoreCp === "number") {
+    cp = line.scoreCp;
+  } else {
+    return null;
+  }
+  if (!whiteToMove) cp = -cp;
+  const abs = Math.abs(cp);
+  if (abs < 25) return "$10";
+  if (abs < 60)  return cp > 0 ? "$14" : "$15";
+  if (abs < 130) return cp > 0 ? "$16" : "$17";
+  return cp > 0 ? "$18" : "$19";
 }
 
 // Load-mutate-save: fetch current PGN, parse, apply mutation, re-export,
@@ -997,16 +1173,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return convertAvailableMovesToSAN(raw, fen);
     }
 
-    case "analyse": {
-      const fen = resolveFenFromArgs(args);
-      const params: Record<string, string | number | undefined> = { fen };
-      if (typeof args.movetime_ms === "number") params.movetime_ms = args.movetime_ms;
-      if (typeof args.multipv === "number") params.multipv = args.multipv;
-      const raw = await get("/api/chess/database/analyse", params);
-      return convertAnalyseResponse(raw, fen);
-    }
-
-    case "predict_human_move": {
+case "predict_human_move": {
       const fen = resolveFenFromArgs(args);
       const qs = new URLSearchParams();
       qs.set("fen", fen);
@@ -1120,6 +1287,12 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
         file: setTag(file, String(args.key), String(args.value ?? "")),
         path: [],
       }));
+
+    case "apply_mutations":
+      return applyBatchMutations(args);
+
+    case "auto_evaluate":
+      return autoEvaluate(args);
 
     case "read_engine_usage_guide":
       return { guide: ENGINE_USAGE_DOC };
