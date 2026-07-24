@@ -21,7 +21,7 @@ The failure mode is *authoritative-sounding recipe = 30% real tool output + 70% 
 
 ## Numbers are inputs, not verdicts
 
-The move statistics endpoints return win %, game counts, and (in the big DB) hotness. Treat every one of these as a *weight*, not a *rule*.
+The move statistics endpoints return win %, game counts, and (in the big DB) a `fashionScore` (0–100, how in-fashion the move is right now at the top level — recent + played often). Treat every one of these as a *weight*, not a *rule*.
 
 - **Sample size scales trust.** 3 games at 66% is noise; 300 at 55% is signal. A great score is nice — with volume. When the opponent has only 2-4 games in a variation, the "opponent-specific" score is basically the general-DB score anyway.
 - **Score doesn't automatically indicate a level gap.** A 60% variation isn't necessarily "stronger players crushing weaker ones." Look at the per-move `avgWhite` / `avgBlack` fields (returned on every move statistic) before drawing conclusions about who is playing whom.
@@ -41,7 +41,7 @@ Every recommendation should be filtered through: "does this survive the fact tha
 
 The opponent's last 12-24 months matter far more than a 10-year career average. Repertoires evolve — a lifelong Najdorf player might have quietly become a Petroff player last year, and their old career stats will lie to you if you skim.
 
-**Related product note (2026-07-23):** the `get_player_preparation` endpoint (compact / LLM view) deliberately strips the per-move `hotness` field. At the individual-player level, "hotness" is trailing noise — the opponent's opening trend is already captured in game dates. Hotness stays on the general-DB endpoint, where it's genuinely useful: it means fashion (what the whole top field is playing this month).
+**Related product note (2026-07-23):** the `get_player_preparation` endpoint (compact / LLM view) deliberately strips the per-move `fashionScore` field. At the individual-player level, fashion is trailing noise — the opponent's opening trend is already captured in game dates. `fashionScore` stays on the general-DB endpoint (`get_position_stats`), where it's genuinely useful: it's what the whole top field is playing this month.
 
 ## Prep is a tree, not a line
 
@@ -68,7 +68,7 @@ Deep prep is a weapon you spend, not one you own. A prepared novelty against a s
 
 ## Move-order tricks aren't visible in raw win rates
 
-The `trs` (transpositions) field on move statistics tells you how much a given position folds into related structures. Move-order tricks are legitimate prep and position stats alone can't recommend them.
+The `reachedViaTransposition` field on move statistics tells you how many of the games at that position arrived via a different move order — a hint at how much the line folds into related structures. Move-order tricks are legitimate prep and position stats alone can't recommend them.
 
 - Considering 1.Nf3 or 1.c4 as a duck around 1.d4? First check the opponent's repertoire *against 1.d4*. If they play the King's Indian, most 1.Nf3/1.c4 lines transpose anyway — the trick doesn't help.
 - Move orders are useful when the opponent plays something that specifically depends on the move order — e.g. a Nimzo player who never gets to play the Nimzo because you go 1.Nf3-2.g3.

@@ -230,7 +230,7 @@ const TOOLS: Tool[] = [
       "Reading the response — CRITICAL:\n" +
       "• Win % is one weight, not a verdict. Recommend 1.b3 over 1.d4 because 60% > 50% is wrong. Sample size matters (3 games at 66% is noise; 300 at 55% is signal); avgWhite / avgBlack per move show the rating context (a big score often means a rating gap, not repertoire truth).\n" +
       "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted; a weak opponent won't patch it, a strong or improving one already has (but structural weaknesses like 'bad in Catalan structures' hold anyway).\n" +
-      "• Recency > career. The last 12-24 months dominate. This endpoint's compact/LLM view deliberately omits per-move `hotness` — at the individual level it's trailing noise. The general DB endpoint keeps it (there it's fashion signal).\n" +
+      "• Recency > career. The last 12-24 months dominate. This endpoint's compact/LLM view deliberately omits per-move `fashionScore` — at the individual level it's trailing noise. The general DB endpoint (`get_position_stats`) keeps it, where it's real fashion signal (what the top field is playing this month).\n" +
       "• Opponent will deviate early. Prep is a tree, not a line — cover the 2 most likely replies at each real branching point, not one 20-move line.\n" +
       "• Surprise is a scalpel. Don't tell a lifelong 1.e4 player to switch to 1.d4 — meta-signal screams prep. Rare secondary lines within the user's existing repertoire (e.g. 6.Bc4 instead of usual 6.Bg5 vs the Najdorf) are where surprise is real.\n\n" +
       "For the full guide call the `read_prep_strategy_guide` tool.",
