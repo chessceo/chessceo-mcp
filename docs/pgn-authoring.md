@@ -133,6 +133,18 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 
 **Don't name the engine unless it adds signal.** "SF: +0.15" for a routine position is noise. Name it when there's a mismatch worth flagging: `{Human predictor gives Black 47% win despite the -0.35 objective eval — Elo gap does the work.}`
 
+### Before you write any commentary: describe_position
+
+LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent captures, miscount pieces. Before you write a comment describing what's happening in a position, call `describe_position(fen)`. It's pure computation (no engine, ~1ms) and returns the same board state a human sees:
+
+- All piece placements per colour (SAN-style: `Nf3`, `Bg7`, `e4`)
+- Material balance in pawn units (`"white +1 (39 vs 38)"`)
+- Every contested piece: attackers + defenders (e.g. `{target: "e5", color: "black", attackers: ["Nf3"], defenders: ["Nc6"]}`)
+- Hanging list — attacked and undefended
+- Check state + checkers, castling rights, en passant
+
+Use it whenever you're about to describe a position from memory or from your reading of a FEN. The failure mode this prevents: `{Black's queen on c7 is defended by the knight on d5.}` when actually there's no knight on d5 and the queen is on c8.
+
 ### When prose ADDS to the NAG
 
 Prose is worth writing when the NAG *understates* something the human should know:

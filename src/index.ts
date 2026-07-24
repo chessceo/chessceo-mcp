@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { Chess } from "chess.js";
 import { parsePGN } from "./pgn/parser.js";
 import { exportPGN } from "./pgn/exporter.js";
+import { describePosition } from "./pgn/describe.js";
 import {
   addMove,
   deleteSubtree,
@@ -293,6 +294,20 @@ const TOOLS: Tool[] = [
           maximum: 50,
           description: "Number of top continuations to return.",
         },
+      },
+    },
+  },
+  {
+    name: "describe_position",
+    description:
+      "Structured facts about a chess position: piece placements per colour (with SAN-style piece letters), material balance in pawn units, list of every piece currently attacked (with attackers + defenders), hanging pieces (attacked and undefended), checkers if in check, castling rights, en passant square, side to move. Pure computation — no engine needed, ~1 ms per call.\n\n" +
+      "USE THIS BEFORE COMMENTING ON A POSITION. LLMs are not reliable at reading FEN strings — you'll misplace pieces or invent captures. This tool gives you the same board state a human sees. If you're about to write a comment describing 'why this move is good' or 'what the threats are', call describe_position first. Free.\n\n" +
+      "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves` to walk from there.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        fen:   { type: "string", description: "Starting position as FEN (defaults to startpos)." },
+        moves: { type: "string", description: "Optional SAN moves to apply on top of `fen`." },
       },
     },
   },
@@ -1273,7 +1288,10 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return converted;
     }
 
-case "predict_human_move": {
+    case "describe_position":
+      return describePosition(resolveFenFromArgs(args));
+
+    case "predict_human_move": {
       const fen = resolveFenFromArgs(args);
       const qs = new URLSearchParams();
       qs.set("fen", fen);
