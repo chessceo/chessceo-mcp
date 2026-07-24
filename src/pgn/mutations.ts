@@ -148,7 +148,7 @@ function validateSan(fen: string, san: string) {
   const move = parseSan(board, san);
   if (!move) {
     throw new MutationError(
-      `illegal SAN "${san}" at fen "${fen}" — check the position (side to move, piece disambiguation, promotion piece) and re-check the path.`,
+      `illegal SAN "${san}" at fen "${fen}". Call describe_position on this fen to see the full list of legal moves.`,
     );
   }
   return move;

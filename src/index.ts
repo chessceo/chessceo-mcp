@@ -300,8 +300,9 @@ const TOOLS: Tool[] = [
   {
     name: "describe_position",
     description:
-      "Structured facts about a chess position: piece placements per colour (with SAN-style piece letters), material balance in pawn units, list of every piece currently attacked (with attackers + defenders), hanging pieces (attacked and undefended), checkers if in check, castling rights, en passant square, side to move. Pure computation — no engine needed, ~1 ms per call.\n\n" +
-      "USE THIS BEFORE COMMENTING ON A POSITION. LLMs are not reliable at reading FEN strings — you'll misplace pieces or invent captures. This tool gives you the same board state a human sees. If you're about to write a comment describing 'why this move is good' or 'what the threats are', call describe_position first. Free.\n\n" +
+      "Structured facts about a chess position: piece placements per colour (SAN-style letters), material balance in pawn units, list of every contested piece (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant square, side to move, and the full list of LEGAL MOVES for the side to move. Pure computation — no engine, ~1 ms per call.\n\n" +
+      "USE THIS BEFORE COMMENTING ON A POSITION. LLMs are not reliable at reading FEN strings — you'll misplace pieces or invent captures. This tool gives you the same board state a human sees.\n\n" +
+      "ALSO USE THIS if `add_move` rejects an illegal SAN — the `.legalMoves` array shows exactly what's playable from that position.\n\n" +
       "Position input is flexible — pass `fen`, or `moves` from startpos, or `fen + moves` to walk from there.",
     inputSchema: {
       type: "object",

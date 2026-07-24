@@ -12,7 +12,8 @@
 import { parseFen } from "chessops/fen";
 import { Chess } from "chessops/chess";
 import { attacks } from "chessops/attacks";
-import { makeSquare } from "chessops/util";
+import { makeSquare, squareRank } from "chessops/util";
+import { makeSan } from "chessops/san";
 import type { Square, Piece, Color, Role } from "chessops/types";
 
 const ROLE_LETTER: Record<Role, string> = {
@@ -58,6 +59,7 @@ export type PositionDescription = {
   };
   castling: { white: string; black: string };
   epSquare: string | null;
+  legalMoves: string[];       // every legal move for sideToMove, SAN-notated, sorted
 };
 
 function pieceSAN(piece: Piece, sq: Square): string {
@@ -136,6 +138,8 @@ export function describePosition(fen: string): PositionDescription {
   const ctx = pos.ctx();
   for (const sq of ctx.checkers) checkers.push(pieceSANFromBoard(board, sq));
 
+  const legalMoves = generateLegalMoves(pos);
+
   return {
     fen,
     sideToMove: pos.turn,
@@ -152,7 +156,35 @@ export function describePosition(fen: string): PositionDescription {
     hanging: { white: hangingWhite, black: hangingBlack },
     castling: { white: castlingW, black: castlingB },
     epSquare: typeof pos.epSquare === "number" ? makeSquare(pos.epSquare) : null,
+    legalMoves,
   };
+}
+
+// All legal moves for the side to move, in SAN. Sorted for stable output.
+// Handles promotion by expanding each pawn-promotion destination into
+// the four promotion pieces (=Q, =R, =B, =N).
+function generateLegalMoves(pos: Chess): string[] {
+  const out: string[] = [];
+  for (const [from, piece] of pos.board) {
+    if (piece.color !== pos.turn) continue;
+    const dests = pos.dests(from);
+    for (const to of dests) {
+      const isPromotion =
+        piece.role === "pawn" &&
+        ((piece.color === "white" && squareRank(to) === 7) ||
+         (piece.color === "black" && squareRank(to) === 0));
+      if (isPromotion) {
+        for (const promo of ["queen", "rook", "bishop", "knight"] as Role[]) {
+          const san = makeSan(pos, { from, to, promotion: promo });
+          if (san) out.push(san);
+        }
+      } else {
+        const san = makeSan(pos, { from, to });
+        if (san) out.push(san);
+      }
+    }
+  }
+  return out.sort();
 }
 
 // Attackers-of a square, split by colour. A piece cannot attack its own
