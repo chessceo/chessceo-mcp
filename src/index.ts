@@ -497,7 +497,7 @@ const TOOLS: Tool[] = [
       "• Stockfish is objective truth — trust it for 'does this line hold?' 'is there a tactic?' 'is this endgame drawn?' A Stockfish 0.00 means 'objectively equal', NOT 'trivial draw' — one side can still be much harder to play in practice.\n" +
       "• Lc0 is practical eval — trust it for 'which side is easier?' 'which candidate is best when Stockfish shows several as equal?' Lc0 sees long-term positional factors Stockfish's fixed search can miss.\n" +
       "• When they agree → high confidence. When they disagree → look at both scores and reason WHY (Stockfish sharply higher = tactic Lc0 missed; Lc0 higher = long-term positional edge past Stockfish's horizon). Never dismiss either — the disagreement is the signal.\n\n" +
-      "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Practical range -20..+20. Use it to find non-objective 'practical' ideas or when the user needs to steer toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
+      "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Signed 0-100 strength — same scale as the web UI's ContemptStrength slider (the server multiplies by 8 to produce Lc0's internal cp bias). Typical values: ±15 for a light nudge, ±30-60 for real fighting play, ±80-100 for maximum steer. Use it to find non-objective 'practical' ideas or when the user needs to lean toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
       "Also useful: pass `moves` on top of `fen` to explore a variation without computing FENs yourself (e.g. fen='<tabiya>', moves='b4 a5 c3'). And the flip-side-to-move threat check documented in the guide is a great free trick.\n\n" +
       "For the full guide including worked examples, call the `read_engine_usage_guide` tool.\n\n" +
       "Not for casual questions — this costs real money per second. Use `get_position_stats` for anything that doesn't require deep prep.\n\n" +
@@ -529,7 +529,7 @@ const TOOLS: Tool[] = [
           minimum: -100,
           maximum: 100,
           description:
-            "Lc0 contempt bias. 0 = objective (default). Positive favours White, negative favours Black; stay within -20..+20 in practice. Not applied to Stockfish. See engine_usage_primer prompt for when to use.",
+            "Lc0 contempt bias. Signed 0-100 strength (same scale as the web UI's ContemptStrength slider — server multiplies by 8 to get the internal cp bias). 0 = objective (default). Positive favours White, negative favours Black. Typical: ±15 light nudge, ±30-60 real fighting play, ±80-100 maximum steer. Not applied to Stockfish. See engine_usage_primer for when to use.",
         },
       },
     },

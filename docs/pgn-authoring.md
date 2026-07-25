@@ -221,12 +221,14 @@ When reading back a file, `node.ceoEval.nag` carries the threshold-derived NAG (
 
 **Only quote engine numbers for positions you actually called `cloud_analyse` on** (or that carry a `ceoEval` from an earlier auto_evaluate, or an auto-attached `.eval` from a query tool). Do NOT infer an eval for a parent position from its children and then write "both engines 0.00" on the parent — that reads as a measurement but is a guess. If the position wasn't analysed, either analyse it or omit the number: prose can say "both continuations run to 0.00, so this looks balanced" without claiming an eval that wasn't taken.
 
-**When you set `contempt`, attribute it to Lc0 only.** Contempt affects Lc0 exclusively — Stockfish always analyses objectively. So don't write "both engines at contempt −15" — that misleads the reader into thinking SF was biased too. Correct phrasings:
+**When you set `contempt`, attribute it to Lc0 only.** Contempt affects Lc0 exclusively — Stockfish always analyses objectively. So don't write "both engines at contempt −30" — that misleads the reader into thinking SF was biased too. Correct phrasings:
 
-- `{Lc0 (contempt −15): 0.00 — even biased toward Black, still balanced. SF objective: 0.00.}`
-- `{With Lc0 nudged toward Black (contempt −15) it still picks Qg6 at 0.00; SF's objective read also 0.00.}`
+- `{Lc0 (contempt −30): 0.00 — even biased toward Black, still balanced. SF objective: 0.00.}`
+- `{With Lc0 nudged toward Black (contempt −30) it still picks Qg6 at 0.00; SF's objective read also 0.00.}`
 
-If you only quote the Lc0 number, disclose the bias in the same sentence — `{Lc0 gives Black +0.30}` with an undisclosed `contempt=-15` is a false objectivity claim.
+If you only quote the Lc0 number, disclose the bias in the same sentence — `{Lc0 gives Black +0.30}` with an undisclosed `contempt=-30` is a false objectivity claim.
+
+Contempt scale is signed 0-100 (same as the web UI's ContemptStrength slider). Typical: `±10-20` a light nudge, `±30-60` real fighting play, `±80-100` maximum steer.
 
 ### Before you write any commentary: describe_position
 
