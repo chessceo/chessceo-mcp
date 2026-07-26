@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin wrapper: sf_eval.py only needs stdlib, system python3 works.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$here/sf_eval.py" "$@"

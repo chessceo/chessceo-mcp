@@ -11,9 +11,10 @@
 
 import { parseFen } from "chessops/fen";
 import { Chess } from "chessops/chess";
-import { attacks } from "chessops/attacks";
-import { makeSquare, squareRank } from "chessops/util";
+import { attacks, pawnAttacks } from "chessops/attacks";
+import { makeSquare, squareRank, squareFile } from "chessops/util";
 import { makeSan } from "chessops/san";
+import { SquareSet } from "chessops/squareSet";
 import type { Square, Piece, Color, Role } from "chessops/types";
 
 const ROLE_LETTER: Record<Role, string> = {
@@ -56,6 +57,39 @@ export type PositionDescription = {
   hanging: {                  // attacked pieces with no defenders
     white: string[];
     black: string[];
+  };
+  // ── Structural analysis ────────────────────────────────────────────
+  // Concepts a human sees at a glance but the LLM cannot derive from a
+  // FEN string alone. Emitted as observations, not verdicts — the LLM
+  // interprets in context.
+  pawnStructure: {
+    files: Record<string, "open" | "half_open_for_white" | "half_open_for_black" | "closed">;
+    islandsWhite: number;      // count of connected pawn groups
+    islandsBlack: number;
+    isolated: { white: string[]; black: string[] };  // squares of isolated pawns
+    doubled:  { white: string[]; black: string[] };  // files (a-h) with >1 own pawn
+    passed:   { white: string[]; black: string[] };  // pawns with no enemy pawn same/adjacent file ahead
+    backward: { white: string[]; black: string[] };  // pawns unable to advance safely, attacked
+  };
+  weakSquares: { white: string[]; black: string[] };  // "holes": squares in ranks 3-6 no friendly pawn can ever attack
+  outposts: {
+    // Friendly minor piece (N or B) sitting on a hole in enemy territory,
+    // defended by own pawn. The classical positional gold-star square.
+    white: Array<{ piece: string; square: string }>;
+    black: Array<{ piece: string; square: string }>;
+  };
+  bishops: {
+    // Own-pawns-on-bishop-colour count. Rough good/bad tag: <4 own pawns
+    // on colour = good, >=5 = bad. Rule of thumb, not gospel.
+    white: Array<{ square: string; colorSquare: "light" | "dark"; ownPawnsOnColor: number; quality: "good" | "mixed" | "bad" }>;
+    black: Array<{ square: string; colorSquare: "light" | "dark"; ownPawnsOnColor: number; quality: "good" | "mixed" | "bad" }>;
+    pair: { white: boolean; black: boolean };
+  };
+  space: {
+    // Squares in the enemy half (ranks 5-8 for White, 1-4 for Black)
+    // controlled by side's pieces/pawns. Rough "how much room do I have".
+    whiteSquaresInBlackHalf: number;
+    blackSquaresInWhiteHalf: number;
   };
   castling: { white: string; black: string };
   epSquare: string | null;
@@ -140,6 +174,8 @@ export function describePosition(fen: string): PositionDescription {
 
   const legalMoves = generateLegalMoves(pos);
 
+  const structural = computeStructural(pos);
+
   return {
     fen,
     sideToMove: pos.turn,
@@ -154,9 +190,257 @@ export function describePosition(fen: string): PositionDescription {
     pieces: { white: whitePieces, black: blackPieces },
     contested,
     hanging: { white: hangingWhite, black: hangingBlack },
+    pawnStructure: structural.pawnStructure,
+    weakSquares: structural.weakSquares,
+    outposts: structural.outposts,
+    bishops: structural.bishops,
+    space: structural.space,
     castling: { white: castlingW, black: castlingB },
     epSquare: typeof pos.epSquare === "number" ? makeSquare(pos.epSquare) : null,
     legalMoves,
+  };
+}
+
+// ── Structural analysis ──────────────────────────────────────────────
+// Concepts a human sees at a glance but the LLM cannot derive from a
+// FEN. All chess-primitive computations on top of chessops bitboards;
+// no engine.
+
+const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"];
+
+// Which files are occupied by pawns of each colour (bitmask, 8 bits).
+function pawnFilesMask(pos: Chess, color: Color): number {
+  let mask = 0;
+  for (const sq of pos.board.pawn.intersect(pos.board[color])) {
+    mask |= 1 << squareFile(sq);
+  }
+  return mask;
+}
+
+function computeStructural(pos: Chess) {
+  const whitePawns = pos.board.pawn.intersect(pos.board.white);
+  const blackPawns = pos.board.pawn.intersect(pos.board.black);
+  const wFileMask = pawnFilesMask(pos, "white");
+  const bFileMask = pawnFilesMask(pos, "black");
+
+  // File status per column.
+  const files: Record<string, "open" | "half_open_for_white" | "half_open_for_black" | "closed"> = {};
+  for (let f = 0; f < 8; f++) {
+    const wHas = (wFileMask & (1 << f)) !== 0;
+    const bHas = (bFileMask & (1 << f)) !== 0;
+    if (!wHas && !bHas) files[FILES[f]] = "open";
+    else if (!bHas && wHas) files[FILES[f]] = "half_open_for_black"; // black has no pawn → open for black's rooks
+    else if (!wHas && bHas) files[FILES[f]] = "half_open_for_white";
+    else files[FILES[f]] = "closed";
+  }
+
+  // Islands: count runs of consecutive occupied files.
+  const countIslands = (mask: number) => {
+    let count = 0, prev = false;
+    for (let f = 0; f < 8; f++) {
+      const has = (mask & (1 << f)) !== 0;
+      if (has && !prev) count++;
+      prev = has;
+    }
+    return count;
+  };
+
+  // Isolated pawns: own pawn with no friend on adjacent files.
+  const isolated = (color: Color) => {
+    const mask = color === "white" ? wFileMask : bFileMask;
+    const own = color === "white" ? whitePawns : blackPawns;
+    const out: string[] = [];
+    for (const sq of own) {
+      const f = squareFile(sq);
+      const left = f > 0 && ((mask >> (f - 1)) & 1);
+      const right = f < 7 && ((mask >> (f + 1)) & 1);
+      if (!left && !right) out.push(makeSquare(sq));
+    }
+    return out.sort();
+  };
+
+  // Doubled: files with >1 own pawn.
+  const doubled = (color: Color) => {
+    const counts: Record<number, number> = {};
+    const own = color === "white" ? whitePawns : blackPawns;
+    for (const sq of own) {
+      const f = squareFile(sq);
+      counts[f] = (counts[f] || 0) + 1;
+    }
+    return Object.entries(counts).filter(([, c]) => c > 1).map(([f]) => FILES[Number(f)]).sort();
+  };
+
+  // Passed pawns: no enemy pawn on same or adjacent file ahead of it.
+  const passed = (color: Color) => {
+    const own = color === "white" ? whitePawns : blackPawns;
+    const enemyMask = color === "white" ? bFileMask : wFileMask;
+    const enemyPawns = color === "white" ? blackPawns : whitePawns;
+    const out: string[] = [];
+    for (const sq of own) {
+      const f = squareFile(sq);
+      const r = squareRank(sq);
+      let blocked = false;
+      for (const ef of [f - 1, f, f + 1]) {
+        if (ef < 0 || ef > 7) continue;
+        if (((enemyMask >> ef) & 1) === 0) continue;
+        // any enemy pawn on this file ahead of us?
+        for (const esq of enemyPawns) {
+          if (squareFile(esq) !== ef) continue;
+          const er = squareRank(esq);
+          if (color === "white" ? er > r : er < r) { blocked = true; break; }
+        }
+        if (blocked) break;
+      }
+      if (!blocked) out.push(makeSquare(sq));
+    }
+    return out.sort();
+  };
+
+  // Backward: own pawn attacked by enemy pawn, unable to safely advance
+  // (advance square attacked by enemy pawn and undefended by own pawn).
+  const backward = (color: Color) => {
+    const own = color === "white" ? whitePawns : blackPawns;
+    const dir = color === "white" ? 8 : -8;
+    const enemyColor: Color = color === "white" ? "black" : "white";
+    const out: string[] = [];
+    for (const sq of own) {
+      const advanceSq = (sq + dir) as Square;
+      if (advanceSq < 0 || advanceSq > 63) continue;
+      // Attacked by enemy pawn?
+      const enemyAttackers = pawnAttacks(enemyColor, advanceSq).intersect(pos.board.pawn).intersect(pos.board[enemyColor]);
+      if (enemyAttackers.isEmpty()) continue;
+      // Defended by own pawn?
+      const ownDefenders = pawnAttacks(color, advanceSq).intersect(pos.board.pawn).intersect(pos.board[color]);
+      if (ownDefenders.nonEmpty()) continue;
+      out.push(makeSquare(sq));
+    }
+    return out.sort();
+  };
+
+  // Weak squares (holes): squares in ranks 3-6 that no friendly pawn can
+  // ever attack. For White the "own attack" is a pawn on rank-1 diagonal
+  // behind (files ±1). We check every square in the middle four ranks.
+  const weakSquares = (color: Color) => {
+    const own = color === "white" ? whitePawns : blackPawns;
+    const ownMask = color === "white" ? wFileMask : bFileMask;
+    const out: string[] = [];
+    const rankRange = color === "white" ? [3, 4, 5] : [2, 3, 4]; // 0-indexed 4,5,6 / 3,4,5 in real ranks
+    for (const r of rankRange) {
+      for (let f = 0; f < 8; f++) {
+        const sq = (r * 8 + f) as Square;
+        // Any friendly pawn on adjacent files that could ever attack this square?
+        // For White, an attack on square (f,r) comes from (f±1, r-1);
+        // any pawn on those adjacent files with rank < r could eventually reach.
+        let canBeAttacked = false;
+        for (const df of [-1, 1]) {
+          const nf = f + df;
+          if (nf < 0 || nf > 7) continue;
+          if (((ownMask >> nf) & 1) === 0) continue;
+          // Any pawn on this file at a rank behind the target?
+          for (const psq of own) {
+            if (squareFile(psq) !== nf) continue;
+            const pr = squareRank(psq);
+            if (color === "white" ? pr < r : pr > r) { canBeAttacked = true; break; }
+          }
+          if (canBeAttacked) break;
+        }
+        if (!canBeAttacked) out.push(makeSquare(sq));
+      }
+    }
+    return out.sort();
+  };
+
+  const wWeak = weakSquares("white");
+  const bWeak = weakSquares("black");
+  const wWeakSet = new Set(wWeak);
+  const bWeakSet = new Set(bWeak);
+
+  // Outposts: friendly N/B on a hole (WEAKNESS of the enemy) in enemy
+  // territory, defended by an own pawn.
+  const outposts = (color: Color) => {
+    const enemyWeak = color === "white" ? bWeakSet : wWeakSet;
+    const own = pos.board[color];
+    const out: Array<{ piece: string; square: string }> = [];
+    for (const sq of own) {
+      const piece = pos.board.get(sq);
+      if (!piece || (piece.role !== "knight" && piece.role !== "bishop")) continue;
+      const sqName = makeSquare(sq);
+      if (!enemyWeak.has(sqName)) continue;
+      // Defended by own pawn?
+      const enemyColor: Color = color === "white" ? "black" : "white";
+      // A pawn defending sq for `color` = pawn one rank behind on adjacent file.
+      const defenders = pawnAttacks(enemyColor, sq).intersect(pos.board.pawn).intersect(pos.board[color]);
+      if (defenders.isEmpty()) continue;
+      out.push({ piece: ROLE_LETTER_INV[piece.role], square: sqName });
+    }
+    return out.sort((a, b) => a.square.localeCompare(b.square));
+  };
+
+  // Bishops: quality based on own pawns on the bishop's colour.
+  const bishopColor = (sq: Square): "light" | "dark" => {
+    // a1 is dark, b1 is light. (file+rank) even = dark.
+    return (squareFile(sq) + squareRank(sq)) % 2 === 0 ? "dark" : "light";
+  };
+  const bishops = (color: Color) => {
+    const own = pos.board.bishop.intersect(pos.board[color]);
+    const ownPawns = color === "white" ? whitePawns : blackPawns;
+    let pawnsLight = 0, pawnsDark = 0;
+    for (const p of ownPawns) {
+      if (bishopColor(p) === "light") pawnsLight++;
+      else pawnsDark++;
+    }
+    const out: Array<{ square: string; colorSquare: "light" | "dark"; ownPawnsOnColor: number; quality: "good" | "mixed" | "bad" }> = [];
+    for (const sq of own) {
+      const c = bishopColor(sq);
+      const onColor = c === "light" ? pawnsLight : pawnsDark;
+      const q = onColor <= 3 ? "good" : onColor >= 5 ? "bad" : "mixed";
+      out.push({ square: makeSquare(sq), colorSquare: c, ownPawnsOnColor: onColor, quality: q });
+    }
+    return out;
+  };
+
+  // Space: squares in the enemy half controlled by side's pieces + pawns.
+  const space = (color: Color) => {
+    const attackedByColor = SquareSet.empty();
+    let acc = attackedByColor;
+    for (const sq of pos.board[color]) {
+      const piece = pos.board.get(sq)!;
+      acc = acc.union(attacks(piece, sq, pos.board.occupied));
+    }
+    // Enemy half: white attacks ranks 5-8 (rank index 4-7); black attacks 1-4 (0-3).
+    let count = 0;
+    for (const sq of acc) {
+      const r = squareRank(sq);
+      if (color === "white" && r >= 4) count++;
+      else if (color === "black" && r <= 3) count++;
+    }
+    return count;
+  };
+
+  return {
+    pawnStructure: {
+      files,
+      islandsWhite: countIslands(wFileMask),
+      islandsBlack: countIslands(bFileMask),
+      isolated: { white: isolated("white"), black: isolated("black") },
+      doubled: { white: doubled("white"), black: doubled("black") },
+      passed: { white: passed("white"), black: passed("black") },
+      backward: { white: backward("white"), black: backward("black") },
+    },
+    weakSquares: { white: wWeak, black: bWeak },
+    outposts: { white: outposts("white"), black: outposts("black") },
+    bishops: {
+      white: bishops("white"),
+      black: bishops("black"),
+      pair: {
+        white: pos.board.bishop.intersect(pos.board.white).size() >= 2,
+        black: pos.board.bishop.intersect(pos.board.black).size() >= 2,
+      },
+    },
+    space: {
+      whiteSquaresInBlackHalf: space("white"),
+      blackSquaresInWhiteHalf: space("black"),
+    },
   };
 }
 

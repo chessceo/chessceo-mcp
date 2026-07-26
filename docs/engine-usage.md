@@ -124,6 +124,23 @@ The gap (1.4 - 0.2 = 1.2) is roughly the value of the tempo Black has to spend d
 
 **Gotcha:** flipping side-to-move invalidates the en passant target field (if the last move was a two-square pawn push, the ep square is now stale). Also, both sides are counted as still having whichever castling rights are in the FEN — don't do this in the middle of a castling sequence. For opening / middlegame threat-checking it's a very useful idiom.
 
+## Why the position is what it is: `describe_position_eval`
+
+The other engine tools give you a number and a move. `describe_position_eval` gives you the *breakdown* — Stockfish's classical eval decomposed into 13 named terms (Material, Imbalance, Pawns, Knights, Bishops, Rooks, Queens, Mobility, King safety, Threats, Passed, Space, Winnable), each with white / black / total values in middlegame + endgame. This is how you answer "WHY is Black better here" beyond pointing at a `-0.35`.
+
+Primary pattern — **the delta**. Call on the position BEFORE and AFTER a candidate move; the term with the biggest shift tells you what the move CHANGED. Kim et al. NAACL 2025 showed feeding these named deltas to an LLM roughly doubles chess-commentary correctness vs a bare eval number. Example:
+
+```
+before 12.Nd5:  king_safety = +0.10, mobility = -0.05, threats = 0.00
+after  12.Nd5:  king_safety = +0.40, mobility = +0.30, threats = +0.55
+→ the delta is dominated by threats + king safety
+→ commentary: "12.Nd5 lands an outpost that both eyes the kingside (threats) and improves piece coordination (mobility)"
+```
+
+Absolute values are useful on their own too — a large "King safety" term flags an exposed king regardless of what caused it.
+
+Complements `describe_position` (chess-primitive observations: bishops good/bad, weak squares, files) and `cloud_analyse` (best move + PV). Different questions, three angles on the same position.
+
 ## Deep Stockfish thinks: `deep_analyse`
 
 `cloud_analyse` runs both engines with a movetime cap of 10 s — deliberately fast because most opening-tree questions are answered in 2–3 s. For **one specific critical position** where you want depth 35+ instead of the usual depth 22, use `deep_analyse`:

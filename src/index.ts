@@ -374,10 +374,20 @@ const TOOLS: Tool[] = [
   {
     name: "describe_position",
     description:
-      "Structured facts about a chess position: piece placements per colour (SAN-style letters), material balance in pawn units, list of every contested piece (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant square, side to move, and the full list of LEGAL MOVES for the side to move. Pure computation — no engine, ~1 ms per call.\n\n" +
-      "USE THIS BEFORE COMMENTING ON A POSITION. LLMs are not reliable at reading FEN strings — you'll misplace pieces or invent captures. This tool gives you the same board state a human sees.\n\n" +
-      "ALSO USE THIS if `add_move` rejects an illegal SAN — the `.legalMoves` array shows exactly what's playable from that position.\n\n" +
-      "Position input: prefer `file_id`+`node_id` if you're inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`.",
+      "Structured facts about a chess position that an LLM cannot reliably derive from a FEN. Pure computation, no engine, ~1 ms per call. USE BEFORE COMMENTING on any position — pieces get misplaced, hanging pieces missed, 'the knight on d5' turns out to not exist.\n\n" +
+      "Returns two layers:\n\n" +
+      "**Board state** — piece placements per colour, material balance in pawn units, contested pieces (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant, side to move, full LEGAL MOVES list for the side to move. Use `.legalMoves` when `add_move` rejects an illegal SAN.\n\n" +
+      "**Structural analysis** — concepts a human sees at a glance but the LLM can't compute:\n" +
+      "  • `pawnStructure.files` — each file as `open`/`half_open_for_white`/`half_open_for_black`/`closed`. Half-open files are natural rook targets.\n" +
+      "  • `pawnStructure.islands` — pawn island count per colour (more islands = weaker structure).\n" +
+      "  • `pawnStructure.isolated` / `doubled` / `passed` / `backward` — structural weaknesses (and strengths, for passed pawns).\n" +
+      "  • `weakSquares` — 'holes' in ranks 3-6 that no friendly pawn can ever attack. Prime real estate for enemy pieces.\n" +
+      "  • `outposts` — friendly N/B sitting on an enemy hole, defended by own pawn. Classic strong squares.\n" +
+      "  • `bishops` — per-bishop quality tag (good/mixed/bad) based on own pawns on the bishop's colour. Bad bishop = own pawns blocking its diagonals.\n" +
+      "  • `bishops.pair` — whether each side has both bishops.\n" +
+      "  • `space` — squares controlled in the enemy half. Higher = more space to manoeuvre.\n\n" +
+      "For per-colour engine-eval numbers (material/pawns/king safety/mobility/threats/space/passed breakdown, mg/eg) call `describe_position_eval` — same position, engine terms instead of chess-primitive observations.\n\n" +
+      "Position input: prefer `file_id`+`node_id` if inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -385,6 +395,23 @@ const TOOLS: Tool[] = [
         node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
         fen:     { type: "string", description: "Starting position as FEN (defaults to startpos). Only used if `node_id` is not set." },
         moves:   { type: "string", description: "Optional SAN moves to apply on top of `fen`. Only used if `node_id` is not set." },
+      },
+    },
+  },
+  {
+    name: "describe_position_eval",
+    description:
+      "Stockfish's classical-eval breakdown for a position: the 13 named contributing terms (Material, Imbalance, Pawns, Knights, Bishops, Rooks, Queens, Mobility, King safety, Threats, Passed, Space, Winnable), each with white / black / total values in mg + eg (middlegame + endgame). This is Stockfish's own answer to WHY the position stands the way it does — companion to `describe_position` (chess-primitive observations) and `cloud_analyse` (best move + PV).\n\n" +
+      "Primary use: **compute a delta between two positions** to see which term shifted most on a move. Call on the position BEFORE and AFTER a candidate move; the term with the biggest change is the CONCEPT that move addresses ('mobility jumped +0.25' → the move improved piece coordination; 'king safety collapsed -0.4' → the move exposed the king). Kim et al. NAACL 2025 showed feeding these named term deltas to an LLM roughly doubles chess-commentary correctness vs a bare eval number.\n\n" +
+      "Absolute values are useful on their own too — a large King safety term means the king is exposed regardless of what caused it.\n\n" +
+      "Values are in pawn units, White POV per term (positive = White's side is doing well on that term). ~50-100 ms per call. No cloud engine required — uses the local Stockfish binary. If Stockfish isn't installed on the server, returns `{found: false, error: ...}`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "Prep file id. When combined with `node_id`, evaluates that node's position." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
+        fen:     { type: "string", description: "Position as FEN. Only used if `node_id` is not set." },
+        moves:   { type: "string", description: "Optional SAN moves on top of `fen`. Only used if `node_id` is not set." },
       },
     },
   },
@@ -1703,6 +1730,49 @@ function deepAnalyseCancel(args: Args): unknown {
 // (FENFIND_DB env, then ~/positions.db).
 // Path resolution shared by both fenfind + readpgn. FENFIND_PATH env
 // overrides the bundled tools/fenfind/ directory.
+// Path to sf_eval helper (spawns local stockfish, parses its `eval`
+// verbose output). Uses the same resolution pattern as FENFIND_DIR.
+const SF_EVAL_SCRIPT: string | null = (() => {
+  const envPath = process.env.SF_EVAL_PATH?.trim();
+  if (envPath && existsSync(join(envPath, "sf_eval"))) return join(envPath, "sf_eval");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bundled = join(here, "..", "tools", "sf_eval", "sf_eval");
+  return existsSync(bundled) ? bundled : null;
+})();
+
+const SF_EVAL_TIMEOUT_MS = 12_000;
+
+async function runSfEval(fen: string): Promise<unknown> {
+  if (!SF_EVAL_SCRIPT) {
+    return {
+      found: false,
+      error: "sf_eval script not bundled; set SF_EVAL_PATH or install tools/sf_eval/",
+    };
+  }
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const p = spawn(SF_EVAL_SCRIPT!, ["--fen", fen], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", d => { out += d.toString("utf8"); });
+    p.stderr.on("data", d => { err += d.toString("utf8"); });
+    const to = setTimeout(() => {
+      try { p.kill("SIGTERM"); } catch { /* already dead */ }
+      reject(new Error(`sf_eval timed out after ${SF_EVAL_TIMEOUT_MS}ms`));
+    }, SF_EVAL_TIMEOUT_MS);
+    p.on("error", e => { clearTimeout(to); reject(e); });
+    p.on("close", code => {
+      clearTimeout(to);
+      if (code !== 0) reject(new Error(`sf_eval exited ${code}: ${err.slice(0, 500)}`));
+      else resolve(out);
+    });
+  });
+  try {
+    return JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`sf_eval returned non-JSON output (${e instanceof Error ? e.message : String(e)}): ${stdout.slice(0, 300)}`);
+  }
+}
+
 const FENFIND_DIR: string | null = (() => {
   const envPath = process.env.FENFIND_PATH?.trim();
   if (envPath && existsSync(join(envPath, "fenfind"))) return envPath;
@@ -2271,6 +2341,11 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "describe_position": {
       const resolved = await resolveFromNodeOrFen(args);
       return describePosition(resolved.fen);
+    }
+
+    case "describe_position_eval": {
+      const resolved = await resolveFromNodeOrFen(args);
+      return runSfEval(resolved.fen);
     }
 
     case "predict_human_move": {

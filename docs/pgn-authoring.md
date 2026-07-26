@@ -240,15 +240,22 @@ Contempt scale is signed 0-100 (same as the web UI's ContemptStrength slider). T
 
 ### Before you write any commentary: describe_position
 
-LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent captures, miscount pieces. Before you write a comment describing what's happening in a position, call `describe_position(fen)`. It's pure computation (no engine, ~1ms) and returns the same board state a human sees:
+LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent captures, miscount pieces. Before you write a comment describing what's happening in a position, call `describe_position(fen)`. Pure computation (~1 ms, no engine), returns two layers:
 
-- All piece placements per colour (SAN-style: `Nf3`, `Bg7`, `e4`)
-- Material balance in pawn units (`"white +1 (39 vs 38)"`)
-- Every contested piece: attackers + defenders (e.g. `{target: "e5", color: "black", attackers: ["Nf3"], defenders: ["Nc6"]}`)
-- Hanging list — attacked and undefended
-- Check state + checkers, castling rights, en passant
+**Board state** — piece placements, material, contested pieces (attackers + defenders), hanging list, check state, castling, en passant, legal moves. Fixes the *"Black's queen on c7 is defended by the knight on d5"* failure when actually there's no knight on d5 and the queen is on c8.
 
-Use it whenever you're about to describe a position from memory or from your reading of a FEN. The failure mode this prevents: `{Black's queen on c7 is defended by the knight on d5.}` when actually there's no knight on d5 and the queen is on c8.
+**Structural analysis** — the concepts a strong player reads at a glance but the LLM can't derive from a FEN:
+
+- `pawnStructure.files` — open / half-open / closed per column (rook targets).
+- `pawnStructure.isolated`, `doubled`, `passed`, `backward` — structural weaknesses (and strengths, for passed).
+- `weakSquares` — holes no friendly pawn can ever attack.
+- `outposts` — friendly N/B on an enemy hole defended by own pawn.
+- `bishops` — good / mixed / bad per bishop, based on own pawns on its colour. `bishops.pair` flags who has both.
+- `space` — squares in the enemy half controlled by each side.
+
+Use these instead of inventing structural claims. Commentary that says *"Black has the bad light-squared bishop"* should trace to `bishops.black[0].quality === "bad"`, not to a memory of similar Carlsbad positions.
+
+For the engine's OWN take on the same position (13 named eval terms, per-colour, mg/eg), call `describe_position_eval` — that's the Stockfish decomposition and pairs beautifully with a before/after delta on a candidate move to explain WHAT the move changed. See the engine-usage guide for the delta pattern.
 
 ### When prose ADDS to the NAG
 
