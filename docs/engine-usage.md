@@ -118,6 +118,19 @@ Typical movetimes:
 
 Only use it when you actually need the depth. Regular `cloud_analyse` handles the ~5–10 branches of a typical prep walk perfectly well.
 
+## Per-engine `multipv` defaults
+
+`cloud_analyse` defaults to different candidate-line counts per engine because the two engines behave differently:
+
+- **Stockfish: `stockfish_multipv=2`** — SF gets weaker as multipv grows. Each extra PV steals search bandwidth from the top choice, so the "objective best move" leg is at its strongest with a tight list. Raise only when you specifically need SF's read on a wide range of candidates (e.g. sanity-checking an unusual sideline).
+- **Lc0: `lc0_multipv=8`** — Lc0 doesn't degrade the same way with multipv. Use it wide by default: 8 candidates give the LLM a real slate of practical ideas to inspect ("what does Lc0 think of the fun moves here?"). Lower it only when you don't need that breadth.
+
+Mental model:
+- **Stockfish = the checker.** "Is this line objectively good? What's actually best?" Narrow, deep, one answer.
+- **Lc0 = the explorer.** "What's practically interesting? What alternatives are worth a look?" Wide, breadth-first, several answers.
+
+`multipv` (unprefixed) still works as a shortcut when you want the same value on both engines, but the per-engine defaults are almost always the right call.
+
 ## Splitting engines on `cloud_analyse`
 
 `cloud_analyse` accepts an `engines` list to run only one leg:

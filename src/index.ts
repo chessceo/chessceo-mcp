@@ -559,7 +559,19 @@ const TOOLS: Tool[] = [
           type: "integer",
           minimum: 1,
           maximum: 10,
-          description: "Number of candidate lines per engine (default 3).",
+          description: "Shortcut: applies the same multipv to BOTH engines. Usually you want the per-engine defaults instead (SF=2, Lc0=8) — see stockfish_multipv / lc0_multipv below and the engine-usage guide.",
+        },
+        stockfish_multipv: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description: "Stockfish candidate lines (default 2). Kept tight because each extra PV steals search bandwidth from the top choice — SF is the 'what's objectively best' leg, use a low multipv to keep it strong. Raise only when you specifically need SF's take on a wide range of candidates.",
+        },
+        lc0_multipv: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description: "Lc0 candidate lines (default 8). Kept wide because multipv doesn't degrade Lc0's strength the way it does Stockfish's — Lc0 is the 'find inspiration / explore practical tries' leg, use a high multipv to get a full slate of ideas.",
         },
         contempt: {
           type: "integer",
@@ -868,7 +880,7 @@ const TOOLS: Tool[] = [
           type: "integer",
           minimum: 1,
           maximum: 10,
-          description: "Number of candidate lines (default 3).",
+          description: "Number of candidate lines (default 2). Stockfish gets weaker as multipv grows — each extra PV steals search bandwidth from the top choice — so keep this low unless you specifically want to see several candidates ranked deep.",
         },
       },
     },
@@ -1542,7 +1554,10 @@ async function deepAnalyseStart(args: Args): Promise<unknown> {
   const resolved = await resolveFromNodeOrFen(args);
   const fen = resolved.fen;
   const movetimeMs = typeof args.movetime_ms === "number" ? args.movetime_ms : 60_000;
-  const multipv = typeof args.multipv === "number" ? args.multipv : 3;
+  // Default 2 — SF loses meaningful strength at higher multipv, so a
+  // deep think is best spent on a tight candidate list. Matches the
+  // cloud_analyse stockfish_multipv default.
+  const multipv = typeof args.multipv === "number" ? args.multipv : 2;
 
   const jobId = newDeepJobId();
   const job: DeepJob = {
@@ -2285,6 +2300,8 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       const body: Record<string, unknown> = { fen };
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") body.multipv = args.multipv;
+      if (typeof args.stockfish_multipv === "number") body.stockfish_multipv = args.stockfish_multipv;
+      if (typeof args.lc0_multipv === "number") body.lc0_multipv = args.lc0_multipv;
       if (typeof args.contempt === "number") body.contempt = args.contempt;
       if (Array.isArray(args.engines)) body.engines = args.engines;
       const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
