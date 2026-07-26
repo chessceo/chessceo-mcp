@@ -4,20 +4,20 @@ Opening prep is not a monologue with the position-stats and player-prep endpoint
 
 ## Grounding: cite tools, don't fill gaps with chess prose
 
-Every recommendation you make must trace back to an actual tool call in this session — engine output from `cloud_analyse` / `analyse` for evaluations and lines, `get_player_preparation` / `get_position_stats` for statistics, `get_player_profile` / `get_head_to_head` for style and history. **Compute is cheap.** When you don't have the data to justify a claim, run the tool — do not paper over the gap with generic chess wisdom you didn't verify.
+Every recommendation you make must trace back to an actual tool call in this session — engine output from `cloud_analyse` for evaluations and lines, `prepare_opponent` + `get_prep_position` for opponent statistics, `get_position_stats` for the general database, `get_player_profile` / `get_head_to_head` for style and history. **Compute is cheap.** When you don't have the data to justify a claim, run the tool — do not paper over the gap with generic chess wisdom you didn't verify.
 
 **Concrete failure modes to catch yourself doing:**
 
 - "This is a good line because Black gets the two bishops." → Did Lc0 or Stockfish score it that way? If not, drop the claim.
-- "Your opponent hates isolated queen pawn positions." → Did you actually look at their IQP games in `get_player_preparation`? Or is this a training-data pattern?
+- "Your opponent hates isolated queen pawn positions." → Did you actually look at their IQP games via a `prepare_opponent` session? Or is this a training-data pattern?
 - "The Petroff is a solid choice here." → Did you check the opponent's score as White vs the Petroff, or against Black openings in general? If not, drop it.
 - "Aim for a Catalan setup, they historically struggle there." → Point at concrete games where they lost in Catalan structures. If you can't, don't say it.
-- Inventing move sequences that "look like typical prep" without walking the actual tree via `get_player_preparation` / `prep_snapshot`.
+- Inventing move sequences that "look like typical prep" without walking the actual tree via `get_prep_position` / `prep_snapshot`.
 - Asserting an opponent's style ("sharp tactician", "endgame grinder") without pointing at their profile data or specific games.
 
 The failure mode is *authoritative-sounding recipe = 30% real tool output + 70% chess-book filler*. The user cannot tell which is which; from their side it all looks like analysis. That's worse than saying "I don't have data on this yet — should I run X?"
 
-**Do this instead:** cite the specific numbers ("opponent scores 32% as White vs the Sveshnikov over 47 games, 2023-2025"), the tool that produced them ("via `get_player_preparation`"), and reason from there. If the reasoning wants to extend beyond what the data supports, either run more tools or flag it as your read, not the data's.
+**Do this instead:** cite the specific numbers ("opponent scores 32% as White vs the Sveshnikov over 47 games, 2023-2025"), the tool that produced them ("via a `prepare_opponent` session filtered to classical since 2024"), and reason from there. If the reasoning wants to extend beyond what the data supports, either run more tools or flag it as your read, not the data's.
 
 ## Numbers are inputs, not verdicts
 
@@ -26,6 +26,56 @@ The move statistics endpoints return win %, game counts, and (in the big DB) a `
 - **Sample size scales trust.** 3 games at 66% is noise; 300 at 55% is signal. A great score is nice — with volume. When the opponent has only 2-4 games in a variation, the "opponent-specific" score is basically the general-DB score anyway.
 - **Score doesn't automatically indicate a level gap.** A 60% variation isn't necessarily "stronger players crushing weaker ones." Look at the per-move `avgWhite` / `avgBlack` fields (returned on every move statistic) before drawing conclusions about who is playing whom.
 - **Don't recommend the higher-percentage move just because it's higher.** If 1.b3 scores 60% and 1.d4 scores 50% against a given opponent, that is *not* on its own a case for playing 1.b3 — style, prep depth, transposition risk, and the practical questions below all matter more.
+
+## Which DB source: signal vs population
+
+Two shards on `get_position_stats`:
+
+- **`gm-classical`** (default): pre-aggregated GM classical games (both players ~2500+, real thinking time). Every move is signal, no noise. Sample sizes are smaller.
+- **`main`**: the full 11.7M-game database. Wider coverage, cheaper positions included (blitz, weak opponents, blunder-fests). Noisier — a move scoring 55% here might just mean "1400s falling for a trap."
+
+Choose by position density, not by habit:
+
+- **Popular positions** (main-line theory, well-known tabiyas, well-explored middlegame structures) — `gm-classical` almost always. If it returned 200+ games at avgRating 2600, that IS the population that matters. Diluting it with 8000 more games from 1400-rated blitz doesn't add information, it subtracts it.
+- **Rare positions** (sub-sub-line 15 moves deep, offbeat variations) — start with `gm-classical`; if `totalCount` is under ~20, switch to `main`. Volume tells you what's actually being played by *someone*, at the cost of noise. Weight the win% accordingly — a `main` result at 55% over 8k games means less than a `gm-classical` result at 55% over 200 games would.
+- **Very rare positions** — sometimes even `main` is thin. Then look at `avgRating` per move; if it's 1400 you're seeing chess-noise, not preparation.
+
+Cross-reference tip: if `main` shows a specific move dominating that `gm-classical` doesn't touch, that's usually a training-DB pattern (correspondence, bots, or a blitz trap), not a discovery. Don't recommend it as prep.
+
+## Which prep source: match data density to what you're preparing
+
+`prepare_opponent` accepts fide, chesscom, lichess sources — each with per-source colour, date-range, time-control filters. Which sources to combine depends on how much data the opponent actually has and what specific question you're answering:
+
+- **Well-known player, well-known question** ("what does Firouzja play against 1.e4?"): FIDE, `time_control: "classical"`, `start_month` = 12–24 months ago. Cleanest signal, big enough sample. Don't dilute with online.
+- **Well-known player, sideline question** ("what would he play in this obscure 20-ply position?"): FIDE all-time-controls first — classical is unlikely to have games in a rare position. If still nothing, add rapid; add online only if you must.
+- **Junior / sub-2400 / comeback player**: FIDE classical alone might give you 5 games. Add FIDE rapid + chesscom + lichess (all filtered to the last 12 months). Signal density improves, but recognize online games are a mixed signal — see next section.
+- **Multiple accounts / handles**: pass them all as sources in one call — `[{type:"fide",fide_id:X}, {type:"chesscom",username:"..."}, {type:"lichess",username:"..."}]`. Same session, more games, no rebuild, all combined into one filtered corpus.
+
+The trade-off is always the same: signal quality vs data density. When density is high, prefer quality; when density is low, take what you can get and lower your confidence in the read explicitly ("only 12 games at this branch — the 66% is noisier than the 55% we saw at move 2").
+
+## Reading a chess.com / lichess profile: three shapes
+
+Online games are a *mixed* signal. Before treating chesscom/lichess data the same weight as FIDE, spot which of these three profiles the opponent fits — misclassifying is worse than not using online data at all.
+
+1. **Consistent** — plays roughly the same repertoire online and OTB. Gold. Suddenly you have thousands of extra games to see reactions against sidelines and to see where he makes mistakes in the early middlegame under time pressure. Weight online data almost the same as classical FIDE.
+
+2. **Eclectic** — online they play everything under the sun; OTB they have a real narrow repertoire. Still usable, but for a *different* question. Online tells you: (a) which openings he has *seen* and roughly *knows*, (b) which moves he *actually recalls under pressure*, (c) where he makes early mistakes. Online does NOT reliably tell you what he'll play in the game.
+
+3. **Split personality** — online repertoire genuinely differs from OTB. Classic example: a 1.e4 Ruy Lopez player over the board who plays only the King's Gambit on lichess blitz because it's fun. Online is the playground; OTB is serious. **Recognize this and discount the online games entirely** for opening-choice prediction — he's not playing his lichess repertoire in a rated classical game. Online may still surface middlegame tendencies, but "what will he play" belongs to FIDE only.
+
+How to distinguish, quickly: compare the top openings from `get_player_profile` (FIDE-based) against the moves he plays from the starting position in an online-only `prepare_opponent` session. High overlap → shape 1. Modest overlap with FIDE openings as a subset of online → shape 2. Different openings entirely → shape 3.
+
+Write the profile-shape into the prep file's overview comment as soon as you decide it — future re-reads (and the user) benefit from knowing you already made the call.
+
+## Reversed colours as a scarcity trick
+
+For a rare position where the opponent has 0–2 games as their side, it's often worth also checking what they've done in the same position from the OTHER colour. This doesn't tell you what they'd play — it tells you what they've SEEN. Useful when you have no direct data:
+
+- **Surprise calculus**: "he's had this position from the White side against people playing it against him — so seeing it from the Black side isn't a real surprise, he knows the ideas."
+- **Structural familiarity**: "he's played this pawn structure before, just from the other colour — his over-the-board understanding will carry over."
+- **Cuts both ways**: if the opponent has played it a lot with the OTHER colour AND had good results, assume he knows both sides thoroughly.
+
+Do this by dropping the `color` filter on `prepare_opponent`, or making a second session with the opposite colour — then compare game counts. When density is scarce, information from the "wrong" colour is worth more than no information at all. Just be honest about what it is: knowledge, not prediction.
 
 ## Prep is symmetric — both sides know the same things
 
@@ -41,7 +91,7 @@ Every recommendation should be filtered through: "does this survive the fact tha
 
 The opponent's last 12-24 months matter far more than a 10-year career average. Repertoires evolve — a lifelong Najdorf player might have quietly become a Petroff player last year, and their old career stats will lie to you if you skim.
 
-**Related product note (2026-07-23):** the `get_player_preparation` endpoint (compact / LLM view) deliberately strips the per-move `fashionScore` field. At the individual-player level, fashion is trailing noise — the opponent's opening trend is already captured in game dates. `fashionScore` stays on the general-DB endpoint (`get_position_stats`), where it's genuinely useful: it's what the whole top field is playing this month.
+**Related product note:** `get_prep_position` (from a `prepare_opponent` session) deliberately strips the per-move `fashionScore` field. At the individual-player level, fashion is trailing noise — the opponent's opening trend is already captured in game dates. `fashionScore` stays on the general-DB endpoint (`get_position_stats`), where it's genuinely useful: it's what the whole top field is playing this month.
 
 ## Prep is a tree, not a line
 

@@ -210,7 +210,7 @@ Where NAGs are noise: every `$10` "=" glyph on every equal position. If the whol
 
 When reading back a file, `node.ceoEval.nag` carries the threshold-derived NAG (`$10` / `$14` / `$16` / `$18` etc.) — treat it as a *suggestion*, not an automatic write. Promote it to a visible NAG only when a glyph on that move actually helps the reader.
 
-**Persisted evals travel with the file.** Every node with an eval gets `ceoEval: { sf: {cp: 25, depth: 32}, lc0: {cp: 30, depth: 18}, nag: "$14" }` on subsequent `read_prep_file` calls. Stored as `[%ceo-eval sf=+0.25/32 lc0=+0.30/18 nag=$14]` inside the PGN comment (an escape tag the app hides from the board view, just like [%cal] / [%csl]). So a re-read after auto_evaluate gives you every position's number without re-running cloud_analyse. Query tools (get_position_stats, get_player_preparation, prep_snapshot) also auto-attach a live `eval` at the request position when a cloud engine is running.
+**Persisted evals travel with the file.** Every node with an eval gets `ceoEval: { sf: {cp: 25, depth: 32}, lc0: {cp: 30, depth: 18}, nag: "$14" }` on subsequent `read_prep_file` calls. Stored as `[%ceo-eval sf=+0.25/32 lc0=+0.30/18 nag=$14]` inside the PGN comment (an escape tag the app hides from the board view, just like [%cal] / [%csl]). So a re-read after auto_evaluate gives you every position's number without re-running cloud_analyse. Query tools (get_position_stats, get_prep_position, prep_snapshot) also auto-attach a live `eval` at the request position when a cloud engine is running.
 
 **Engine numbers in prose: brief only.** If you must reference a number, keep it compact:
 
