@@ -391,12 +391,11 @@ const TOOLS: Tool[] = [
   {
     name: "predict_human_move",
     description:
-      "Rating-conditioned neural net (ResNet-20x256). Returns two things — both are useful, treat them as separate signals:\n\n" +
-      "1. **Top-N most likely moves** (`moves: [{san, p}, ...]`) — 'what will a player of this rating actually pick here'. Different question from engines: cloud_analyse tells you objective best, this tells you what the opponent will play. If the human top move is a mistake, that's a real practical advantage worth building prep around.\n\n" +
-      "2. **`wdlWhitePov: {win, draw, loss}`** — game-outcome prediction, rating-aware, White POV. Directly comparable across positions. This is how you answer 'which of these lines is drawier / more forcing at this level' — call on two positions, compare the `draw` component. Example: `0-0 Nxe4 Re1` (Berlin main line, ~50% draw at 2600) vs `4.d3 d6` (Italian, ~30% draw at 2600) — you can quantify the intuition instead of guessing. Useful when the user asks 'must-win with Black, which of these two openings gives more play'.\n\n" +
-      "Rating effect: a 400-point gap widens win probability even in equal positions — the model has learned that human errors compound. Same knob works both ways: prep for a lower opponent → bump the win prediction; verify a drawish line still gives Black chances at 2200 → set both elos to 2200 and check the draw share.\n\n" +
-      "Pass `prev_fen` (most recent first) when the position is mid-trade — without history the model treats it as quiet, which under-counts practical chances.\n\n" +
-      "Position input: prefer `file_id`+`node_id` when inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. ~1-2s per call. **Premium (or admin/moderator) only** — anonymous calls get 402.",
+      "Neural net (ResNet-20x256) trained on real games. Always evaluated at **2850 vs 2850** (top-level play) — the rating is fixed on purpose, so cross-position comparisons stay apples-to-apples. Returns two signals — both useful, treat as independent:\n\n" +
+      "1. **Top-N most likely moves** (`moves: [{san, p}, ...]`) — what a top player will actually pick. Different question from engines: cloud_analyse says objectively best, this says what the human will play. If the human top move is a mistake, that's a real practical advantage.\n\n" +
+      "2. **`wdlWhitePov: {win, draw, loss}`** — game-outcome prediction, White POV. Directly comparable across positions: call on two positions, compare `draw` to find which line is drawier / more forcing. Two-line comparisons are how you answer 'must-win with Black, which of these openings gives more play'.\n\n" +
+      "Pass `prev_fens` (most recent first) when the position is mid-trade — without history the model treats it as quiet, which under-counts practical chances.\n\n" +
+      "Position input: prefer `file_id`+`node_id` when inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`. ~1-2s per call. **Premium (or admin/moderator) only** — anonymous calls get 402.",
     inputSchema: {
       type: "object",
       properties: {
@@ -406,18 +405,6 @@ const TOOLS: Tool[] = [
         moves: {
           type: "string",
           description: "Optional SAN moves to apply on top of `fen` (or startpos). Only used if `node_id` is not set.",
-        },
-        white_elo: {
-          type: "integer",
-          minimum: 100,
-          maximum: 3400,
-          description: "White's rating (default 2400).",
-        },
-        black_elo: {
-          type: "integer",
-          minimum: 100,
-          maximum: 3400,
-          description: "Black's rating (default 2400).",
         },
         top: {
           type: "integer",
@@ -2289,17 +2276,32 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "predict_human_move": {
       const resolved = await resolveFromNodeOrFen(args);
       const fen = resolved.fen;
+      // Rating is fixed at 2850 vs 2850. Not exposed to the LLM —
+      // cross-position comparisons only mean something at a constant
+      // rating, and top-level is the useful reference point for prep.
       const qs = new URLSearchParams();
       qs.set("fen", fen);
-      if (typeof args.white_elo === "number") qs.set("white_elo", String(args.white_elo));
-      if (typeof args.black_elo === "number") qs.set("black_elo", String(args.black_elo));
+      qs.set("white_elo", "2850");
+      qs.set("black_elo", "2850");
       if (typeof args.top === "number") qs.set("top", String(args.top));
       if (Array.isArray(args.prev_fens)) {
         for (const p of args.prev_fens as unknown[]) {
           if (typeof p === "string" && p.length > 0) qs.append("prev_fen", p);
         }
       }
-      return authedRequest("GET", `/api/agent/predict-move?${qs.toString()}`);
+      const raw = await authedRequest("GET", `/api/agent/predict-move?${qs.toString()}`);
+      // Strip uci from each move — san is enough for the LLM and the
+      // duplicate field is context bloat. Also drop whiteElo/blackElo
+      // from the response (always 2850 now — echoing them adds nothing).
+      if (raw && typeof raw === "object") {
+        const r = raw as { moves?: Array<Record<string, unknown>>; whiteElo?: unknown; blackElo?: unknown };
+        if (Array.isArray(r.moves)) {
+          for (const m of r.moves) delete m.uci;
+        }
+        delete r.whiteElo;
+        delete r.blackElo;
+      }
+      return raw;
     }
 
     case "get_head_to_head":
