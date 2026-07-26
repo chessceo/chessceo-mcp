@@ -255,7 +255,7 @@ LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent
 
 Use these instead of inventing structural claims. Commentary that says *"Black has the bad light-squared bishop"* should trace to `bishops.black[0].quality === "bad"`, not to a memory of similar Carlsbad positions.
 
-For the engine's OWN take on the same position (13 named eval terms, per-colour, mg/eg), call `describe_position_eval` — that's the Stockfish decomposition and pairs beautifully with a before/after delta on a candidate move to explain WHAT the move changed. See the engine-usage guide for the delta pattern.
+The same call also returns `engineEvalTerms` — Stockfish's classical-eval breakdown into 13 named terms per colour (mg/eg). Compare it before/after a candidate move: the term that shifts most tells you WHAT the move changed. See the engine-usage guide for the delta pattern.
 
 ### When prose ADDS to the NAG
 

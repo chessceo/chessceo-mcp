@@ -374,19 +374,20 @@ const TOOLS: Tool[] = [
   {
     name: "describe_position",
     description:
-      "Structured facts about a chess position that an LLM cannot reliably derive from a FEN. Pure computation, no engine, ~1 ms per call. USE BEFORE COMMENTING on any position — pieces get misplaced, hanging pieces missed, 'the knight on d5' turns out to not exist.\n\n" +
-      "Returns two layers:\n\n" +
-      "**Board state** — piece placements per colour, material balance in pawn units, contested pieces (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant, side to move, full LEGAL MOVES list for the side to move. Use `.legalMoves` when `add_move` rejects an illegal SAN.\n\n" +
-      "**Structural analysis** — concepts a human sees at a glance but the LLM can't compute:\n" +
-      "  • `pawnStructure.files` — each file as `open`/`half_open_for_white`/`half_open_for_black`/`closed`. Half-open files are natural rook targets.\n" +
-      "  • `pawnStructure.islands` — pawn island count per colour (more islands = weaker structure).\n" +
-      "  • `pawnStructure.isolated` / `doubled` / `passed` / `backward` — structural weaknesses (and strengths, for passed pawns).\n" +
-      "  • `weakSquares` — 'holes' in ranks 3-6 that no friendly pawn can ever attack. Prime real estate for enemy pieces.\n" +
-      "  • `outposts` — friendly N/B sitting on an enemy hole, defended by own pawn. Classic strong squares.\n" +
-      "  • `bishops` — per-bishop quality tag (good/mixed/bad) based on own pawns on the bishop's colour. Bad bishop = own pawns blocking its diagonals.\n" +
-      "  • `bishops.pair` — whether each side has both bishops.\n" +
-      "  • `space` — squares controlled in the enemy half. Higher = more space to manoeuvre.\n\n" +
-      "For per-colour engine-eval numbers (material/pawns/king safety/mobility/threats/space/passed breakdown, mg/eg) call `describe_position_eval` — same position, engine terms instead of chess-primitive observations.\n\n" +
+      "Everything you need to understand a position in one call. USE BEFORE COMMENTING — pieces get misplaced when reading a FEN, hanging pieces missed, 'the knight on d5' turns out to not exist. ~50-100 ms per call (chess-primitive analysis is instant; the Stockfish leg dominates wall time).\n\n" +
+      "Returns three layers:\n\n" +
+      "**Board state** — piece placements per colour, material balance in pawn units, contested pieces (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant, side to move, full LEGAL MOVES list. Use `.legalMoves` when `add_move` rejects an illegal SAN.\n\n" +
+      "**Structural analysis** — chess-concept observations a human sees at a glance:\n" +
+      "  • `pawnStructure.files` — each file `open`/`half_open_for_white`/`half_open_for_black`/`closed`. Half-open files are natural rook targets.\n" +
+      "  • `pawnStructure.islands` — count per colour (more = weaker structure).\n" +
+      "  • `pawnStructure.isolated` / `doubled` / `passed` / `backward` — structural weaknesses (and strengths, for passed).\n" +
+      "  • `weakSquares` — holes in ranks 3-6 that no friendly pawn can ever attack. Prime real estate for enemy pieces.\n" +
+      "  • `outposts` — friendly N/B on an enemy hole defended by own pawn. Classic strong squares.\n" +
+      "  • `bishops` — per-bishop `good`/`mixed`/`bad` from own pawns on its colour. `bishops.pair` flags who has both.\n" +
+      "  • `space` — squares controlled in the enemy half.\n\n" +
+      "**Engine eval terms** (`engineEvalTerms`) — Stockfish's classical eval decomposed into 13 named contributing terms (Material, Imbalance, Pawns, Knights, Bishops, Rooks, Queens, Mobility, King safety, Threats, Passed, Space, Winnable), each with white / black / total values in mg + eg. Stockfish's own answer to WHY the position stands the way it does.\n" +
+      "  → **Primary use: the delta pattern.** Call `describe_position` on the position BEFORE and AFTER a candidate move, compare `engineEvalTerms` — the term with the biggest shift tells you WHAT the move changed (king safety collapsed → move exposed the king; mobility jumped → move improved coordination). Kim et al. NAACL 2025 showed this named-delta pattern roughly doubles LLM chess-commentary correctness vs a bare eval number.\n" +
+      "  → Omitted from the response if Stockfish isn't installed on the server.\n\n" +
       "Position input: prefer `file_id`+`node_id` if inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`.",
     inputSchema: {
       type: "object",
@@ -395,23 +396,6 @@ const TOOLS: Tool[] = [
         node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
         fen:     { type: "string", description: "Starting position as FEN (defaults to startpos). Only used if `node_id` is not set." },
         moves:   { type: "string", description: "Optional SAN moves to apply on top of `fen`. Only used if `node_id` is not set." },
-      },
-    },
-  },
-  {
-    name: "describe_position_eval",
-    description:
-      "Stockfish's classical-eval breakdown for a position: the 13 named contributing terms (Material, Imbalance, Pawns, Knights, Bishops, Rooks, Queens, Mobility, King safety, Threats, Passed, Space, Winnable), each with white / black / total values in mg + eg (middlegame + endgame). This is Stockfish's own answer to WHY the position stands the way it does — companion to `describe_position` (chess-primitive observations) and `cloud_analyse` (best move + PV).\n\n" +
-      "Primary use: **compute a delta between two positions** to see which term shifted most on a move. Call on the position BEFORE and AFTER a candidate move; the term with the biggest change is the CONCEPT that move addresses ('mobility jumped +0.25' → the move improved piece coordination; 'king safety collapsed -0.4' → the move exposed the king). Kim et al. NAACL 2025 showed feeding these named term deltas to an LLM roughly doubles chess-commentary correctness vs a bare eval number.\n\n" +
-      "Absolute values are useful on their own too — a large King safety term means the king is exposed regardless of what caused it.\n\n" +
-      "Values are in pawn units, White POV per term (positive = White's side is doing well on that term). ~50-100 ms per call. No cloud engine required — uses the local Stockfish binary. If Stockfish isn't installed on the server, returns `{found: false, error: ...}`.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        file_id: { type: "string", description: "Prep file id. When combined with `node_id`, evaluates that node's position." },
-        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
-        fen:     { type: "string", description: "Position as FEN. Only used if `node_id` is not set." },
-        moves:   { type: "string", description: "Optional SAN moves on top of `fen`. Only used if `node_id` is not set." },
       },
     },
   },
@@ -2340,12 +2324,26 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "describe_position": {
       const resolved = await resolveFromNodeOrFen(args);
-      return describePosition(resolved.fen);
-    }
-
-    case "describe_position_eval": {
-      const resolved = await resolveFromNodeOrFen(args);
-      return runSfEval(resolved.fen);
+      // Chess-primitive analysis (structural, ~1 ms) + Stockfish eval-
+      // term breakdown (~50-100 ms) in parallel. Merge into one response
+      // so the LLM sees the whole position in one call — chess-concepts,
+      // structural weaknesses, AND engine's per-term reasoning.
+      // If Stockfish isn't installed the eval leg returns {found: false,
+      // error} and we drop it from the response so callers see the same
+      // shape either way (just without `engineEvalTerms`).
+      const [structural, evalRaw] = await Promise.all([
+        Promise.resolve(describePosition(resolved.fen)),
+        runSfEval(resolved.fen).catch(err => ({
+          found: false,
+          error: err instanceof Error ? err.message : String(err),
+        })),
+      ]);
+      const merged = structural as Record<string, unknown>;
+      const ev = evalRaw as { found?: boolean; terms?: unknown; total?: unknown };
+      if (ev && ev.found === true) {
+        merged.engineEvalTerms = { terms: ev.terms, total: ev.total };
+      }
+      return merged;
     }
 
     case "predict_human_move": {
