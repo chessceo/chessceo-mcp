@@ -29,18 +29,20 @@ The move statistics endpoints return win %, game counts, and (in the big DB) a `
 
 ## Which DB source: signal vs population
 
-Two shards on `get_position_stats`:
+Two shards on `get_position_stats`, answering different questions:
 
-- **`gm-classical`** (default): pre-aggregated GM classical games (both players ~2500+, real thinking time). Every move is signal, no noise. Sample sizes are smaller.
-- **`main`**: the full 11.7M-game database. Wider coverage, cheaper positions included (blitz, weak opponents, blunder-fests). Noisier — a move scoring 55% here might just mean "1400s falling for a trap."
+- **`gm-classical`** (default): pre-aggregated GM classical games (both players ~2500+, real thinking time). Every move is signal, no noise. Sample sizes are smaller. Answers: *what do good players actually play here, and how well does each option score at that level?*
+- **`main`**: the full 11.7M-game database. Wider coverage, cheaper positions included (blitz, weak opponents, blunder-fests). Noisier. Answers: *has this position/move been reached at all, and by whom?*
 
-Choose by position density, not by habit:
+They're not either-or. Reasonable to hit both on the same position for different questions:
 
-- **Popular positions** (main-line theory, well-known tabiyas, well-explored middlegame structures) — `gm-classical` almost always. If it returned 200+ games at avgRating 2600, that IS the population that matters. Diluting it with 8000 more games from 1400-rated blitz doesn't add information, it subtracts it.
-- **Rare positions** (sub-sub-line 15 moves deep, offbeat variations) — start with `gm-classical`; if `totalCount` is under ~20, switch to `main`. Volume tells you what's actually being played by *someone*, at the cost of noise. Weight the win% accordingly — a `main` result at 55% over 8k games means less than a `gm-classical` result at 55% over 200 games would.
-- **Very rare positions** — sometimes even `main` is thin. Then look at `avgRating` per move; if it's 1400 you're seeing chess-noise, not preparation.
+- **What GMs play here** → `gm-classical`. Even a small count (5-10 games at avgRating 2600) is often the honest answer for a specific tabiya — that's just how many GMs have gone there. Don't dismiss small numbers if the rating context supports them.
+- **Does anyone play this at all** → `main`. Especially useful for a move you're considering that hasn't appeared in `gm-classical`. Zero in the GM DB doesn't automatically mean bad — it might just mean unfashionable. Check `main`: if it has some volume at reasonable avgRating (~2200+), the move has real support even without top-level play; if it's only 1400-rated games or bots, it doesn't.
+- **Sanity-checking a candidate** → both. If a move you're considering shows 3 games in `gm-classical` but 800 in `main` at avgRating 2100, that's a coherent picture (unfashionable at the very top but played by strong players); if `main` shows the same 3 games and nothing else, the move is genuinely rare and you're pioneering.
 
-Cross-reference tip: if `main` shows a specific move dominating that `gm-classical` doesn't touch, that's usually a training-DB pattern (correspondence, bots, or a blitz trap), not a discovery. Don't recommend it as prep.
+When you do read a `main` result, always eyeball `avgRating` per move before quoting the win%. A 60% score across 200 games at avgRating 1400 is not a recommendation — it's a trap that catches beginners. The same 60% across 200 games at avgRating 2400 is a real finding.
+
+Cross-reference tip: if `main` shows a specific move dominating that `gm-classical` doesn't touch, look at *who* — correspondence engines, blitz-only players, and bot accounts skew the `main` totals. A move with 5000 games in `main` at avgRating 1900 and zero in `gm-classical` is probably not something to recommend as GM prep.
 
 ## Which prep source: match data density to what you're preparing
 
