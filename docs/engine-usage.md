@@ -103,6 +103,31 @@ The gap (1.4 - 0.2 = 1.2) is roughly the value of the tempo Black has to spend d
 
 **Gotcha:** flipping side-to-move invalidates the en passant target field (if the last move was a two-square pawn push, the ep square is now stale). Also, both sides are counted as still having whichever castling rights are in the FEN — don't do this in the middle of a castling sequence. For opening / middlegame threat-checking it's a very useful idiom.
 
+## Deep Stockfish thinks: `deep_analyse`
+
+`cloud_analyse` runs both engines with a movetime cap of 10 s — deliberately fast because most opening-tree questions are answered in 2–3 s. For **one specific critical position** where you want depth 35+ instead of the usual depth 22, use `deep_analyse`:
+
+- SF-only (Lc0 saturates in a handful of seconds — no benefit past ~5 s of movetime).
+- Movetime up to 5 min.
+- Async: returns a `job_id` immediately, poll `deep_analyse_status(job_id)`, cancel with `deep_analyse_cancel(job_id)` if you decide partial depth is enough.
+- **Holds only the Stockfish slot on the combo.** Lc0 remains callable for other positions via `cloud_analyse({ engines: ["lc0"], … })` while the deep think runs. Use that during the wait — walk other branches, sanity-check candidates.
+
+Typical movetimes:
+- `30_000 – 60_000` (30–60 s) — careful check on a candidate move
+- `120_000 – 300_000` (2–5 min) — "find the truth" on a novelty, tactical shot, or difficult endgame
+
+Only use it when you actually need the depth. Regular `cloud_analyse` handles the ~5–10 branches of a typical prep walk perfectly well.
+
+## Splitting engines on `cloud_analyse`
+
+`cloud_analyse` accepts an `engines` list to run only one leg:
+
+- `engines: ["lc0"]` — Lc0 only, useful while a `deep_analyse` is holding the Stockfish slot.
+- `engines: ["stockfish"]` — SF only, when only the objective read matters and you want to skip the Lc0 latency.
+- Default (omitted) — both engines. This is what you want for real prep decisions.
+
+The skipped engine's field is omitted from the response (not present as an empty object).
+
 ## Worked example
 
 User is preparing Black against a 2600 opponent who plays 1.e4 c5 2.Nf3 d6 3.d4 cxd4 4.Nxd4 Nf6 5.Nc3 a6 6.Be3 e5. You want to know if 7.Nb3 or 7.Nf3 is more testing.

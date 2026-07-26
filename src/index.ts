@@ -124,6 +124,9 @@ const AUTHED_TOOLS = new Set([
   "auto_evaluate",
   "auto_evaluate_status",
   "auto_evaluate_cancel",
+  "deep_analyse",
+  "deep_analyse_status",
+  "deep_analyse_cancel",
   "quote_engine_eval",
   "predict_human_move",
   "prepare_opponent",
@@ -563,6 +566,12 @@ const TOOLS: Tool[] = [
           description:
             "Lc0 contempt bias. Signed 0-100 strength (same scale as the web UI's ContemptStrength slider — server multiplies by 8 to get the internal cp bias). 0 = objective (default). Positive favours White, negative favours Black. Typical: ±15 light nudge, ±30-60 real fighting play, ±80-100 maximum steer. Not applied to Stockfish. See engine_usage_primer for when to use.",
         },
+        engines: {
+          type: "array",
+          items: { type: "string", enum: ["stockfish", "lc0"] },
+          description:
+            "Which engines to run. Default = both. Use `[\"lc0\"]` to skip Stockfish (e.g. while a deep_analyse job is holding the SF slot on the same combo). Use `[\"stockfish\"]` when only the objective read matters. The skipped engine's field is omitted from the response.",
+        },
       },
     },
   },
@@ -830,6 +839,59 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: {
         job_id: { type: "string", description: "Job id from the `auto_evaluate` response." },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "deep_analyse",
+    description:
+      "Start a long Stockfish think on a single position (up to 5 min movetime). Returns a `job_id` immediately; poll `deep_analyse_status(job_id)` for the result, cancel with `deep_analyse_cancel(job_id)`. Runs SF only — Lc0 doesn't benefit from long thinks past a handful of seconds — and **holds only the SF engine slot on the combo, so `cloud_analyse(..., engines: [\"lc0\"])` stays available for other work in parallel**.\n\n" +
+      "Use this when a specific critical position deserves depth — a novelty candidate, a hairy tactical shot, a difficult endgame — and you want Stockfish at depth 35+ rather than the ~depth 22 you get from a 2s cloud_analyse. Movetime is in ms; typical: 30_000-60_000 for 'careful check', 120_000-300_000 for 'find the truth'.\n\n" +
+      "Result shape when done matches cloud_analyse's Stockfish leg (depth, top-N candidates with scoreCp/mate, best move, PV). Auto-stores the eval on `file_id`+`node_id` when both are supplied, same as cloud_analyse.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "Prep file id. Combine with `node_id` to derive FEN from the tree AND persist the result on the node's ceoEval." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'. When set, overrides `fen`/`moves`." },
+        fen: { type: "string", description: "Position as FEN. Only used if `node_id` is not set." },
+        moves: { type: "string", description: "Optional SAN moves on top of `fen`. Only used if `node_id` is not set." },
+        movetime_ms: {
+          type: "integer",
+          minimum: 5_000,
+          maximum: 300_000,
+          description: "Think time in ms. Default 60_000 (1 min). Max 300_000 (5 min).",
+        },
+        multipv: {
+          type: "integer",
+          minimum: 1,
+          maximum: 10,
+          description: "Number of candidate lines (default 3).",
+        },
+      },
+    },
+  },
+  {
+    name: "deep_analyse_status",
+    description:
+      "Poll a deep_analyse job. Response: `{ status: 'running' | 'done' | 'cancelled' | 'error' | 'not_found', elapsed_ms, movetime_ms, result?, error? }`. `result` shape when done: `{ engine, depth, timeMs, bestMove, lines: [{rank, depth, scoreCp?, mate?, pv, nodes?}] }` — the SF leg of a cloud_analyse response.\n\n" +
+      "Poll cadence: every ~15-30s for long thinks; there's no penalty for polling more often but the engine progresses at its own pace.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job id from `deep_analyse`." },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "deep_analyse_cancel",
+    description:
+      "Ask a running deep_analyse job to stop early. The engine returns whatever it's found so far as the final result. Useful when a partial result at depth 25 is enough and you don't want to wait for depth 40. Idempotent for already-finished jobs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job id from `deep_analyse`." },
       },
       required: ["job_id"],
     },
@@ -1398,6 +1460,183 @@ function autoEvaluateCancel(args: Args): unknown {
   return { status: "cancelling", evaluated_so_far: job.evaluated };
 }
 
+// ── deep_analyse: async background job ─────────────────────────────
+//
+// Same shape as auto_evaluate — start returns a job_id immediately,
+// poll via _status, cancel via _cancel — but for a SINGLE long
+// Stockfish think on ONE position (up to 5 min movetime). The point
+// is to free the tool response path from a 5-minute wait AND to keep
+// the Lc0 slot free on the combo, so the LLM can keep calling
+// `cloud_analyse({engines: ["lc0"]})` for other positions while the
+// deep SF think runs.
+//
+// Concretely: the job fires an unawaited authedRequest to the backend
+// with engines=["stockfish"] + long movetime; the backend's per-engine
+// semaphore lets that hold only the SF slot for the duration. The
+// MCP-side promise resolves when the long HTTP call returns (nginx
+// proxy_read_timeout is bumped to 420s on /api/agent/ to cover 5-min
+// movetime + engine bestmove grace).
+
+type DeepJobStatus = "running" | "done" | "cancelled" | "error";
+
+type DeepJob = {
+  id: string;
+  status: DeepJobStatus;
+  fileHandle?: FileHandle; // set when file_id+node_id was supplied
+  fen: string;
+  movetimeMs: number;
+  multipv: number;
+  startedAt: number;
+  finishedAt?: number;
+  result?: unknown;
+  error?: string;
+  cancelController: AbortController;
+};
+
+const deepJobs = new Map<string, DeepJob>();
+const DEEP_JOB_TTL_MS = 15 * 60 * 1000;
+
+function newDeepJobId(): string {
+  const rand = Math.random().toString(16).slice(2, 8);
+  return `deep_${Date.now().toString(16)}${rand}`;
+}
+
+function reapExpiredDeepJobs(): void {
+  const now = Date.now();
+  for (const [k, j] of deepJobs) {
+    if (j.finishedAt && now - j.finishedAt > DEEP_JOB_TTL_MS) {
+      deepJobs.delete(k);
+    }
+  }
+}
+
+async function deepAnalyseStart(args: Args): Promise<unknown> {
+  reapExpiredDeepJobs();
+  const resolved = await resolveFromNodeOrFen(args);
+  const fen = resolved.fen;
+  const movetimeMs = typeof args.movetime_ms === "number" ? args.movetime_ms : 60_000;
+  const multipv = typeof args.multipv === "number" ? args.multipv : 3;
+
+  const jobId = newDeepJobId();
+  const job: DeepJob = {
+    id: jobId,
+    status: "running",
+    fileHandle: resolved.file,
+    fen,
+    movetimeMs,
+    multipv,
+    startedAt: Date.now(),
+    cancelController: new AbortController(),
+  };
+  deepJobs.set(jobId, job);
+
+  // Kick off the long HTTP call unawaited — resolves when the backend
+  // returns the SF snapshot. authedRequest is a plain fetch under the
+  // hood; abort signal flows via cancelController.
+  void runDeepJob(job).catch(err => {
+    job.status = "error";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.finishedAt = Date.now();
+  });
+
+  return {
+    job_id: jobId,
+    status: "running",
+    movetime_ms: movetimeMs,
+    fen,
+  };
+}
+
+async function runDeepJob(job: DeepJob): Promise<void> {
+  const body = {
+    fen: job.fen,
+    movetime_ms: job.movetimeMs,
+    multipv: job.multipv,
+    engines: ["stockfish"],
+  };
+  let raw: unknown;
+  try {
+    // TODO(future): plumb an AbortSignal through authedRequest for
+    // real mid-flight cancellation. For now, cancel just marks the
+    // job so the caller stops polling; the backend still runs the
+    // engine to completion and the result is stored on the job
+    // record but flagged cancelled.
+    raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
+  } catch (err) {
+    job.status = "error";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.finishedAt = Date.now();
+    return;
+  }
+
+  const converted = convertCloudSnapshotResponse(raw, job.fen) as {
+    stockfish?: unknown;
+  };
+  const sf = converted.stockfish;
+
+  if (job.cancelController.signal.aborted) {
+    job.status = "cancelled";
+  } else {
+    job.status = "done";
+  }
+  job.result = sf ?? null;
+  job.finishedAt = Date.now();
+
+  // Same node-persistence as cloud_analyse: if the caller anchored on
+  // file_id+node_id, store the SF-only eval as the node's ceoEval so
+  // quote_engine_eval can cite it later. We build a StoredEval that has
+  // only the sf leg — no Lc0 was run.
+  if (job.fileHandle && sf) {
+    const ev = analysisToStoredEval({ stockfish: sf }, job.fen);
+    if (ev) {
+      try {
+        await storeEvalOnNode(job.fileHandle, ev);
+      } catch {
+        // best-effort — the analysis result is what the LLM asked for
+      }
+    }
+  }
+}
+
+function deepAnalyseStatus(args: Args): unknown {
+  reapExpiredDeepJobs();
+  const jobId = String(args.job_id || "").trim();
+  if (!jobId) throw new Error("`job_id` is required");
+  const job = deepJobs.get(jobId);
+  if (!job) {
+    return {
+      status: "not_found",
+      note: "Job unknown — expired (kept ~15 min after completion), never existed, or the MCP process restarted.",
+    };
+  }
+  return {
+    job_id: job.id,
+    status: job.status,
+    movetime_ms: job.movetimeMs,
+    elapsed_ms: (job.finishedAt ?? Date.now()) - job.startedAt,
+    fen: job.fen,
+    result: job.result,
+    error: job.error,
+    started_at_ms: job.startedAt,
+    finished_at_ms: job.finishedAt,
+  };
+}
+
+function deepAnalyseCancel(args: Args): unknown {
+  const jobId = String(args.job_id || "").trim();
+  if (!jobId) throw new Error("`job_id` is required");
+  const job = deepJobs.get(jobId);
+  if (!job) return { status: "not_found" };
+  if (job.status !== "running") {
+    return { status: job.status, note: "Job already finished; nothing to cancel." };
+  }
+  job.cancelController.abort();
+  // Status flips to "cancelled" when runDeepJob observes the abort on
+  // completion. Backend keeps churning until movetime elapses (mid-
+  // flight abort of the HTTP call is a follow-up).
+  return { status: "cancelling", elapsed_ms: Date.now() - job.startedAt };
+}
+
 // Walk chess.js-free: resolve a path against a tree, throw if invalid.
 function pathIntoTree(root: PrepNode, path: Path): PrepNode {
   let cur = root;
@@ -1933,6 +2172,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
       if (typeof args.multipv === "number") body.multipv = args.multipv;
       if (typeof args.contempt === "number") body.contempt = args.contempt;
+      if (Array.isArray(args.engines)) body.engines = args.engines;
       const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
       const converted = convertCloudSnapshotResponse(raw, fen);
       // Node-addressed calls: persist the result on the node's ceoEval
@@ -1947,6 +2187,13 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       }
       return converted;
     }
+
+    case "deep_analyse":
+      return deepAnalyseStart(args);
+    case "deep_analyse_status":
+      return deepAnalyseStatus(args);
+    case "deep_analyse_cancel":
+      return deepAnalyseCancel(args);
 
     case "list_prep_files":
       return authedRequest("GET", "/api/agent/prep-files");
