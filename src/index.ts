@@ -124,6 +124,10 @@ const AUTHED_TOOLS = new Set([
   "auto_evaluate",
   "quote_engine_eval",
   "predict_human_move",
+  "prepare_opponent",
+  "get_prep_position",
+  "list_prep_sessions",
+  "delete_prep_session",
 ]);
 
 function isAuthedToolCall(body: unknown): boolean {
@@ -233,58 +237,84 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "get_player_preparation",
+    name: "prepare_opponent",
     description:
-      "For a given player, colour and starting position, return both the moves the player actually chose (frequency + win rate) and the underlying games. Position is specified either as a move sequence in SAN (`line`) or a raw FEN. Use `line` iteratively to walk the opening tree: call once with empty `line`, pick a move, call again with `line` extended by that move, etc.\n\n" +
-      "GROUNDING: every claim about the opponent's repertoire must trace back to this tool's output. Don't assert 'they play sharply' or 'they hate isolated queen pawn' without pointing at the actual game counts / win rates in the response. Don't invent 'the opponent typically plays X' — check first. Compute is cheap: run this on more branches instead of pattern-matching from a chess book.\n\n" +
-      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` with a compact Stockfish + Lc0 read at the requested position (top move + score + PV) and the corresponding NAG. Do NOT fire a separate cloud_analyse for the same FEN — the eval is right there.\n\n" +
-      "Reading the response — CRITICAL:\n" +
-      "• Win % is one weight, not a verdict. Recommend 1.b3 over 1.d4 because 60% > 50% is wrong. Sample size matters (3 games at 66% is noise; 300 at 55% is signal); avgWhite / avgBlack per move show the rating context (a big score often means a rating gap, not repertoire truth).\n" +
-      "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted; a weak opponent won't patch it, a strong or improving one already has (but structural weaknesses like 'bad in Catalan structures' hold anyway).\n" +
-      "• Recency > career. The last 12-24 months dominate. This endpoint's compact/LLM view deliberately omits per-move `fashionScore` — at the individual level it's trailing noise. The general DB endpoint (`get_position_stats`) keeps it, where it's real fashion signal (what the top field is playing this month).\n" +
-      "• Opponent will deviate early. Prep is a tree, not a line — cover the 2 most likely replies at each real branching point, not one 20-move line.\n" +
-      "• Surprise is a scalpel. Don't tell a lifelong 1.e4 player to switch to 1.d4 — meta-signal screams prep. Rare secondary lines within the user's existing repertoire (e.g. 6.Bc4 instead of usual 6.Bg5 vs the Najdorf) are where surprise is real.\n\n" +
-      "For the full guide call the `read_prep_strategy_guide` tool.",
+      "Create a prep SESSION combining games from one or more sources — FIDE database, Chess.com account, Lichess account — with optional filters (colour, date range, time control). Returns a session `token` you pass to `get_prep_position` to query stats at any position within that filtered corpus.\n\n" +
+      "This is the main opponent-prep tool. Use it whenever a user asks 'prep me against X' — call once with the right sources+filters, then walk the tree with `get_prep_position(session_token, ...)`. Sessions are cached on the server (list existing ones with `list_prep_sessions` to avoid rebuilding).\n\n" +
+      "SOURCES (1-10 per call, combined into one gameset):\n" +
+      "- `fide` — needs `fideId`. Optional filters: `color`, `startMonth`/`endMonth`, `timeControl` (`classical`|`rapid`|`blitz`), `excludeOnline`.\n" +
+      "- `chesscom` — needs `username`. Filters: `color`, `startMonth`/`endMonth` (**required** for chesscom/lichess), `timeControl`.\n" +
+      "- `lichess` — needs `username`. Same filters as chesscom; `timeControl` also accepts `bullet` on Lichess.\n\n" +
+      "Multi-source example: one player with both a FIDE ID and a Lichess account → two sources in one call, all their games combined into one session.\n\n" +
+      "GROUNDING: every claim about the opponent's repertoire must trace back to a `get_prep_position` call on this session. Don't assert 'they play sharply' or 'they hate isolated queen pawn' without pointing at actual game counts / win rates in the response. Prep is a two-player game — see `read_prep_strategy_guide` before recommending an opening plan.",
     inputSchema: {
       type: "object",
       properties: {
-        fide_id: { type: "integer", description: "FIDE ID from search_player." },
-        color: {
-          type: "string",
-          enum: ["white", "black"],
-          description: "Which colour the player is analysed with.",
+        sources: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          description: "1-10 game sources, all combined into one filtered session.",
+          items: {
+            type: "object",
+            properties: {
+              type:        { type: "string", enum: ["fide", "chesscom", "lichess"], description: "Source type." },
+              fide_id:     { type: "integer", description: "FIDE ID (required for type='fide')." },
+              username:    { type: "string",  description: "Platform username (required for type='chesscom'/'lichess')." },
+              color:       { type: "string",  enum: ["white", "black"], description: "Filter: only games where this side is played by the source player. Omit for both colours." },
+              start_month: { type: "string",  pattern: "^\\d{4}/\\d{2}$", description: "Filter: games from this month onwards, format 'YYYY/MM'. **Required** for chesscom/lichess." },
+              end_month:   { type: "string",  pattern: "^\\d{4}/\\d{2}$", description: "Filter: games up to this month, format 'YYYY/MM'. **Required** for chesscom/lichess." },
+              time_control: { type: "string", enum: ["classical", "rapid", "blitz", "bullet"], description: "Filter: only this time control. `bullet` is Lichess-only." },
+              exclude_online: { type: "boolean", description: "FIDE-only: exclude online-flagged games (default false)." },
+            },
+            required: ["type"],
+          },
         },
-        file_id: {
-          type: "string",
-          description: "Prep file id to address the position from. Combine with `node_id` — the server derives the FEN from the tree, so you don't paste a FEN string. **Prefer this over `fen`/`line`/`moves` when a prep file is open.**",
-        },
-        node_id: {
-          type: "string",
-          description: "Node id inside `file_id` whose position to query. Root is 'r'. When set, overrides `fen`/`line`/`moves`.",
-        },
-        line: {
-          type: "string",
-          description:
-            "Move sequence in SAN from the starting position, space-separated, no move numbers required. Example: 'e4 e5 Nf3'. Leave empty for startpos. Alias: `moves` (same thing). Only used if `node_id` is not set.",
-        },
-        moves: {
-          type: "string",
-          description:
-            "SAN moves to apply on top of `fen` (or on top of startpos if no fen). Same shape as `line`. Wins over `line` if both are set. Only used if `node_id` is not set.",
-        },
-        fen: {
-          type: "string",
-          description: "Starting position as FEN. Combine with `moves` to walk from there, or use alone. Only used if `node_id` is not set.",
-        },
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 10,
-          description: "Number of games to return (max 10 per request; page with offset).",
-        },
+      },
+      required: ["sources"],
+    },
+  },
+  {
+    name: "get_prep_position",
+    description:
+      "Query one position within a prep session created by `prepare_opponent`. Returns move statistics (frequency + win rate + last-played date per move) plus the actual games played from that position, in one call.\n\n" +
+      "Position input: prefer `file_id`+`node_id` when inside a prep file (server derives FEN from the tree). Otherwise pass `fen`.\n\n" +
+      "AUTO-EVAL: if a cloud combo instance is running, the response includes `.eval` (Stockfish + Lc0 read at the position) so you don't need a separate cloud_analyse.\n\n" +
+      "Reading the response — CRITICAL:\n" +
+      "• Win % is one weight, not a verdict. Sample size matters (3 games at 66% is noise; 300 at 55% is signal).\n" +
+      "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted.\n" +
+      "• Recency > career. The last 12-24 months dominate — filter your session with `start_month` if the player's repertoire shifted.\n" +
+      "• Opponent will deviate early. Prep is a tree — cover the 2 most likely replies at each real branching point, not one 20-move line.\n\n" +
+      "For the full guide call `read_prep_strategy_guide`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_token: { type: "string", description: "Session token from `prepare_opponent`." },
+        file_id: { type: "string", description: "Prep file id — combine with `node_id` for tree-addressed position lookup." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'. When set, overrides `fen`." },
+        fen: { type: "string", description: "Position as FEN. Only used if `node_id` is not set." },
+        limit: { type: "integer", minimum: 1, maximum: 50, description: "Games to return (default 10)." },
         offset: { type: "integer", minimum: 0 },
       },
-      required: ["fide_id", "color"],
+      required: ["session_token"],
+    },
+  },
+  {
+    name: "list_prep_sessions",
+    description:
+      "List the caller's active prep sessions with their tokens and metadata. Call this BEFORE `prepare_opponent` to reuse an existing session instead of rebuilding — sessions cost real backend work for chesscom/lichess (downloading months of games), so re-using saves time. Response includes source description, game count, and creation time per session.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "delete_prep_session",
+    description:
+      "Delete one prep session by token. Free-form cleanup — sessions do expire automatically, but this is useful when you're done with one or when you want to force a rebuild after upstream data changed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_token: { type: "string", description: "Token from `list_prep_sessions` or the response of `prepare_opponent`." },
+      },
+      required: ["session_token"],
     },
   },
   {
@@ -557,7 +587,7 @@ const TOOLS: Tool[] = [
     description:
       "Read one prep file. Returns a compact tree (each node carries a stable `id`, `san`, `fen`, `ply`, optional `comment`/`nags`/`annotations`/`ceoEval`, and `children`) plus tags and the `version` for optimistic locking on subsequent mutations. NO raw PGN — all edits go through the mutation tools (add_move / add_line / set_comment / set_nags / set_annotations / delete_subtree / promote_variation / set_tag), which validate SAN and structure for you.\n\n" +
       "**Node addressing.** Every node has a stable `id` — root is `'r'`, every other node is an 8-hex-char content hash derived from its parent's id + its SAN. Sibling insertions, deletions and variation promotions do NOT change any other node's id. Pass this id as `node_id` (or `parent_id` for add_move / add_line) to every mutation and engine/DB tool.\n\n" +
-      "**Every engine/DB tool accepts `file_id`+`node_id`** (get_position_stats, cloud_analyse, describe_position, predict_human_move, prep_snapshot, get_player_preparation, quote_engine_eval). Use it whenever a file is open — the server derives the FEN from the tree, so you can't 'analyse the wrong position' by mis-typing a FEN.",
+      "**Every engine/DB tool accepts `file_id`+`node_id`** (get_position_stats, cloud_analyse, describe_position, predict_human_move, prep_snapshot, get_prep_position, quote_engine_eval). Use it whenever a file is open — the server derives the FEN from the tree, so you can't 'analyse the wrong position' by mis-typing a FEN.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1419,6 +1449,41 @@ function resolveFenFromArgs(args: Args): string {
   return board.fen();
 }
 
+// Normalize one MCP `prepare_opponent` source into the shape the backend's
+// /api/chess/prep/prepare-multi expects. Handles two impedance mismatches:
+//   - snake_case → camelCase (fide_id → fideId, start_month → startMonth, etc.)
+//   - the unified `time_control` string → per-source-type filter:
+//       * fide / chesscom → timeFormats: ["Classical" | "Rapid" | "Blitz"]
+//       * lichess → perfType: "classical" | "rapid" | "blitz" | "bullet"
+// Backend validates required fields per source type, so we don't need to
+// pre-reject missing username/fideId here — it'll come back as a 400 the
+// LLM can act on.
+function normalizeSourceForBackend(src: Record<string, unknown>, idx: number): Record<string, unknown> {
+  const type = typeof src.type === "string" ? src.type : "";
+  if (type !== "fide" && type !== "chesscom" && type !== "lichess") {
+    throw new Error(`sources[${idx}].type must be one of fide|chesscom|lichess (got ${JSON.stringify(src.type)})`);
+  }
+  const out: Record<string, unknown> = { type };
+  if (typeof src.fide_id === "number") out.fideId = src.fide_id;
+  if (typeof src.username === "string" && src.username.trim() !== "") out.username = src.username.trim();
+  if (typeof src.color === "string" && (src.color === "white" || src.color === "black")) out.color = src.color;
+  if (typeof src.start_month === "string" && src.start_month.trim() !== "") out.startMonth = src.start_month.trim();
+  if (typeof src.end_month === "string" && src.end_month.trim() !== "") out.endMonth = src.end_month.trim();
+  if (typeof src.exclude_online === "boolean") out.excludeOnline = src.exclude_online;
+
+  const tc = typeof src.time_control === "string" ? src.time_control : "";
+  if (tc) {
+    if (type === "lichess") {
+      out.perfType = tc;
+    } else {
+      // fide + chesscom take a titlecased timeFormats array.
+      const titled = tc.charAt(0).toUpperCase() + tc.slice(1);
+      out.timeFormats = [titled];
+    }
+  }
+  return out;
+}
+
 // Handle to a loaded prep-file when an engine/DB tool was called with
 // file_id+node_id. Carries enough state to (a) know which FEN to query,
 // and (b) write ceoEval back onto the node without another parse.
@@ -1527,31 +1592,44 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "get_player_profile":
       return get("/api/chess/players/profile", { fideId: Number(args.fide_id) });
 
-    case "get_player_preparation": {
-      // Node-first: if file_id+node_id was given, derive the FEN from the
-      // tree (never trust an LLM-supplied FEN when a node reference is
-      // available). Otherwise fall back to fen/moves/line.
+    case "prepare_opponent": {
+      const rawSources = Array.isArray(args.sources) ? args.sources : [];
+      if (rawSources.length === 0) throw new Error("`sources` array required");
+      const sources = rawSources.map((s, i) => normalizeSourceForBackend(s as Record<string, unknown>, i));
+      return authedRequest("POST", "/api/chess/prep/prepare-multi", { sources });
+    }
+
+    case "get_prep_position": {
+      const token = String(args.session_token || "").trim();
+      if (!token) throw new Error("`session_token` required — create one with prepare_opponent");
       const resolved = await resolveFromNodeOrFen(args);
-      const effectiveFen = resolved.fen;
-      const params: Record<string, string | number | undefined> = {
-        fideId: Number(args.fide_id),
-        color: String(args.color),
-        compact: "true",
-        fen: effectiveFen,
+      const fen = resolved.fen;
+      const qs: Record<string, string | number | undefined> = {
+        token,
+        fen,
+        limit: typeof args.limit === "number" ? args.limit : 10,
       };
-      if (typeof args.limit === "number") params.limit = args.limit;
-      if (typeof args.offset === "number") params.offset = args.offset;
+      if (typeof args.offset === "number") qs.offset = args.offset;
       const [raw, ev] = await Promise.all([
-        get("/api/chess/prep/by-player", params),
-        fetchCompactEval(effectiveFen),
+        get("/api/chess/prep/unified", qs),
+        fetchCompactEval(fen),
       ]);
-      const converted = convertAvailableMovesToSAN(raw, effectiveFen);
+      const converted = convertAvailableMovesToSAN(raw, fen);
       if (converted && typeof converted === "object") {
         trimGamesMovetext(converted);
         stripPositionResponse(converted);
         if (ev) (converted as { eval?: CompactEval }).eval = ev;
       }
       return converted;
+    }
+
+    case "list_prep_sessions":
+      return authedRequest("GET", "/api/chess/prep/sessions");
+
+    case "delete_prep_session": {
+      const token = String(args.session_token || "").trim();
+      if (!token) throw new Error("`session_token` required");
+      return authedRequest("DELETE", `/api/chess/prep/sessions/${encodeURIComponent(token)}`);
     }
 
     case "get_position_stats": {
@@ -1875,7 +1953,7 @@ Preparation workflow — follow the steps in order and be explicit about which t
    - Rapid and blitz reveal what they play under time pressure but may include experiments.
    - Online games are useful but noisier (blitz gambits, alt accounts).
 
-4. **Walk the opponent's repertoire against ${me}'s color.** Call \`get_player_preparation\` on the opponent for the color they'll have in this game. Iterate: start from move 1, pick the opponent's most-played reply, call again with \`line\` extended. Look for:
+4. **Walk the opponent's repertoire against ${me}'s color.** Call \`prepare_opponent\` once with the opponent's FIDE ID (add \`chesscom\` / \`lichess\` sources if you know their handles), filtered to the color they'll have in this game — plus \`start_month\` (last 12-24 months) and \`time_control: "classical"\` if you want the strongest signal. That returns a session \`token\`. Then walk the tree with \`get_prep_position(session_token=token, node_id="r")\`, pick the opponent's most-played reply, call again as you descend. Look for:
    - **Weak lines**: variations where the opponent scores below 40% as their side.
    - **Shallow lines**: openings the opponent has played only a few times — probably less deeply prepared.
    - **Abandoned lines**: openings they used to play but stopped. Something went wrong; may not want to revisit.
@@ -1924,7 +2002,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
 1. \`search_player\` to get their FIDE ID.
 2. \`get_player_profile\` — pull rating history, career splits by color and time control, opening repertoire, opponent analysis, top events, notable wins and losses.
 3. Weight the data: recent (last 12-24 months) > older, classical OTB > rapid/blitz > online.
-4. \`get_player_preparation\` for both colors from the starting position to summarise their opening choices with actual frequencies and win rates.
+4. \`prepare_opponent\` twice (once per colour, or once with two sources), then \`get_prep_position(session_token, node_id="r")\` to summarise their opening choices with actual frequencies and win rates. Filter with \`start_month\` if you only care about their current repertoire.
 5. Deliver: current strength, characteristic openings, one-sentence style read, biggest wins, biggest losses / recurring weakness. Cite the numbers.`;
       break;
     }
