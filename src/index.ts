@@ -391,14 +391,11 @@ const TOOLS: Tool[] = [
   {
     name: "predict_human_move",
     description:
-      "Predicts what a HUMAN of the given rating will most likely play from a position. Rating-conditioned neural net (ResNet-20x256) — you get the top-N most likely moves with their probabilities and a WDL value head (White POV).\n\n" +
-      "This is a completely different question from the engine tools (analyse / cloud_analyse):\n" +
-      "• Engines answer: 'what is objectively best?'\n" +
-      "• predict_human_move answers: 'what will my 2200-rated opponent actually play here?'\n\n" +
-      "Prime use cases in prep:\n" +
-      "• After you've found what the opponent SHOULD do (with the engine), check what they'll ACTUALLY do at their rating. If the top human move is a mistake, you have a real practical advantage.\n" +
-      "• The WDL head is rating-aware — a 400-point gap will show up as a big win probability even in equal positions (the model has learned that human errors compound).\n" +
-      "• Pass `prev_fen` (most recent first) when analysing mid-trade positions — without history the model treats the position as quiet.\n\n" +
+      "Rating-conditioned neural net (ResNet-20x256). Returns two things — both are useful, treat them as separate signals:\n\n" +
+      "1. **Top-N most likely moves** (`moves: [{san, p}, ...]`) — 'what will a player of this rating actually pick here'. Different question from engines: cloud_analyse tells you objective best, this tells you what the opponent will play. If the human top move is a mistake, that's a real practical advantage worth building prep around.\n\n" +
+      "2. **`wdlWhitePov: {win, draw, loss}`** — game-outcome prediction, rating-aware, White POV. Directly comparable across positions. This is how you answer 'which of these lines is drawier / more forcing at this level' — call on two positions, compare the `draw` component. Example: `0-0 Nxe4 Re1` (Berlin main line, ~50% draw at 2600) vs `4.d3 d6` (Italian, ~30% draw at 2600) — you can quantify the intuition instead of guessing. Useful when the user asks 'must-win with Black, which of these two openings gives more play'.\n\n" +
+      "Rating effect: a 400-point gap widens win probability even in equal positions — the model has learned that human errors compound. Same knob works both ways: prep for a lower opponent → bump the win prediction; verify a drawish line still gives Black chances at 2200 → set both elos to 2200 and check the draw share.\n\n" +
+      "Pass `prev_fen` (most recent first) when the position is mid-trade — without history the model treats it as quiet, which under-counts practical chances.\n\n" +
       "Position input: prefer `file_id`+`node_id` when inside a prep file. Otherwise `fen`, `moves` from startpos, or `fen + moves`. Default rating 2400 both sides. ~1-2s per call. **Premium (or admin/moderator) only** — anonymous calls get 402.",
     inputSchema: {
       type: "object",
