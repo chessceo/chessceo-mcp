@@ -274,7 +274,19 @@ set_nags(id, path, ["$14"])
 
 ## Visual annotations (arrows + coloured squares)
 
-`set_annotations(id, path, {arrows, highlights})` sets both together (an atomic replacement — pass both current and new). Passing empty arrays clears.
+**Use them.** An arrow says what a sentence would. If a comment mentions a move, a plan, a square, a target — draw it. The reader sees the board; a green f2→f4 arrow replaces "White's plan is to break with f4"; a red square on h6 replaces "Black's weak point is h6". Annotations are the fastest LLM→reader channel we have.
+
+**When to reach for one (any of these triggers → add):**
+
+- Naming a pawn break in prose → arrow from the pawn to its target square (`green` for your break, `red` for the opponent's).
+- Naming a plan involving specific moves (castle long, Nc4-a5, Bxh6) → arrow(s) for the piece routes.
+- Naming a key square / weak square / target → highlight (`green` = key square for you, `red` = weak square you exploit or that Black attacks).
+- Naming a piece under pressure or a piece that will become the target → highlight the square it's on.
+- Showing multiple candidate moves in one comment → arrow per candidate, different colours.
+
+If the comment could be *replaced* by two arrows and a highlighted square, then the arrows + squares alone are better and the prose is redundant. Try that direction first.
+
+`set_annotations(id, node_id, {arrows, highlights})` sets both together — atomic replacement, pass both current and new. Empty arrays clear.
 
 Colours (both arrows and squares): `green`, `red`, `yellow`, `light-blue`, `dark-blue`, `orange`.
 
@@ -289,7 +301,7 @@ Usage conventions:
 | dark-blue  | Alternative / secondary idea                   |
 | orange     | Attention / warning                            |
 
-**Keep it light.** 1–3 arrows per node and 2–3 highlighted squares is plenty. Twenty arrows is noise, not signal — pick the most important ones. Highlights are labels, not decoration.
+**Keep it light.** 1–3 arrows per node and 2–3 highlighted squares is plenty. Twenty arrows is noise. Highlights are labels, not decoration. **But zero arrows on a strategic branch-point comment is usually a miss** — if the comment names a plan, a break, a square, or a piece, the corresponding annotation almost certainly exists and is worth adding.
 
 Example:
 ```
