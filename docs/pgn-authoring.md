@@ -40,7 +40,8 @@ All mutations **auto-save** with optimistic locking. Response includes the new `
 
 ## Typical build order
 
-1. `read_prep_file` — see what's there. Every node has an `id` you'll pass to the mutation and engine/DB tools.
+0. **`read_example_prep_files`** — do this once per session, before writing any prose. Not optional. Log analysis shows most sessions skip this and produce documented anti-patterns (long PVs in prose, restating what the app renders, verbose citations). Reading the two bundled reference files once inoculates the LLM against those.
+1. `read_prep_file` — see what's there. Every node has an `id` you'll pass to the mutation and engine/DB tools. Use `view: "compact"` (default) plus `node_id` + `max_depth` to scope; the full tree of a 500+-node file can blow the token limit.
 2. `apply_mutations([...])` — one call with your whole intended build (a mix of `add_move` / `add_line` for structure, plus any `set_comment`/`set_annotations` you already know at author time, plus any `set_nags` where you already have a clear judgment — novelty `$146`, `!?` speculative sac, obvious `?` blunder in a sideline you're rejecting).
 3. `auto_evaluate(id)` — spawns a background job that PERSISTS engine numbers on every node. Does not touch visible NAGs. Cheap way to get every position's Stockfish + Lc0 read baked into the file for later reference. Grab the returned `job_id` and either (a) poll `auto_evaluate_status(job_id)` every ~10-30s until done, or (b) fire and do useful work meanwhile (write more of the tree, walk the opponent's repertoire) and check back later — engine walk-time serialises on the per-combo semaphore, so it takes roughly `target_count × movetime_ms` in wall time.
 4. Once the job reports `done:true`, re-read the file and add NAGs where they carry real signal (see NAG discipline below). Use individual mutation tools for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).

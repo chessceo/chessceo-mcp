@@ -1042,9 +1042,9 @@ const TOOLS: Tool[] = [
   {
     name: "read_example_prep_files",
     description:
-      "Returns two full reference PGNs authored by a strong human coach — one a general opening overview (Italian Fried Liver, both sides, 1600+ audience) and one a one-sided repertoire (Najdorf 6.f4 for White, 2200+ audience). Bundled with the MCP; not the user's files.\n\n" +
-      "Read these ONCE per session before writing your first substantial prep file. The authoring guide (read_pgn_authoring_guide) tells you the rules; these examples show you what the rules look like when applied by someone who knows what they're doing — comment density, when to cite games by player name, how to use `$146` / `$3` / `$44` sparingly and correctly, when a bare `[%csl Rf7]` says everything, how to acknowledge transpositions, how to phrase practical guidance vs objective evaluation. Study the rhythm before writing your own.\n\n" +
-      "Response: `{ overview: <pgn>, repertoire: <pgn> }`. Raw PGN — comments, arrows, NAGs, and stored evals all intact.",
+      "**CALL WHEN**: about to write ANY prose commentary in a prep file, ever. Even one comment. Even one variation. This is not optional and not once-per-project — call it early in the session and read the examples before your first `set_comment` or `apply_mutations` batch that includes comments. Log analysis showed <5% of sessions call this despite it being the single biggest quality lift documented in this MCP; that's the mistake this description is trying to fix.\n\n" +
+      "Why: `read_pgn_authoring_guide` tells you the rules in prose. These files show you the *sound* of them applied by a strong human coach — comment density (short and load-bearing, not verbose), how citations look in-line (`WeiYi-Svidler` not `\"Svidler's choice at the FIDE World Blitz Team, June 2026\"`), when `$146` / `$3` / `$44` earn their place, when a bare `[%csl Rf7]` says everything a sentence would say. LLMs default to florid, restate-what's-visible commentary; reading these once inoculates against that.\n\n" +
+      "Two files bundled with the MCP (not the user's own): one general opening overview (Italian Fried Liver, both sides, 1600+ audience) and one one-sided repertoire (Najdorf 6.f4 for White, 2200+ audience). Response: `{ overview: <pgn>, repertoire: <pgn> }` — raw PGN with comments, arrows, NAGs, stored evals intact.",
     inputSchema: { type: "object", properties: {} },
   },
   {

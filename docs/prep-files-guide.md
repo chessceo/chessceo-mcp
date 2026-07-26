@@ -31,6 +31,10 @@ Every mutation call takes a `node_id` (or `parent_id` for add-style ops) and aut
 
 Duplicate files are the #1 way to lose your user's trust in this system.
 
+## Before writing any prose: read the examples
+
+**Call `read_example_prep_files` early in the session, before your first `set_comment` or comment-carrying `apply_mutations` batch.** Not once per project — once per LLM session. It returns two reference PGNs by a strong human coach and is the single biggest quality lift documented in this MCP; log analysis shows <5% of sessions call it and the ones that don't produce the exact anti-patterns the authoring guide warns against. Reading the two files takes one tool call and inoculates against most commentary failure modes.
+
 ## PGN authoring — separate concern
 
 Everything about **how to write good PGN** (structure, NAGs, arrows, coloured squares, variation discipline, common pitfalls) lives in `pgn-authoring.md` — call `read_pgn_authoring_guide` for the full doc. That guide is universal to any chess file you might write; this guide is about the prep-files *feature* on top.
