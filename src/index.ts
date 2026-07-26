@@ -520,7 +520,7 @@ const TOOLS: Tool[] = [
   {
     name: "cloud_analyse",
     description:
-      "Runs a synchronous ~2s analysis on the user's running combo instance and returns both Stockfish and Lc0's final read for the FEN — depth, top-N candidate moves with scores (centipawns from side-to-move POV, or mate distance), and each engine's principal variation.\n\n" +
+      "Runs a synchronous ~2s analysis on the user's running combo instance and returns both Stockfish and Lc0's final read for the FEN — depth, top-N candidate moves with scores (**scoreCp is White-POV centipawns**: +20 = White is +0.20 pawns better regardless of whose turn it is; matches the sign convention used everywhere else in this MCP, including the stored ceoEval). Mate is White-POV plies-to-mate (+5 = White mates in 5). Also returns each engine's principal variation.\n\n" +
       "GROUNDING: every claim you make about a position must trace back to actual engine output from a call in THIS session. Don't invent evaluations, don't name 'best moves' you haven't seen the engine list, don't fabricate variations that 'look plausible.' Compute is cheap — call this 5-10 times while walking a tree rather than pattern-matching from your training data. When you don't have data for the position, either run the tool or say so; don't fill the gap with chess prose the user can't distinguish from measured output.\n\n" +
       "Auto-picks the caller's only running combo instance; errors clearly if there are zero (start one first with start_cloud_engine) or more than one (destroy the extras first).\n\n" +
       "How to read the response:\n" +
