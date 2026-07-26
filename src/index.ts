@@ -111,6 +111,7 @@ const AUTHED_TOOLS = new Set([
   "list_prep_files",
   "search_prep_files",
   "read_prep_file",
+  "list_nodes",
   "create_prep_file",
   "delete_prep_file",
   "add_move",
@@ -600,15 +601,49 @@ const TOOLS: Tool[] = [
   {
     name: "read_prep_file",
     description:
-      "Read one prep file. Returns a compact tree (each node carries a stable `id`, `san`, `fen`, `ply`, optional `comment`/`nags`/`annotations`/`ceoEval`, and `children`) plus tags and the `version` for optimistic locking on subsequent mutations. NO raw PGN — all edits go through the mutation tools (add_move / add_line / set_comment / set_nags / set_annotations / delete_subtree / promote_variation / set_tag), which validate SAN and structure for you.\n\n" +
-      "**Node addressing.** Every node has a stable `id` — root is `'r'`, every other node is an 8-hex-char content hash derived from its parent's id + its SAN. Sibling insertions, deletions and variation promotions do NOT change any other node's id. Pass this id as `node_id` (or `parent_id` for add_move / add_line) to every mutation and engine/DB tool.\n\n" +
+      "Read one prep file. Response always includes `id`, `version`, `tags`. The tree/PGN part is controlled by `view` and `node_id`/`max_depth` — large files (500+ nodes) can otherwise blow the LLM's token limit.\n\n" +
+      "**Views** (pick the smallest one that answers your question):\n" +
+      "  • `compact` (default) — per-node: `id`, `san`, `ply`, `nags`, `comment`, `ceoEval`, `children`. Drops `fen` and `annotations`. Typical size: ~120 chars/node vs ~330 in `full`.\n" +
+      "  • `full` — everything (`fen`, `annotations` too). Use when you actually need the FEN inline or want to inspect arrows/highlights. On a 500+-node file this can exceed token limits.\n" +
+      "  • `spine` — mainline only (children[0] recursively). Great for a 'what does this repertoire cover' summary.\n" +
+      "  • `pgn` — subtree as raw PGN text (comments, NAGs, [%cal] arrows all preserved). Useful for sanity-checking formatting against reference material.\n\n" +
+      "**Node addressing.** Every node has a stable `id` — root is `'r'`, every other node is an 8-hex-char content hash of parent-id + SAN. Sibling insertions, deletions, variation promotions never shift ids. Pass as `node_id` (or `parent_id` for add_move / add_line) to every mutation and engine/DB tool.\n\n" +
+      "**Scoping.** `node_id` starts the tree from a subtree root (default `'r'`). `max_depth` caps the tree at that many plies below the anchor (default unlimited). Use both to drill into a specific branch without dumping the whole file — the LLM never needs to see the full 800-node tree at once.\n\n" +
+      "For querying the tree without reading it (\"which nodes have no ceoEval?\", \"give me the mainline spine\") call `list_nodes` — cheaper than parsing a full read.\n\n" +
       "**Every engine/DB tool accepts `file_id`+`node_id`** (get_position_stats, cloud_analyse, describe_position, predict_human_move, prep_snapshot, get_prep_position, quote_engine_eval). Use it whenever a file is open — the server derives the FEN from the tree, so you can't 'analyse the wrong position' by mis-typing a FEN.",
     inputSchema: {
       type: "object",
       properties: {
-        id: { type: "string", description: "Prep file id, from list_prep_files or search_prep_files." },
+        id:        { type: "string", description: "Prep file id, from list_prep_files or search_prep_files." },
+        view:      { type: "string", enum: ["compact", "full", "spine", "pgn"], description: "Response shape. Default `compact` — drops fen + annotations to keep token count sane. See tool description for when to use each." },
+        node_id:   { type: "string", description: "Subtree root (default `'r'` = whole file)." },
+        max_depth: { type: "integer", minimum: 0, description: "Cap the returned tree at this many plies below `node_id`. Omit for unlimited." },
       },
       required: ["id"],
+    },
+  },
+  {
+    name: "list_nodes",
+    description:
+      "Cheap tree queries without reading the whole file. Returns only the node ids matching the filter (plus san, ply, and any filter-specific bits), so the LLM can find what it needs in ~KBs instead of MBs.\n\n" +
+      "Filters:\n" +
+      "  • `missing_eval` — nodes without a stored `ceoEval`. Use before `auto_evaluate` to know how much work is left, or to target a small batch.\n" +
+      "  • `has_comment` — nodes with a text comment. Use to audit what's been annotated.\n" +
+      "  • `has_annotations` — nodes with arrows or highlighted squares.\n" +
+      "  • `mainline` — the spine (children[0] recursively). Use for a compact 'what does the repertoire cover' view.\n" +
+      "  • `novelties` — nodes carrying the `$146` NAG.\n" +
+      "  • `leaves` — nodes with no children (variation endpoints). Useful for finding lines that need continuation.\n" +
+      "  • `all` — every node id. Use only when you really need the whole list.\n\n" +
+      "Response: `{ file_id, filter, count, nodes: [{node_id, san, ply, ...}] }`. `...` is filter-specific — e.g. `has_comment` includes the first 80 chars of the comment; `missing_eval` includes nothing extra (just the addressing).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id:       { type: "string", description: "Prep file id." },
+        filter:   { type: "string", enum: ["missing_eval", "has_comment", "has_annotations", "mainline", "novelties", "leaves", "all"], description: "Which nodes to list." },
+        node_id:  { type: "string", description: "Subtree root (default `'r'` = whole file)." },
+        max_depth:{ type: "integer", minimum: 0, description: "Cap the walk at this many plies below `node_id`. Omit for unlimited." },
+      },
+      required: ["id", "filter"],
     },
   },
   {
@@ -1280,7 +1315,9 @@ type EvalJob = {
   targetCount: number;
   evaluated: number;
   errored: number;              // nodes where cloud_analyse threw — kept going
+  failedNodeIds: string[];      // exact node_ids that failed; ready for targeted retry
   error?: string;               // fatal error that terminated the job
+  abortedReason?: string;       // e.g. "engine died — 3 consecutive failures"
   finalVersion?: number;
   startedAt: number;
   finishedAt?: number;
@@ -1362,6 +1399,7 @@ async function autoEvaluate(args: Args): Promise<unknown> {
       targetCount: 0,
       evaluated: 0,
       errored: 0,
+      failedNodeIds: [],
       finalVersion: g.version,
       startedAt: Date.now(),
       finishedAt: Date.now(),
@@ -1378,6 +1416,7 @@ async function autoEvaluate(args: Args): Promise<unknown> {
     targetCount: targets.length,
     evaluated: 0,
     errored: 0,
+    failedNodeIds: [],
     startedAt: Date.now(),
     cancelled: false,
   };
@@ -1429,8 +1468,16 @@ async function runEvalJob(
     pending.length = 0;
   };
 
+  // Consecutive-failure abort. If N cloud_analyse calls in a row error,
+  // the engine is almost certainly dead (vanished contract, network to
+  // VastAI down) and burning through the rest of the tree just wastes
+  // time. Bail with an explicit reason so a targeted retry is possible.
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  let consecutiveFailures = 0;
+  let aborted = false;
+
   for (const t of targets) {
-    if (job.cancelled) break;
+    if (job.cancelled || aborted) break;
     try {
       const analysis = await authedRequest(
         "POST",
@@ -1441,13 +1488,23 @@ async function runEvalJob(
       if (ev) {
         pending.push({ op: "set_ceo_eval", node_id: t.nodeId, ceoEval: ev });
         job.evaluated++;
+        consecutiveFailures = 0;
       } else {
         job.errored++;
+        job.failedNodeIds.push(t.nodeId);
+        consecutiveFailures++;
       }
     } catch {
-      // Per-node failure — record and continue; a bad FEN or a transient
-      // engine hiccup on one node shouldn't kill the whole walk.
+      // Per-node failure — record the node_id so the caller can retry
+      // just those, and count consecutive failures for the abort check.
       job.errored++;
+      job.failedNodeIds.push(t.nodeId);
+      consecutiveFailures++;
+    }
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      aborted = true;
+      job.abortedReason = `aborted after ${MAX_CONSECUTIVE_FAILURES} consecutive cloud_analyse failures — check that the cloud combo is still running (list_cloud_engines)`;
+      break;
     }
     if (pending.length >= SAVE_EVERY_N) {
       try {
@@ -1492,6 +1549,8 @@ function autoEvaluateStatus(args: Args): unknown {
     target_count: job.targetCount,
     evaluated: job.evaluated,
     errored: job.errored,
+    failed_node_ids: job.failedNodeIds,        // exact ids for targeted retry — pass as node_id list or check with list_nodes
+    aborted_reason: job.abortedReason,          // present when the job stopped early due to consecutive engine failures
     remaining: Math.max(0, job.targetCount - job.evaluated - job.errored),
     done: job.status !== "running",
     error: job.error,
@@ -1974,6 +2033,182 @@ async function applyMutation(
   };
 }
 
+// ── read_prep_file / list_nodes ────────────────────────────────────
+//
+// Split out of the case handler because both need the same load-parse
+// pipeline and to keep the compact / spine / pgn views centralised.
+// The whole point of these two tools: don't force the LLM to dump the
+// entire tree when it wants a slice — a 500-node file can already
+// exceed the context window in `full` view.
+
+type ViewMode = "compact" | "full" | "spine" | "pgn";
+
+async function loadPrepFile(id: string): Promise<{ file: PrepFile; version: number | undefined; fileIdEcho: string | undefined; pgn: string }> {
+  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
+  const g = raw as { pgnContent?: string; version?: number; id?: string };
+  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+  return { file: parsePGN(g.pgnContent), version: g.version, fileIdEcho: g.id, pgn: g.pgnContent };
+}
+
+// Recursively project a PrepNode into the requested view. `depthLeft`
+// null → unlimited; 0 → just the node without children.
+function projectNode(node: PrepNode, view: ViewMode, depthLeft: number | null): unknown {
+  const base: Record<string, unknown> = {
+    id: node.id,
+    san: node.san,
+    ply: node.ply,
+  };
+  if (node.nags && node.nags.length > 0) base.nags = node.nags;
+  if (node.comment) base.comment = node.comment;
+  if (node.ceoEval) base.ceoEval = node.ceoEval;
+  if (view === "full") {
+    base.fen = node.fen;
+    if (node.annotations) base.annotations = node.annotations;
+  }
+  // Children handling depends on view + depth budget.
+  const showChildren = depthLeft === null || depthLeft > 0;
+  const childDepth = depthLeft === null ? null : depthLeft - 1;
+  if (showChildren && node.children.length > 0) {
+    if (view === "spine") {
+      // Only follow children[0] — collapses the tree to the mainline.
+      base.children = [projectNode(node.children[0], view, childDepth)];
+    } else {
+      base.children = node.children.map(c => projectNode(c, view, childDepth));
+    }
+  } else {
+    base.children = [];
+  }
+  return base;
+}
+
+async function readPrepFile(args: Args): Promise<unknown> {
+  const id = String(args.id);
+  const view: ViewMode = (typeof args.view === "string" && ["compact", "full", "spine", "pgn"].includes(args.view))
+    ? args.view as ViewMode
+    : "compact";
+  const startNodeId = typeof args.node_id === "string" && args.node_id.length > 0 ? args.node_id : ROOT_ID;
+  const maxDepth: number | null = typeof args.max_depth === "number" && args.max_depth >= 0 ? args.max_depth : null;
+
+  const { file, version, fileIdEcho, pgn } = await loadPrepFile(id);
+  const idIndex = buildIdIndex(file.root);
+  const path = resolveNodeId(idIndex, startNodeId);
+  const anchor = getNodeByPath(file.root, path);
+
+  const header: Record<string, unknown> = {
+    id: fileIdEcho ?? id,
+    version,
+    tags: file.tags,
+    view,
+    node_id: startNodeId,
+    max_depth: maxDepth,
+  };
+
+  if (view === "pgn") {
+    // For the root, just return the file's actual PGN as-is. For a
+    // subtree, build a mini-Game from the anchor and export it. Keeps
+    // formatting identical to what the app renders.
+    if (startNodeId === ROOT_ID && (maxDepth === null || maxDepth >= 999)) {
+      return { ...header, pgn };
+    }
+    // Truncate to a subtree with max_depth. Simple: walk the anchor's
+    // subtree, produce a synthetic PGN starting from the anchor's FEN.
+    const subtreePgn = exportSubtreePgn(file, anchor, maxDepth);
+    return { ...header, pgn: subtreePgn };
+  }
+
+  return { ...header, tree: projectNode(anchor, view, maxDepth) };
+}
+
+// Produce a PGN string for a subtree rooted at `anchor`, truncated
+// at `maxDepth` plies below (null = unlimited). Reuses the exporter
+// by building a synthetic PrepFile whose root is a shallow clone of
+// the anchor with its children trimmed to depth.
+function exportSubtreePgn(file: PrepFile, anchor: PrepNode, maxDepth: number | null): string {
+  const trim = (n: PrepNode, depthLeft: number | null): PrepNode => {
+    if (depthLeft !== null && depthLeft <= 0) return { ...n, children: [] };
+    const next = depthLeft === null ? null : depthLeft - 1;
+    return { ...n, children: n.children.map(c => trim(c, next)) };
+  };
+  const trimmedAnchor = trim(anchor, maxDepth);
+  // If the anchor IS the root, exporter handles it. If it's an inner
+  // node, we set the root's FEN to the anchor's position and hang the
+  // trimmed subtree off it. Tags carried over.
+  if (anchor.id === ROOT_ID) {
+    return exportPGN({ tags: file.tags, root: trimmedAnchor });
+  }
+  const syntheticRoot: PrepNode = {
+    id: ROOT_ID,
+    san: null,
+    fen: anchor.fen,
+    ply: 0,
+    children: trimmedAnchor.children,
+  };
+  const tags = { ...file.tags, FEN: anchor.fen, SetUp: "1" };
+  return exportPGN({ tags, root: syntheticRoot });
+}
+
+async function listNodes(args: Args): Promise<unknown> {
+  const id = String(args.id);
+  const filter = String(args.filter || "");
+  const startNodeId = typeof args.node_id === "string" && args.node_id.length > 0 ? args.node_id : ROOT_ID;
+  const maxDepth: number | null = typeof args.max_depth === "number" && args.max_depth >= 0 ? args.max_depth : null;
+
+  const { file } = await loadPrepFile(id);
+  const idIndex = buildIdIndex(file.root);
+  const path = resolveNodeId(idIndex, startNodeId);
+  const anchor = getNodeByPath(file.root, path);
+
+  type Hit = Record<string, unknown>;
+  const hits: Hit[] = [];
+
+  const walk = (node: PrepNode, depthLeft: number | null, spineOnly: boolean) => {
+    // Root has no san — never emit it as a match. Everything else is fair game.
+    if (node.id !== ROOT_ID) {
+      let include = false;
+      let extra: Record<string, unknown> = {};
+      switch (filter) {
+        case "missing_eval":
+          include = !node.ceoEval; break;
+        case "has_comment":
+          include = !!(node.comment && node.comment.length > 0);
+          if (include) extra.comment_preview = (node.comment || "").slice(0, 80);
+          break;
+        case "has_annotations":
+          include = !!(node.annotations && (node.annotations.arrows.length > 0 || node.annotations.highlights.length > 0));
+          break;
+        case "novelties":
+          include = !!(node.nags && node.nags.includes("$146"));
+          break;
+        case "leaves":
+          include = node.children.length === 0; break;
+        case "mainline":
+          include = spineOnly; break;
+        case "all":
+          include = true; break;
+        default:
+          throw new Error(`unknown filter: ${filter}`);
+      }
+      if (include) {
+        const hit: Hit = { node_id: node.id, san: node.san, ply: node.ply };
+        Object.assign(hit, extra);
+        hits.push(hit);
+      }
+    }
+    if (depthLeft !== null && depthLeft <= 0) return;
+    const nextDepth = depthLeft === null ? null : depthLeft - 1;
+    if (filter === "mainline" && spineOnly) {
+      if (node.children.length > 0) walk(node.children[0], nextDepth, true);
+    } else {
+      for (const c of node.children) walk(c, nextDepth, filter === "mainline");
+    }
+  };
+
+  const rootIsSpineForFilter = filter === "mainline";
+  walk(anchor, maxDepth, rootIsSpineForFilter);
+
+  return { file_id: id, filter, node_id: startNodeId, max_depth: maxDepth, count: hits.length, nodes: hits };
+}
+
 // Strip cruft the LLM doesn't need from the DB-position response.
 // Called AFTER trimGamesMovetext so plyNumber survives long enough to
 // slice each game's movetext. Also renames the `transpositions` field
@@ -2163,13 +2398,25 @@ type FileHandle = {
   fen: string;
 };
 
-// Async resolver used by every engine / DB tool. If the caller supplied
-// file_id + node_id (preferred), load the file, resolve the node, and
-// return both the FEN and a handle we can use to persist ceoEval later.
-// Otherwise fall back to the raw fen/moves/line inputs.
+// Async resolver used by every engine / DB tool. Three paths:
+//
+//   1. file_id + node_id → load file, resolve node, return FEN + handle
+//      to persist ceoEval later. Cheapest, most explicit.
+//
+//   2. file_id + (fen | moves | line) → load file, resolve FEN
+//      client-side, then scan the file's nodes for one matching that
+//      FEN. If found, return the same handle as (1) so cloud_analyse
+//      auto-stores on the matching node. Fixes the previous footgun
+//      where `cloud_analyse({file_id, moves})` silently dropped the
+//      eval because the server didn't try to match the resulting FEN
+//      back to a node.
+//
+//   3. Just fen | moves | line, no file_id → scratch mode, no
+//      persistence. Same as before.
 async function resolveFromNodeOrFen(args: Args): Promise<{ fen: string; file?: FileHandle }> {
   const fileId = typeof args.file_id === "string" ? args.file_id.trim() : "";
   const nodeId = typeof args.node_id === "string" ? args.node_id.trim() : "";
+
   if (fileId && nodeId) {
     const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
     const g = raw as { pgnContent?: string; version?: number };
@@ -2180,17 +2427,51 @@ async function resolveFromNodeOrFen(args: Args): Promise<{ fen: string; file?: F
     const node = getNodeByPath(parsedFile.root, nodePath);
     return {
       fen: node.fen,
-      file: {
-        id: fileId,
-        version: g.version ?? 0,
-        parsedFile,
-        idIndex,
-        nodePath,
-        fen: node.fen,
-      },
+      file: { id: fileId, version: g.version ?? 0, parsedFile, idIndex, nodePath, fen: node.fen },
     };
   }
+
+  if (fileId) {
+    // file_id only — resolve FEN from fen/moves/line, then look it up
+    // in the file's nodes. If a node has that FEN, treat this as if
+    // node_id had been supplied (auto-persist on match).
+    const fen = resolveFenFromArgs(args);
+    try {
+      const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
+      const g = raw as { pgnContent?: string; version?: number };
+      if (typeof g.pgnContent === "string") {
+        const parsedFile = parsePGN(g.pgnContent);
+        const match = findNodeByFen(parsedFile.root, fen);
+        if (match) {
+          const idIndex = buildIdIndex(parsedFile.root);
+          return {
+            fen,
+            file: { id: fileId, version: g.version ?? 0, parsedFile, idIndex, nodePath: match.path, fen },
+          };
+        }
+      }
+    } catch {
+      // Best-effort: if the file load fails, fall through to scratch mode.
+    }
+    return { fen };
+  }
+
   return { fen: resolveFenFromArgs(args) };
+}
+
+// Search the tree for a node whose FEN matches. Full-tree scan — trees
+// max out ~1000 nodes so this is fine. FEN comparison is exact string
+// match (both come from the same chessops normalisation).
+function findNodeByFen(root: PrepNode, targetFen: string): { node: PrepNode; path: Path } | null {
+  const stack: Array<{ node: PrepNode; path: Path }> = [{ node: root, path: [] }];
+  while (stack.length > 0) {
+    const { node, path } = stack.pop()!;
+    if (node.fen === targetFen) return { node, path };
+    for (let i = 0; i < node.children.length; i++) {
+      stack.push({ node: node.children[i], path: [...path, i] });
+    }
+  }
+  return null;
 }
 
 // Local wrapper — the mutation module re-exports paths.getNode so this
@@ -2235,18 +2516,48 @@ function stringifyForLog(v: unknown): string {
   return s;
 }
 
+// Version tag stamped on every log line so a bug report can be traced
+// to the exact MCP release that produced it. process.env.npm_package_version
+// is set by npm when the package is run via `npx` / `npm start` (and by
+// our systemd unit which uses npx); falls back to reading package.json
+// during dev when we `node dist/index.js` directly. "unknown" if all
+// else fails — better than pretending we know.
+const MCP_VERSION: string = (() => {
+  const fromEnv = process.env.npm_package_version?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // dist/index.js is one level below package.json; src/index.ts is two
+    // (src/index.ts → ../package.json). Try both.
+    for (const p of [join(here, "..", "package.json"), join(here, "..", "..", "package.json")]) {
+      if (existsSync(p)) {
+        const pkg = JSON.parse(readFileSync(p, "utf8")) as { version?: string };
+        if (pkg.version) return pkg.version;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return "unknown";
+})();
+const MCP_TAG = `[mcp v${MCP_VERSION}]`;
+
+// One-shot startup line so tailing the log from the beginning shows
+// the running version immediately, before any tool call.
+console.error(`${MCP_TAG} chessceo-mcp startup`);
+
 async function callTool(name: string, args: Args): Promise<unknown> {
   const started = Date.now();
-  console.error(`[mcp] IN  ${name} args=${stringifyForLog(args)}`);
+  console.error(`${MCP_TAG} IN  ${name} args=${stringifyForLog(args)}`);
   try {
     const result = await callToolInner(name, args);
     const dur = Date.now() - started;
-    console.error(`[mcp] OUT ${name} ok ${dur}ms result=${stringifyForLog(result)}`);
+    console.error(`${MCP_TAG} OUT ${name} ok ${dur}ms result=${stringifyForLog(result)}`);
     return result;
   } catch (err) {
     const dur = Date.now() - started;
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[mcp] OUT ${name} err ${dur}ms error=${JSON.stringify(msg)}`);
+    console.error(`${MCP_TAG} OUT ${name} err ${dur}ms error=${JSON.stringify(msg)}`);
     throw err;
   }
 }
@@ -2452,18 +2763,11 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "search_prep_files":
       return authedRequest("GET", `/api/agent/prep-files/search?q=${encodeURIComponent(String(args.query))}`);
 
-    case "read_prep_file": {
-      const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
-      const g = raw as { pgnContent?: string; version?: number; id?: string };
-      if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
-      const file = parsePGN(g.pgnContent);
-      return {
-        id: g.id,
-        version: g.version,
-        tags: file.tags,
-        tree: file.root,
-      };
-    }
+    case "read_prep_file":
+      return readPrepFile(args);
+
+    case "list_nodes":
+      return listNodes(args);
 
     case "create_prep_file":
       return authedRequest("POST", "/api/agent/prep-files", {
