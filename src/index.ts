@@ -9,7 +9,8 @@
 
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Chess } from "chess.js";
@@ -127,6 +128,7 @@ const AUTHED_TOOLS = new Set([
   "deep_analyse",
   "deep_analyse_status",
   "deep_analyse_cancel",
+  "find_position_in_courses",
   "quote_engine_eval",
   "predict_human_move",
   "prepare_opponent",
@@ -897,6 +899,28 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "find_position_in_courses",
+    description:
+      "Look up which of the USER's own Chessable / PGN courses cover a position, ranked by how much ANNOTATED material sits below that position in each course. This is the LLM's window into what the user has personally studied — not a general database. Complements engine + big-DB tools: the general database says what the world plays, this says what the user has literature on.\n\n" +
+      "Ranking: files/chapters where the position sits at a branching point with lots of text under it rank first. A chapter that merely passes through the position on its way somewhere else ranks last, which is the whole point — the LLM wants to point the user at where the material actually explains this specific position.\n\n" +
+      "Use this to: cite specific chapters the user already owns when recommending an opening decision, cross-check whether the user has coverage of a rare line, find author overlap when the user asks 'what do I have on this?'\n\n" +
+      "Returns: `{fen, found, total_occurrences, excluded: {game_db_hits, unmapped_files, thin_entries_below_min, min_notes_chars}, hits: [{course, file, author, chapter, line, ply, notes_chars, subtree_moves}], truncated}`. `notes_chars` is the total characters of commentary in the subtree rooted at this occurrence — the primary rank signal. `ply` tells you how deep in the chapter's game tree this position sits (small ply = near the chapter's start).\n\n" +
+      "Not available if the fenfind index isn't installed on the server — response includes a clear note in that case.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "Prep file id. Combine with `node_id` to derive FEN from the tree." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'. When set, overrides `fen`/`moves`." },
+        fen: { type: "string", description: "Starting position as FEN. Only used if `node_id` is not set." },
+        moves: { type: "string", description: "Optional SAN moves on top of `fen` (or startpos). Only used if `node_id` is not set." },
+        include_games: { type: "boolean", description: "Include hits from game-database PGNs (player headers instead of course/chapter titles). Default false — those are noise for course-lookup." },
+        chapters_mode: { type: "boolean", description: "Return every chapter separately rather than best-per-course. Default false. Useful when a course has multiple chapters covering the same position." },
+        min_notes_chars: { type: "number", description: "Minimum notes_chars per hit to be included. Default 400 (~a paragraph of prose). Set to 0 to see every occurrence." },
+        limit: { type: "integer", description: "Max hits to return (default 25)." },
+      },
+    },
+  },
+  {
     name: "quote_engine_eval",
     description:
       "Return the stored engine eval for a node, or null if that node was never analysed. **Call this before writing prose or NAGs that quote engine numbers** — if it returns null, you have no measurement to cite. Do NOT infer an eval for the node from siblings or children; either analyse it (cloud_analyse with node_id) or omit the number from your prose.\n\n" +
@@ -1637,6 +1661,84 @@ function deepAnalyseCancel(args: Args): unknown {
   return { status: "cancelling", elapsed_ms: Date.now() - job.startedAt };
 }
 
+// ── find_position_in_courses: fenfind subprocess wrapper ───────────
+//
+// fenfind is a small python tool that indexes chess PGN files by
+// polyglot Zobrist hash. Given a position it returns which of the
+// user's Chessable / PGN files cover it, ranked by how much annotated
+// material sits below that position in each course. Runs as a
+// subprocess of the MCP so we can reuse python-chess's polyglot
+// hashing (matching the pre-built positions.db) instead of porting
+// the hash function to TS.
+//
+// Path resolution order (`FENFIND_PATH` env var overrides):
+//   1. $FENFIND_PATH/fenfind
+//   2. <package-root>/tools/fenfind/fenfind (ships with the npm package)
+// The bash wrapper picks a python interpreter with python-chess
+// available (venv at $here/.venv/bin/python preferred, then falls back
+// to system python3). DB path is resolved inside fenfind.py itself
+// (FENFIND_DB env, then ~/positions.db).
+const FENFIND_SCRIPT: string | null = (() => {
+  const envPath = process.env.FENFIND_PATH?.trim();
+  if (envPath) {
+    const p = join(envPath, "fenfind");
+    return existsSync(p) ? p : null;
+  }
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bundled = join(here, "..", "tools", "fenfind", "fenfind");
+  return existsSync(bundled) ? bundled : null;
+})();
+
+// Cap on how long we let fenfind run — SQLite query with a hash index
+// should return in well under a second, but a stuck subprocess
+// shouldn't pin the MCP handler.
+const FENFIND_TIMEOUT_MS = 15_000;
+
+async function findPositionInCourses(args: Args): Promise<unknown> {
+  if (!FENFIND_SCRIPT) {
+    return {
+      status: "not_available",
+      note: "fenfind index not installed on this server. Set FENFIND_PATH env var to the directory containing the `fenfind` script and positions.db, or install the tools/fenfind bundle shipped in the npm package.",
+    };
+  }
+
+  const resolved = await resolveFromNodeOrFen(args);
+  const cliArgs: string[] = [resolved.fen, "--json"];
+  if (args.include_games) cliArgs.push("--games");
+  if (args.chapters_mode) cliArgs.push("--chapters");
+  if (typeof args.min_notes_chars === "number") cliArgs.push("--min", String(args.min_notes_chars));
+  if (typeof args.limit === "number") cliArgs.push("-n", String(args.limit));
+
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const p = spawn(FENFIND_SCRIPT!, cliArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", d => { out += d.toString("utf8"); });
+    p.stderr.on("data", d => { err += d.toString("utf8"); });
+    const to = setTimeout(() => {
+      try { p.kill("SIGTERM"); } catch { /* already dead */ }
+      reject(new Error(`fenfind timed out after ${FENFIND_TIMEOUT_MS}ms`));
+    }, FENFIND_TIMEOUT_MS);
+    p.on("error", e => { clearTimeout(to); reject(e); });
+    p.on("close", code => {
+      clearTimeout(to);
+      if (code !== 0) {
+        reject(new Error(`fenfind exited ${code}: ${err.slice(0, 500)}`));
+      } else {
+        resolve(out);
+      }
+    });
+  });
+
+  try {
+    return JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`fenfind returned non-JSON output (${e instanceof Error ? e.message : String(e)}): ${stdout.slice(0, 300)}`);
+  }
+}
+
 // Walk chess.js-free: resolve a path against a tree, throw if invalid.
 function pathIntoTree(root: PrepNode, path: Path): PrepNode {
   let cur = root;
@@ -2194,6 +2296,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return deepAnalyseStatus(args);
     case "deep_analyse_cancel":
       return deepAnalyseCancel(args);
+
+    case "find_position_in_courses":
+      return findPositionInCourses(args);
 
     case "list_prep_files":
       return authedRequest("GET", "/api/agent/prep-files");
