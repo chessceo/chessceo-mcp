@@ -154,6 +154,14 @@ Prose is NEVER for:
 - Move recommendations ("here White should play h4") — add_move it.
 - Restating the eval a NAG already conveys.
 - **Describing a sibling variation you already added as a branch.** If move A has variation B added as `add_move(A, sibling)`, don't ALSO write `{if B then ...}` on A. The reader clicks B on the board — the branch is already there.
+- **Restating what the app already renders.** The reader opens the file in the app and sees: every sibling move (with count / avg rating / top players from the DB), each node's stored `ceoEval`, the NAG glyphs, the tree structure. Duplicating any of that in prose is pure noise.
+
+  - ❌ `{5...Bb4 (180/247), 5...d6 (26), 5...Be7 (18), 5...d5 (7), 5...g6 (2)}` — those are the sibling variations, already visible.
+  - ❌ `{Main move, 180 of 247 games (So, Giri, Karjakin, Duda). Eval −0.20/−0.27.}` — count, top players, eval all shown by the app.
+  - ✅ `{Main move; the sharpest test is actually 5...d5 (only 7 games but avg 2526) — see the variation.}`
+  - ✅ `{Popular, but leads to the endgame Black draws — 6.Bd2 is where prep depth matters.}`
+
+  Test: if the reader can see it by looking at the position or clicking a branch, don't write it. Prose is only for plans, prep-signal, or WHY — the layer the app can't derive.
 
 ## Move-judgment symbols (NAGs)
 

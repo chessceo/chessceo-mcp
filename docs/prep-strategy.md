@@ -26,6 +26,7 @@ The move statistics endpoints return win %, game counts, and (in the big DB) a `
 - **Sample size scales trust.** 3 games at 66% is noise; 300 at 55% is signal. A great score is nice — with volume. When the opponent has only 2-4 games in a variation, the "opponent-specific" score is basically the general-DB score anyway.
 - **Score doesn't automatically indicate a level gap.** A 60% variation isn't necessarily "stronger players crushing weaker ones." Look at the per-move `avgWhite` / `avgBlack` fields (returned on every move statistic) before drawing conclusions about who is playing whom.
 - **Don't recommend the higher-percentage move just because it's higher.** If 1.b3 scores 60% and 1.d4 scores 50% against a given opponent, that is *not* on its own a case for playing 1.b3 — style, prep depth, transposition risk, and the practical questions below all matter more.
+- **Count is popular, avgRating is critical.** When you're choosing which branches deserve prep depth, the highest-avgRating move often matters more than the highest-count one. Top players play the moves they know work, sometimes ignoring the herd. Example: 5...Bb4 has 180 games at avg 2350; 5...d5 has 7 games at avg 2526. d5 is the sharper test even though Bb4 is "main". Skim the rating column before the count column when picking branches to cover.
 
 ## Which DB source: signal vs population
 
