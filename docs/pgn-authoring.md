@@ -23,7 +23,7 @@ Building (use these — one call for many ops):
 
 - **`apply_mutations(id, mutations[])`** — batch. This is the primary build tool. Send 100 mutations in one call → one load-parse-mutate-save cycle instead of 100. When you're writing a repertoire from scratch, EVERYTHING should go through this. Individual mutation tools are for surgical follow-up edits, not for bulk work.
 - **`add_line(id, parent_id, sans[])`** — a whole linear variation in one op. Cleaner than N `add_move` ops for straight lines. Overlapping prefixes with an existing branch **join** (same SAN from the same position IS the same move) — see below.
-- **`auto_evaluate(id, node_id?)`** — walk from a node and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every descendant via cloud_analyse. **Does NOT set visible NAGs** — the numbers land in a hidden `[%ceo-eval]` tag so you can read them back later. NAG placement (`$1` `!`, `$14` `⩲`, `$16` `±`, `$18` `+−`, etc.) is your editorial call. Skip nodes that already have a stored eval by default.
+- **`auto_evaluate(id, node_id?)`** — walk from a node and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every descendant via cloud_analyse. **Async job**: returns `{job_id, target_count, estimated_seconds}` immediately, does the work in the background. Poll with `auto_evaluate_status(job_id)` until `done:true`; cancel with `auto_evaluate_cancel(job_id)` if you change your mind (partial progress is checkpointed every 8 nodes so a cancel never loses more than a handful of evaluations). **Does NOT set visible NAGs** — the numbers land in a hidden `[%ceo-eval]` tag so you can read them back later. NAG placement (`$1` `!`, `$14` `⩲`, `$16` `±`, `$18` `+−`, etc.) is your editorial call. Skip nodes that already have a stored eval by default.
 
 Per-op mutation tools (single-op calls, use for edits after the bulk build):
 
@@ -42,8 +42,8 @@ All mutations **auto-save** with optimistic locking. Response includes the new `
 
 1. `read_prep_file` — see what's there. Every node has an `id` you'll pass to the mutation and engine/DB tools.
 2. `apply_mutations([...])` — one call with your whole intended build (a mix of `add_move` / `add_line` for structure, plus any `set_comment`/`set_annotations` you already know at author time, plus any `set_nags` where you already have a clear judgment — novelty `$146`, `!?` speculative sac, obvious `?` blunder in a sideline you're rejecting).
-3. `auto_evaluate(id)` — walk the tree and PERSIST engine numbers on every node. Does not touch visible NAGs. Cheap way to get every position's Stockfish + Lc0 read baked into the file for later reference.
-4. Re-read the file and add NAGs where they carry real signal (see NAG discipline below). Use individual mutation tools for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).
+3. `auto_evaluate(id)` — spawns a background job that PERSISTS engine numbers on every node. Does not touch visible NAGs. Cheap way to get every position's Stockfish + Lc0 read baked into the file for later reference. Grab the returned `job_id` and either (a) poll `auto_evaluate_status(job_id)` every ~10-30s until done, or (b) fire and do useful work meanwhile (write more of the tree, walk the opponent's repertoire) and check back later — engine walk-time serialises on the per-combo semaphore, so it takes roughly `target_count × movetime_ms` in wall time.
+4. Once the job reports `done:true`, re-read the file and add NAGs where they carry real signal (see NAG discipline below). Use individual mutation tools for surgical follow-ups (fix one comment, add one arrow, promote a specific variation, prune a branch).
 
 The build-cost math: a 200-move file via individual `add_move` calls is 200 saves ≈ 100+ seconds of tool overhead. The same file via one `apply_mutations` call is one save ≈ 500ms. Use batch by default.
 
@@ -194,7 +194,7 @@ Engine numbers go into the NAG, not into prose. Convert the eval to the correct 
 | `\|eval\| ≥ 1.3`          | `$18` (+−)              | `$19` (−+)              |
 | Sharp, hard to evaluate | `$13` (∞)               | `$13` (∞)               |
 
-**NAGs are editorial, not automatic.** `auto_evaluate` persists engine numbers on every node but does NOT set visible NAGs — because a repertoire full of 0.00 opening theory does not want a `$10` (=) glyph plastered on every move. That's noise, not signal. NAGs are your call: mark moves that carry a judgment a reader can't derive by looking at the board.
+**NAGs are editorial, not automatic.** `auto_evaluate` (and its `auto_evaluate_status` poll) persists engine numbers on every node but does NOT set visible NAGs — because a repertoire full of 0.00 opening theory does not want a `$10` (=) glyph plastered on every move. That's noise, not signal. NAGs are your call: mark moves that carry a judgment a reader can't derive by looking at the board.
 
 Where NAGs actually earn their place:
 
