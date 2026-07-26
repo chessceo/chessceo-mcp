@@ -253,7 +253,7 @@ const TOOLS: Tool[] = [
       "- `chesscom` — needs `username`. Filters: `color`, `startMonth`/`endMonth` (**required** for chesscom/lichess), `timeControl`.\n" +
       "- `lichess` — needs `username`. Same filters as chesscom; `timeControl` also accepts `bullet` on Lichess.\n\n" +
       "Multi-source example: one player with both a FIDE ID and a Lichess account → two sources in one call, all their games combined into one session.\n\n" +
-      "GROUNDING: every claim about the opponent's repertoire must trace back to a `get_prep_position` call on this session. Don't assert 'they play sharply' or 'they hate isolated queen pawn' without pointing at actual game counts / win rates in the response. Prep is a two-player game — see `read_prep_strategy_guide` before recommending an opening plan.",
+      "GROUNDING: every claim about the opponent's repertoire must trace back to a `get_prep_position` call on this session. Don't assert 'they play sharply' or 'they hate isolated queen pawn' without pointing at actual game counts / win rates in the response. Prep is a two-player game — see `read_opening_prep_guide` before recommending an opening plan.",
     inputSchema: {
       type: "object",
       properties: {
@@ -292,7 +292,7 @@ const TOOLS: Tool[] = [
       "• Prep is symmetric information — both sides see the same history. Assume the opponent knows the weakness you spotted.\n" +
       "• Recency > career. The last 12-24 months dominate — filter your session with `start_month` if the player's repertoire shifted.\n" +
       "• Opponent will deviate early. Prep is a tree — cover the 2 most likely replies at each real branching point, not one 20-move line.\n\n" +
-      "For the full guide call `read_prep_strategy_guide`.",
+      "For the full guide call `read_opening_prep_guide`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -956,15 +956,18 @@ const TOOLS: Tool[] = [
     inputSchema: { type: "object", properties: {} },
   },
   {
-    name: "read_prep_strategy_guide",
+    name: "read_opening_prep_guide",
     description:
-      "Returns the full chess.ceo prep-strategy guide: why win% is one weight not a verdict, why prep is a two-player game with symmetric information (opponent sees your history too), how sample size and recency change the reading, when 'revealed weaknesses' are actionable vs already patched, how to use move-order tricks with the `trs` field, and how to calibrate surprise (rare secondary lines inside the existing repertoire, not big first-move switches). Call this ONCE per session before recommending an opening plan, especially when the user is preparing for a specific real opponent.",
+      "**CALL WHEN**: the user asks about OPENING PREPARATION — 'prep me against X', 'what should I play vs the Najdorf', 'help me build a repertoire against 1.e4', 'walk this opponent's Sveshnikov'. This guide is chess-and-analysis philosophy, not storage semantics.\n\n" +
+      "Covers: why win% is one weight not a verdict, why prep is a two-player game with symmetric information (opponent sees your history too), how sample size and recency change the reading, when 'revealed weaknesses' are actionable vs already patched, how to choose between the GM-classical DB and the main DB, when to combine chesscom/lichess sources with FIDE, the three chess.com profile shapes (consistent / eclectic / split-personality), the reversed-colours scarcity trick, how to calibrate surprise (rare secondary lines inside the existing repertoire, not big first-move switches).\n\n" +
+      "Different tool: `read_prep_files_guide` covers the FILE STORAGE feature (how to list/create/save prep files) — call that only when about to manipulate files, not for opening questions.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "read_prep_files_guide",
     description:
-      "Returns the guide to the prep-files FEATURE — how the storage works, when to list vs search vs create, optimistic locking with `version`, and naming conventions for the [Event] tag. Call this ONCE per session before your first create_prep_file. For how to actually WRITE PGN (mainline, variations, NAGs, arrows, comments) call read_pgn_authoring_guide instead — separate concern.",
+      "**CALL WHEN**: you're about to CREATE, LIST, SAVE, or DELETE a prep file — the persistent file storage feature. Not for opening prep philosophy (that's `read_opening_prep_guide`) and not for how to write PGN (that's `read_pgn_authoring_guide`).\n\n" +
+      "Covers: the AI Prep folder, when to list vs search vs create (avoid duplicate 'Prep vs Firouzja' files), optimistic locking with `version`, naming conventions for the [Event] tag, node-id addressing basics.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -1761,15 +1764,24 @@ function analysisToStoredEval(analysis: unknown, fen: string): StoredEval | null
     stockfish?: { depth?: number; lines?: Array<{ depth?: number; scoreCp?: number; mate?: number }> };
     lc0?:       { depth?: number; lines?: Array<{ depth?: number; scoreCp?: number; mate?: number }> };
   };
-  const whiteToMove = / w /.test(fen);
-  const flip = (n: number) => (whiteToMove ? n : -n);
+  // NOTE: the backend already returns White-POV cp/mate (engine-ws flips
+  // in ParseInfo based on side-to-move, then cloud_snapshot passes the
+  // number through). Previously this function ALSO flipped on
+  // black-to-move — a double flip that silently inverted every
+  // Black-to-move position's stored eval, so half of every prep tree
+  // had wrong-sign ceoEval and the auto-attached .eval on those
+  // positions reported White as better when Black was. Any ceoEval
+  // written on a Black-to-move node prior to 2026-07-26 is inverted;
+  // re-run auto_evaluate on affected files to overwrite.
+  // Unused `fen` kept as an arg for signature stability with callers.
+  void fen;
 
   const engineEval = (block: typeof r.stockfish): StoredEngineEval | undefined => {
     const line = block?.lines?.[0];
     if (!line) return undefined;
     const depth = line.depth ?? block?.depth;
-    if (typeof line.mate === "number") return { mate: flip(line.mate), depth };
-    if (typeof line.scoreCp === "number") return { cp: flip(line.scoreCp), depth };
+    if (typeof line.mate === "number") return { mate: line.mate, depth };
+    if (typeof line.scoreCp === "number") return { cp: line.scoreCp, depth };
     return undefined;
   };
 
@@ -2401,7 +2413,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "read_engine_usage_guide":
       return { guide: ENGINE_USAGE_DOC };
 
-    case "read_prep_strategy_guide":
+    case "read_opening_prep_guide":
       return { guide: PREP_STRATEGY_DOC };
 
     case "read_prep_files_guide":
