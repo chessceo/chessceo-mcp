@@ -141,6 +141,31 @@ Meta-signal matters. Big changes in the user's repertoire are transparent to str
 - **Right:** stay inside the user's normal repertoire, pick a rare secondary line. Classic example: a 1.e4 player who always plays 6.Bg5 vs the Najdorf switching to 6.Bc4 for one game. The opponent recognizes the opening; they don't have prep on this specific line; the user's meta-signature ("I play 1.e4 vs Najdorf") stays intact.
 - Same logic for candidate move choice: the opponent's expectation of *what the user plays* is itself a variable to be manipulated.
 
+## Practical, not correspondence
+
+The reader is a human at the board, not a computer consuming a PGN.
+
+- **Don't paste long engine PVs into prose.** A 15-move variation in a comment is unreadable and unmemorable. Cite the eval, name the key move or two, stop. If the line matters as a variation, add it as a branch with `add_line` — the reader walks it interactively there — not as prose.
+- **Compress for human memory.** If the opponent has 6 plausible replies that all share one strategic theme, describe the theme once; add the two structurally different branches, not all 6. Long non-forcing lines are unmemorable regardless of eval; recommend depth only when the line is actually forced or the reader has a clear reason to remember it.
+
+## When the database runs thin, judge the position
+
+Sparse data (few games, low ratings, or literally zero) means no "what does the field play here" signal. The LLM has to actually judge the position — and it has two tools that stand in for the missing signal.
+
+- **Call `describe_position` before commenting on a position without concrete game data.** You cannot reliably read a FEN — pieces get swapped, hanging pieces missed, "the knight on d5" turns out to not exist. `describe_position` gives you the same board a human sees: piece placements, contested pieces with attackers/defenders, hanging list, check state, legal moves. Cheap (~1 ms, no engine). Mandatory when the DB is thin, since you no longer have "what won here historically" to anchor the reasoning.
+- **Call `predict_human_move` when past theory.** Once out of book, humans play *human* moves — natural, principled, sometimes objectively second-best. The engine's top choice is often not what the opponent actually picks. Rating-condition the prediction on the opponent's level.
+- **Think in plans, not lines.** With no games to anchor you, one 12-move engine line is nearly worthless as prep. Two plans described in a sentence each ("break with f4 and pile on the h-file" vs "consolidate with Nc4/Bd2 and play for a3-b4") give the reader something they can actually execute.
+
+## Prune obviously worse branches
+
+Not every legal move deserves a variation. Skip a move when it is **both** significantly worse AND barely played. Either condition alone isn't enough:
+
+- Rare-but-equal sideline → cover it (surprise value).
+- Bad move that top players still occasionally try → cover it (you'll face it).
+- Rare AND worse → skip. A covered-for-thoroughness branch dilutes the tree and wastes reader attention.
+
+Concrete: after 1.e4 e5 2.d4 from White's side, only 2...exd4 is worth analysing — every alternative is worse AND rare. Cross-check with `get_prep_position` (opponent's actual choices) and `get_position_stats` (population + objective eval) before spending depth on a branch.
+
 ## How to combine these
 
 None of these are rules; they're weights. In one game against a specific opponent one factor dominates (they clearly hate Catalan structures); in another it's a different one (they're rigid and just play their repertoire, so tree-depth matters more than surprise). Reason through them explicitly when recommending, and cite the concrete numbers (game counts, dates, win rates) so the user can trust or overrule.
