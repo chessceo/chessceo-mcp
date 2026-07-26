@@ -122,6 +122,8 @@ const AUTHED_TOOLS = new Set([
   "set_tag",
   "apply_mutations",
   "auto_evaluate",
+  "auto_evaluate_status",
+  "auto_evaluate_cancel",
   "quote_engine_eval",
   "predict_human_move",
   "prepare_opponent",
@@ -791,10 +793,11 @@ const TOOLS: Tool[] = [
   {
     name: "auto_evaluate",
     description:
-      "Walk the tree from `node_id` (default `'r'` = whole file) and populate the persistent `ceoEval` (Stockfish + Lc0 numbers) on every descendant via cloud_analyse. Requires a running cloud combo instance.\n\n" +
-      "**Does NOT set visible NAGs.** NAG placement is your call, not the engine's — an opening tree full of 0.00 positions doesn't need a `$10` (=) glyph on every move (that's just noise on the board), and a `!` on a novelty or a `?!` on a risky committal is a judgment call the engine can't make. Use this tool to persist the raw numbers on every node, then re-read the file and hand-pick NAGs on the moves where a glyph carries real signal.\n\n" +
-      "On re-read every evaluated node carries `ceoEval: { sf: {cp, depth}, lc0: {cp, depth} }` — the numbers travel with the file. Read those back with quote_engine_eval before writing prose that references engine numbers. Use `only_missing=true` (default) to skip nodes already evaluated on repeat runs.\n\n" +
-      "Costs real money — hits cloud_analyse per node. A 200-node tree at 1.5s/node = ~5 min of engine time. Runs 4 evaluations in parallel to save wall time.",
+      "Walk the tree from `node_id` (default `'r'` = whole file) and populate the persistent `ceoEval` on every descendant via cloud_analyse. Requires a running cloud combo instance.\n\n" +
+      "**Async job — returns immediately.** Response: `{ job_id, target_count, status: 'running', estimated_seconds }`. Then poll `auto_evaluate_status(job_id)` until `done: true`. Cancel a run with `auto_evaluate_cancel(job_id)` — partial progress is preserved. Do useful other work between polls (write more of the tree, walk the opponent's repertoire) — the engine runs in the background.\n\n" +
+      "Progress is checkpointed to the prep file every 8 successfully-evaluated nodes, so a cancel / crash / MCP restart mid-run leaves the tree partially populated rather than losing everything. On MCP restart the job record disappears; re-run auto_evaluate and `only_missing=true` naturally skips what was already saved.\n\n" +
+      "**Does NOT set visible NAGs.** NAG placement is your call, not the engine's — an opening tree full of 0.00 positions doesn't need a `$10` (=) glyph on every move. Use quote_engine_eval on individual nodes before writing prose that references engine numbers.\n\n" +
+      "Costs real money — one cloud_analyse per node. A 200-node walk at default movetime is ~5 min of engine time (calls serialise on the per-combo semaphore in the backend).",
     inputSchema: {
       type: "object",
       properties: {
@@ -802,9 +805,33 @@ const TOOLS: Tool[] = [
         node_id:       { type: "string", description: "Subtree root (default 'r' = whole file)." },
         only_missing:  { type: "boolean", description: "Skip nodes that already carry a stored ceoEval (default true)." },
         movetime_ms:   { type: "integer", minimum: 500, maximum: 5000, description: "Per-node cloud_analyse think time (default 1500)." },
-        expected_version: { type: "integer" },
       },
       required: ["id"],
+    },
+  },
+  {
+    name: "auto_evaluate_status",
+    description:
+      "Poll the status of an auto_evaluate job. Response: `{ status: 'running' | 'done' | 'cancelled' | 'error' | 'not_found', target_count, evaluated, errored, remaining, done, error?, version? }`. When `status: 'not_found'` the job either expired (kept ~15 min after completion), never existed, or the MCP restarted since it was created — re-run auto_evaluate.\n\n" +
+      "Typical poll cadence: every 3-5 s for small walks, every 10-30 s for large ones. Don't hammer — status is a pure in-memory read but polling doesn't speed the engine up.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job id from the `auto_evaluate` response." },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "auto_evaluate_cancel",
+    description:
+      "Ask a running auto_evaluate job to stop as soon as its current node finishes. Whatever progress was completed before cancellation is durably saved (checkpoint on cancel). Idempotent — cancelling an already-finished job is a no-op with a clear note in the response.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job id from the `auto_evaluate` response." },
+      },
+      required: ["job_id"],
     },
   },
   {
@@ -1103,7 +1130,77 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
 // survives across sessions and appears on every read_prep_file), and
 // derive the NAG from the SF score. Both writes go via a single batch
 // mutation at the end so a 200-node evaluate is one save.
+// ── auto_evaluate: async background job ────────────────────────────
+//
+// The naive walk-and-await approach held one HTTP request open for the
+// full duration of the walk (200 nodes × ~1.5s serialized on the
+// per-combo engine semaphore = ~5 min). MCP hosts vary in their
+// tolerance for that. Switched to a background-job model:
+//
+//   1. `auto_evaluate` collects targets, spawns an unawaited worker,
+//      returns `{ job_id, target_count }` immediately.
+//   2. `auto_evaluate_status(job_id)` returns live progress; the LLM
+//      can poll while doing other work on the tree.
+//   3. `auto_evaluate_cancel(job_id)` aborts a running job cleanly;
+//      partial progress up to the last checkpoint is preserved.
+//
+// The MCP server is long-lived (chessceo-mcp.service under systemd), so
+// in-memory job state survives across HTTP requests. On process restart
+// jobs disappear — polling returns `not_found` and the LLM re-runs (the
+// `only_missing` default naturally skips already-evaluated nodes).
+//
+// Progress is checkpointed to the prep file every SAVE_EVERY_N nodes so
+// a mid-run crash / cancellation doesn't lose the whole walk. Small
+// tension with the version-lock — see runEvalJob comments for how we
+// re-anchor the version between saves.
+
+type EvalJobStatus = "running" | "done" | "error" | "cancelled";
+
+type EvalJob = {
+  id: string;
+  fileId: string;
+  status: EvalJobStatus;
+  targetCount: number;
+  evaluated: number;
+  errored: number;              // nodes where cloud_analyse threw — kept going
+  error?: string;               // fatal error that terminated the job
+  finalVersion?: number;
+  startedAt: number;
+  finishedAt?: number;
+  cancelled: boolean;
+};
+
+const evalJobs = new Map<string, EvalJob>();
+
+// GC finished jobs after this long so status polling remains useful
+// for a while but the map doesn't grow unbounded across long uptimes.
+const EVAL_JOB_TTL_MS = 15 * 60 * 1000;
+// Checkpoint interval — save progress every N successfully-evaluated
+// nodes so a mid-run kill leaves the tree partially populated. Small
+// enough that <15s of work is at risk per checkpoint on a slow combo,
+// large enough that the save overhead stays a small fraction of the
+// per-node cost.
+const SAVE_EVERY_N = 8;
+
+function newEvalJobId(): string {
+  // 12 hex chars, low collision (same 32-bit width as node ids ×1.5).
+  const rand = Math.random().toString(16).slice(2, 8);
+  return `evj_${Date.now().toString(16)}${rand}`;
+}
+
+// Sweep expired jobs on every start/status call — cheap, doesn't need
+// a background timer, keeps the map bounded to active + recent jobs.
+function reapExpiredEvalJobs(): void {
+  const now = Date.now();
+  for (const [k, j] of evalJobs) {
+    if (j.finishedAt && now - j.finishedAt > EVAL_JOB_TTL_MS) {
+      evalJobs.delete(k);
+    }
+  }
+}
+
 async function autoEvaluate(args: Args): Promise<unknown> {
+  reapExpiredEvalJobs();
   const id = String(args.id);
   const startNodeId = typeof args.node_id === "string" && args.node_id.length > 0
     ? String(args.node_id)
@@ -1136,48 +1233,169 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   // If the caller anchored at the root, skip evaluating the root itself
   // (no move); otherwise the anchor node IS a real move and gets evaluated.
   walk(startNode, startNode.id === ROOT_ID);
-  if (targets.length === 0) return { ok: true, evaluated: 0, skipped: 0, version: g.version };
 
-  // Dispatch cloud_analyse in parallel with a 4-way cap so we don't
-  // over-saturate the engine-ws connection cap (single-client per port).
-  const stored: { nodeId: string; ev: StoredEval }[] = [];
-  const CONCURRENCY = 4;
-  let cursor = 0;
-  async function worker() {
-    while (cursor < targets.length) {
-      const idx = cursor++;
-      const t = targets[idx];
+  // Nothing to do → return a done job synthetically so the caller doesn't
+  // need to special-case the empty response.
+  if (targets.length === 0) {
+    const jobId = newEvalJobId();
+    evalJobs.set(jobId, {
+      id: jobId,
+      fileId: id,
+      status: "done",
+      targetCount: 0,
+      evaluated: 0,
+      errored: 0,
+      finalVersion: g.version,
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      cancelled: false,
+    });
+    return { job_id: jobId, target_count: 0, status: "done", version: g.version };
+  }
+
+  const jobId = newEvalJobId();
+  const job: EvalJob = {
+    id: jobId,
+    fileId: id,
+    status: "running",
+    targetCount: targets.length,
+    evaluated: 0,
+    errored: 0,
+    startedAt: Date.now(),
+    cancelled: false,
+  };
+  evalJobs.set(jobId, job);
+
+  // Unawaited — runs concurrently with the tool response. Any thrown
+  // error gets recorded on the job so the LLM's status poll surfaces
+  // it instead of the process seeing an unhandled rejection.
+  void runEvalJob(job, id, targets, movetimeMs).catch(err => {
+    job.status = "error";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.finishedAt = Date.now();
+  });
+
+  return {
+    job_id: jobId,
+    target_count: targets.length,
+    status: "running",
+    // Rough time estimate at the current default movetime. Serialization
+    // on the per-combo semaphore means walltime ≈ target_count × movetime.
+    estimated_seconds: Math.round((targets.length * movetimeMs) / 1000),
+  };
+}
+
+// Worker body — walks targets sequentially (concurrency > 1 is a lie
+// against the per-combo semaphore in the backend anyway), checkpoints
+// every SAVE_EVERY_N successfully-evaluated nodes so partial progress
+// is durable, and re-anchors the version after each save.
+async function runEvalJob(
+  job: EvalJob,
+  fileId: string,
+  targets: Array<{ nodeId: string; fen: string }>,
+  movetimeMs: number,
+): Promise<void> {
+  const pending: Array<{ op: string; node_id: string; ceoEval?: StoredEval }> = [];
+
+  const flush = async (): Promise<void> => {
+    if (pending.length === 0) return;
+    // No expected_version — auto_evaluate treats concurrent edits by
+    // the LLM as last-write-wins on the ceoEval field specifically.
+    // Safe because set_ceo_eval is idempotent per node and other
+    // mutations (add_move / set_comment / etc.) don't touch ceoEval.
+    const saved = await applyBatchMutations({
+      id: fileId,
+      mutations: pending,
+    } as Args);
+    const sr = saved as { version?: number };
+    if (typeof sr.version === "number") job.finalVersion = sr.version;
+    pending.length = 0;
+  };
+
+  for (const t of targets) {
+    if (job.cancelled) break;
+    try {
+      const analysis = await authedRequest(
+        "POST",
+        "/api/agent/cloud-engines/analyse",
+        { fen: t.fen, movetime_ms: movetimeMs, multipv: 1 },
+      );
+      const ev = analysisToStoredEval(analysis, t.fen);
+      if (ev) {
+        pending.push({ op: "set_ceo_eval", node_id: t.nodeId, ceoEval: ev });
+        job.evaluated++;
+      } else {
+        job.errored++;
+      }
+    } catch {
+      // Per-node failure — record and continue; a bad FEN or a transient
+      // engine hiccup on one node shouldn't kill the whole walk.
+      job.errored++;
+    }
+    if (pending.length >= SAVE_EVERY_N) {
       try {
-        const analysis = await authedRequest(
-          "POST",
-          "/api/agent/cloud-engines/analyse",
-          { fen: t.fen, movetime_ms: movetimeMs, multipv: 1 },
-        );
-        const ev = analysisToStoredEval(analysis, t.fen);
-        if (ev) stored.push({ nodeId: t.nodeId, ev });
+        await flush();
       } catch {
-        // best-effort — a single failed node shouldn't kill the batch
+        // Save failure is bad but not fatal — try again on the next
+        // checkpoint or at the end. Progress remains in `pending`
+        // so nothing is lost as long as the process stays alive.
       }
     }
   }
-  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
-  if (stored.length === 0) return { ok: true, evaluated: 0, skipped: targets.length, version: g.version };
-
-  // Persist the raw numbers only — never touch visible NAGs. NAG glyphs
-  // are the LLM's editorial call (novelty, sharp choice, real mistake),
-  // not an automatic mapping from the engine number. Stamping `$10` on
-  // every 0.00 position in an opening tree just clutters the board.
-  // The threshold-derived NAG still lives INSIDE `ceoEval.nag` so the
-  // LLM can read it back and decide whether to promote it to a visible
-  // NAG on a case-by-case basis.
-  const batchMutations: Array<{ op: string; node_id: string; ceoEval?: StoredEval }> = [];
-  for (const s of stored) {
-    batchMutations.push({ op: "set_ceo_eval", node_id: s.nodeId, ceoEval: s.ev });
+  // Final flush regardless of cancellation — durably persist whatever
+  // work was completed before the user asked to stop.
+  try {
+    await flush();
+  } catch (err) {
+    job.error = err instanceof Error ? err.message : String(err);
+    job.status = "error";
+    job.finishedAt = Date.now();
+    return;
   }
-  const saveResult = await applyBatchMutations({ id, mutations: batchMutations, expected_version: g.version } as Args);
-  const sr = saveResult as { version?: number };
-  return { ok: true, evaluated: stored.length, skipped: targets.length - stored.length, version: sr.version };
+
+  job.status = job.cancelled ? "cancelled" : "done";
+  job.finishedAt = Date.now();
+}
+
+function autoEvaluateStatus(args: Args): unknown {
+  reapExpiredEvalJobs();
+  const jobId = String(args.job_id || "").trim();
+  if (!jobId) throw new Error("`job_id` is required");
+  const job = evalJobs.get(jobId);
+  if (!job) {
+    return {
+      status: "not_found",
+      note: "Job unknown — either expired (kept ~15 min after completion), never existed, or the MCP process restarted since it was created. Re-run auto_evaluate to start over; the `only_missing` default will skip nodes already evaluated in the prep file.",
+    };
+  }
+  return {
+    job_id: job.id,
+    status: job.status,
+    target_count: job.targetCount,
+    evaluated: job.evaluated,
+    errored: job.errored,
+    remaining: Math.max(0, job.targetCount - job.evaluated - job.errored),
+    done: job.status !== "running",
+    error: job.error,
+    version: job.finalVersion,
+    started_at_ms: job.startedAt,
+    finished_at_ms: job.finishedAt,
+  };
+}
+
+function autoEvaluateCancel(args: Args): unknown {
+  const jobId = String(args.job_id || "").trim();
+  if (!jobId) throw new Error("`job_id` is required");
+  const job = evalJobs.get(jobId);
+  if (!job) return { status: "not_found" };
+  if (job.status !== "running") {
+    return { status: job.status, note: "Job already finished; nothing to cancel." };
+  }
+  job.cancelled = true;
+  // status transitions to "cancelled" on the next per-node iteration
+  // inside runEvalJob, after the final flush persists progress.
+  return { status: "cancelling", evaluated_so_far: job.evaluated };
 }
 
 // Walk chess.js-free: resolve a path against a tree, throw if invalid.
@@ -1808,6 +2026,12 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "auto_evaluate":
       return autoEvaluate(args);
+
+    case "auto_evaluate_status":
+      return autoEvaluateStatus(args);
+
+    case "auto_evaluate_cancel":
+      return autoEvaluateCancel(args);
 
     case "quote_engine_eval": {
       const fileId = String(args.id);
