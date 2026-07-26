@@ -167,6 +167,14 @@ Not every legal move deserves a variation. Skip a move when it is **both** signi
 
 Concrete: after 1.e4 e5 2.d4 from White's side, only 2...exd4 is worth analysing — every alternative is worse AND rare. Cross-check with `get_prep_position` (opponent's actual choices) and `get_position_stats` (population + objective eval) before spending depth on a branch.
 
+## When to stop, when to keep going
+
+Depth calibrates to the *character* of the position, not to whether the DB has games or how deep in the tree you are.
+
+- **Forcing → keep going.** Concrete tactics, only-moves, sharp sequences — analyse until the position calms (real endgame, stable middlegame structure). No game data doesn't matter; the moves are forced, so there's nothing to look up anyway. `describe_position` + engine is enough.
+- **Quiet → stop early.** Once the position is strategic — many reasonable moves, no immediate threats — one sentence of plans is worth more than another 6 plies of tree. Stop and describe.
+- **Novelties MUST branch.** If you're introducing a move nobody's played, "the DB has no games" is not a reason to stop — the reader will actually reach this position over the board and needs an answer. Predict the opponent's replies with `predict_human_move` (rating-conditioned to their level), sanity-check with Stockfish (objective best) and Lc0 (practical alternatives), then branch on the top ~2 predicted responses. This is precisely where all three signals matter most, because there's no historical answer to lean on. See also "Novelty burns" — save deep novelty-prep for the games that actually warrant it.
+
 ## How to combine these
 
 None of these are rules; they're weights. In one game against a specific opponent one factor dominates (they clearly hate Catalan structures); in another it's a different one (they're rigid and just play their repertoire, so tree-depth matters more than surprise). Reason through them explicitly when recommending, and cite the concrete numbers (game counts, dates, win rates) so the user can trust or overrule.
