@@ -1,3 +1,5 @@
 .venv/
 positions.db
+positions.db.tmp
+positions.db.old
 _INDEXER.py
