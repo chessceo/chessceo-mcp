@@ -66,6 +66,27 @@ Trust Lc0 for:
   - Lc0 higher: probably a long-term positional factor beyond Stockfish's horizon
   - Never dismiss either engine — the disagreement itself is the signal
 
+## 0.00 is not "dead draw"
+
+The single most common misread of an engine number. **0.00 means "objectively balanced with optimal play from both sides".** It says nothing about how often the position actually draws over the board — a sharp middlegame with imbalances and only-moves can sit at 0.00 for 40 plies and be a lively fighting game.
+
+An eval quantifies WHO STANDS BETTER, not HOW LIKELY A DRAW IS. The two questions are independent.
+
+- **A wrong reasoning pattern** (documented failure): the LLM sees `SF 0.00, depth 58, 6.6B nodes` on a Bg5 sideline, concludes "actually a dead draw", and marks the line `?!` as a dead end. Wrong. All that eval says is neither side is objectively better with optimal play — the practical drawing chance is a separate question the SF number doesn't answer.
+
+Signals that actually correlate with high drawing chance:
+
+- **Forced repetition visible in the PV** (`Nf3 Nf6 Ng1 Ng8 …`) — that's a draw, not the eval.
+- **Reduced material + 0.00** — opposite-coloured bishops, queen + rook endgames with balanced pawns, king-and-pawn structures with no breakthrough. The material context makes the draw likely, not the eval.
+- **Symmetrical structures with no imbalances and no plan for either side** — engine says 0.00, humans agree by move 25.
+
+If you actually want to estimate PRACTICAL drawing chance, ask the tools that answer that question:
+
+- **`predict_human_move.wdlWhitePov`** — game-outcome prediction from the neural net, rating-conditioned. The `draw` component IS the answer to "how often does this position draw at this level".
+- **Lc0's practical eval** — often diverges from SF at 0.00 to say "still slightly better for White in a real game". That divergence is where the practical winning chance hides.
+
+**Never conflate the objective eval with the practical outcome.** A 0.00 middlegame with a piece imbalance, opposite-side attacks, or a rating gap is a fighting game; the number just told you nobody has a forced win.
+
 ## Lc0 contempt
 
 Contempt is an Lc0 option that skews its evaluation and move choice toward one side. Passing `contempt` to `cloud_analyse` sets it on the Lc0 leg only; Stockfish always analyzes objectively.
