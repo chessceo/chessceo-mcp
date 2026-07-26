@@ -49,6 +49,8 @@ def main():
     ap.add_argument('--games', action='store_true', help='include game-database hits')
     ap.add_argument('--min', type=float, default=400)
     ap.add_argument('-n', type=int, default=25)
+    ap.add_argument('--sort', choices=['recency', 'notes'], default='recency',
+                    help='ranking: recency (default, most recently updated file first) or notes (annotation depth, notes_chars desc)')
     ap.add_argument('--json', action='store_true', help='emit structured JSON on stdout instead of the text table (used by the MCP wrapper)')
     a = ap.parse_args()
 
@@ -60,7 +62,7 @@ def main():
 
     con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
     rows = [dict(r) for r in con.execute(
-        """SELECT f.name,f.course,f.author,o.chapter,o.line,o.ply,o.subtree,o.chars
+        """SELECT f.id AS file_id,f.name,f.path,f.course,f.author,o.chapter,o.line,o.ply,o.subtree,o.chars
            FROM occ o JOIN files f ON f.id=o.file_id WHERE o.z=?""", (z,))]
     if not rows:
         if a.json:
@@ -69,6 +71,15 @@ def main():
             return
         print("position not found in the collection"); return
     total = len(rows)
+
+    # Attach file mtime for recency ranking. Cheap — one stat() per row,
+    # done here rather than at index time so re-indexing isn't required
+    # for the recency signal to work.
+    for r in rows:
+        try:
+            r['mtime'] = os.path.getmtime(r['path'])
+        except OSError:
+            r['mtime'] = 0
 
     ngame = 0
     if not a.games:
@@ -99,9 +110,23 @@ def main():
             if k not in groups or (r['chars'], r['subtree']) > (groups[k]['chars'], groups[k]['subtree']):
                 groups[k] = r
 
-    hits = sorted(groups.values(), key=lambda r: (-r['chars'], -r['subtree']))
+    # Ranking. `recency` (default) sorts by file mtime desc — 2-month-old
+    # material beats 10-year-old on the assumption that theory shifts. Ties
+    # broken by notes_chars so a deep chapter beats a thin one at the same
+    # mtime. `notes` sorts by annotation depth alone, useful when the
+    # question is "who explains this best regardless of age".
+    if a.sort == 'notes':
+        hits = sorted(groups.values(), key=lambda r: (-r['chars'], -r['subtree']))
+    else:  # recency
+        hits = sorted(groups.values(), key=lambda r: (-r['mtime'], -r['chars']))
     shown = hits if a.all else [h for h in hits if h['chars'] >= a.min]
     thin = len(hits) - len(shown)
+
+    import datetime as _dt
+    def _updated_at(ts):
+        if not ts:
+            return None
+        return _dt.date.fromtimestamp(ts).isoformat()
 
     if a.json:
         # Structured output for the MCP wrapper. Field names spelled out
@@ -110,6 +135,7 @@ def main():
             "fen": b.fen(),
             "found": True,
             "total_occurrences": total,
+            "sort": a.sort,
             "excluded": {
                 "game_db_hits": ngame,
                 "unmapped_files": ncourse,
@@ -118,6 +144,7 @@ def main():
             },
             "hits": [
                 {
+                    "course_file_id": h['file_id'],  # opaque handle; pass to read_course_at_position
                     "course": h['course'] or None,
                     "file":   h['name'],
                     "author": h['author'] or None,
@@ -126,6 +153,7 @@ def main():
                     "ply":     h['ply'],
                     "notes_chars":   h['chars'],
                     "subtree_moves": h['subtree'],
+                    "updated_at":    _updated_at(h['mtime']),
                 }
                 for h in shown[:a.n]
             ],

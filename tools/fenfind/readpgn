@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Run readpgn.py with whichever interpreter has python-chess available.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for py in "$here/.venv/bin/python" "$HOME/chess/.venv/bin/python" "$HOME/.venv/bin/python" python3; do
+    if "$py" -c 'import chess' 2>/dev/null; then
+        exec "$py" "$here/readpgn.py" "$@"
+    fi
+done
+echo "readpgn: python-chess not found. Install it, e.g.:" >&2
+echo "  python3 -m venv \"$here/.venv\" && \"$here/.venv/bin/pip\" install python-chess" >&2
+exit 1

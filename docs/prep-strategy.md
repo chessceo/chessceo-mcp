@@ -80,6 +80,30 @@ For a rare position where the opponent has 0–2 games as their side, it's often
 
 Do this by dropping the `color` filter on `prepare_opponent`, or making a second session with the opposite colour — then compare game counts. When density is scarce, information from the "wrong" colour is worth more than no information at all. Just be honest about what it is: knowledge, not prediction.
 
+## Using the user's course library (`find_position_in_courses` + `read_course_at_position`)
+
+The user has a private index of their own Chessable / PGN files (dozens of GB of prep material). This is a **reference library, not memory** — nobody remembers what's in it, but the LLM can query on demand and cite specific chapters.
+
+Two-tool workflow:
+
+1. **`find_position_in_courses(fen)`** → metadata: which courses cover this position, ranked most-recently-updated first (10-year-old material is less trustworthy than 2-month-old). Each hit has a `course_file_id`.
+2. **`read_course_at_position({course_file_id, fen})`** → the actual commentary, variations, arrows from that specific chapter. Depth-bounded (`max_plies_below`); widen or call again with a different `fen` to explore further.
+
+Query patterns worth reaching for:
+
+- **"Does my chosen line have coverage?"** — search from the target position. If several recent courses cover it, read the top hit for background before writing prep.
+- **"What do opposite-colour repertoires recommend against this move?"** — same position, look at hits authored for the OTHER side. That's the LLM's window into "what will opponents have been told to play here".
+- **"Has anyone tried my novelty before?"** — search the post-novelty position. Zero hits = genuine novelty (good). Hits = it's been tried; read what happened.
+- **"Compare how two authors annotate the same critical position"** — two `read_course_at_position` calls with different `course_file_id`s.
+
+Discipline:
+
+- Course material is a signal, not truth. A course written 2019 may be objectively refuted by current engine analysis; cross-check with `cloud_analyse` before adopting a course's recommendation wholesale.
+- Recency ranking matters most in fast-moving lines (Najdorf, KID, Grünfeld) and less in stable structures (Caro-Kann, Slav mainlines). Weight accordingly.
+- Cite the source when you use it: `{Ganguly (Reinventing the Ragozin, 2025) covers this exact position — recommends 12.Rd1.}` The reader can then go read the chapter themselves. Don't dump the course prose into your comment; point them at it.
+
+Not available if fenfind isn't installed on the server; both tools respond with `status: "not_available"` in that case.
+
 ## Prep is symmetric — both sides know the same things
 
 The single biggest LLM error in prep is treating it like writing a book: "here's what you should play against this opponent's weakness." A real chess opponent:

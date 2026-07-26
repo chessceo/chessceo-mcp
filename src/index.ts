@@ -129,6 +129,7 @@ const AUTHED_TOOLS = new Set([
   "deep_analyse_status",
   "deep_analyse_cancel",
   "find_position_in_courses",
+  "read_course_at_position",
   "quote_engine_eval",
   "predict_human_move",
   "prepare_opponent",
@@ -907,10 +908,13 @@ const TOOLS: Tool[] = [
   {
     name: "find_position_in_courses",
     description:
-      "Look up which of the USER's own Chessable / PGN courses cover a position, ranked by how much ANNOTATED material sits below that position in each course. This is the LLM's window into what the user has personally studied — not a general database. Complements engine + big-DB tools: the general database says what the world plays, this says what the user has literature on.\n\n" +
-      "Ranking: files/chapters where the position sits at a branching point with lots of text under it rank first. A chapter that merely passes through the position on its way somewhere else ranks last, which is the whole point — the LLM wants to point the user at where the material actually explains this specific position.\n\n" +
-      "Use this to: cite specific chapters the user already owns when recommending an opening decision, cross-check whether the user has coverage of a rare line, find author overlap when the user asks 'what do I have on this?'\n\n" +
-      "Returns: `{fen, found, total_occurrences, excluded: {game_db_hits, unmapped_files, thin_entries_below_min, min_notes_chars}, hits: [{course, file, author, chapter, line, ply, notes_chars, subtree_moves}], truncated}`. `notes_chars` is the total characters of commentary in the subtree rooted at this occurrence — the primary rank signal. `ply` tells you how deep in the chapter's game tree this position sits (small ply = near the chapter's start).\n\n" +
+      "Look up which of the USER's own Chessable / PGN courses cover a position. This is the LLM's window into what the user has personally studied — not a general database. Two-step: `find_position_in_courses` returns metadata (course, chapter, author, updated_at, notes_chars, `course_file_id`); `read_course_at_position` fetches the actual commentary + variations from a specific hit.\n\n" +
+      "Use it as a reference library, not memory. Query patterns:\n" +
+      "  • 'Does my chosen line have coverage?' → search from the position, see which repertoires cover it.\n" +
+      "  • 'What do opposite-colour repertoires recommend against this move?' → search, filter by author/course to the other side.\n" +
+      "  • 'Has anyone tried my novelty before?' → search the position, if hits exist read the ones that reach it.\n\n" +
+      "Default sort is `recency` (most-recently-updated file first — theory shifts, 10-year-old material is less trustworthy than 2-month-old). Switch to `notes` when you specifically want the deepest annotated chapter regardless of age.\n\n" +
+      "Returns: `{fen, found, total_occurrences, sort, excluded, hits: [{course_file_id, course, file, author, chapter, line, ply, notes_chars, subtree_moves, updated_at}], truncated}`. Pass `course_file_id` to `read_course_at_position` to actually see the material.\n\n" +
       "Not available if the fenfind index isn't installed on the server — response includes a clear note in that case.",
     inputSchema: {
       type: "object",
@@ -919,11 +923,34 @@ const TOOLS: Tool[] = [
         node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'. When set, overrides `fen`/`moves`." },
         fen: { type: "string", description: "Starting position as FEN. Only used if `node_id` is not set." },
         moves: { type: "string", description: "Optional SAN moves on top of `fen` (or startpos). Only used if `node_id` is not set." },
+        sort: { type: "string", enum: ["recency", "notes"], description: "Ranking. `recency` (default) = most-recently-updated file first. `notes` = deepest annotation first regardless of age." },
         include_games: { type: "boolean", description: "Include hits from game-database PGNs (player headers instead of course/chapter titles). Default false — those are noise for course-lookup." },
         chapters_mode: { type: "boolean", description: "Return every chapter separately rather than best-per-course. Default false. Useful when a course has multiple chapters covering the same position." },
         min_notes_chars: { type: "number", description: "Minimum notes_chars per hit to be included. Default 400 (~a paragraph of prose). Set to 0 to see every occurrence." },
         limit: { type: "integer", description: "Max hits to return (default 25)." },
       },
+    },
+  },
+  {
+    name: "read_course_at_position",
+    description:
+      "Read the actual commentary + variations from a course file at a specific position. Second half of the find→read pair — `find_position_in_courses` returns metadata; this returns the material itself.\n\n" +
+      "Response includes the subtree as PGN (comments, NAGs, `[%cal]`/`[%csl]` arrows all preserved), plus the moves-to-position and chapter metadata. Depth-capped by `max_plies_below` (default 20) to keep responses small — widen when you want to see deeper analysis, or call with a different `fen` to jump to another position in the same file.\n\n" +
+      "Usage patterns:\n" +
+      "  • Read what an author says about a specific position → pass `course_file_id` from a find hit + the FEN.\n" +
+      "  • Explore a chapter from move 1 → pass `course_file_id` + `chapter`, no FEN.\n" +
+      "  • Skim deeper into a branch you're interested in → same file/chapter, wider `max_plies_below`.\n" +
+      "  • Compare how two authors annotate the same position → two calls with different `course_file_id`s.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        course_file_id: { type: "integer", description: "File id from a `find_position_in_courses` hit (`course_file_id` field)." },
+        fen: { type: "string", description: "Position to walk to (matched by polyglot Zobrist hash, so move-order transpositions work). Omit to return the chapter from move 1." },
+        moves: { type: "string", description: "Alternative to `fen`: SAN moves from startpos." },
+        chapter: { type: "string", description: "Substring match on chapter title (the White header in the PGN). Omit to auto-pick the first chapter containing the position; supply when a course has multiple chapters and you want a specific one." },
+        max_plies_below: { type: "integer", minimum: 0, maximum: 200, description: "How many plies of subtree to include below the target position. Default 20. Cap 200." },
+      },
+      required: ["course_file_id"],
     },
   },
   {
@@ -1690,24 +1717,55 @@ function deepAnalyseCancel(args: Args): unknown {
 // available (venv at $here/.venv/bin/python preferred, then falls back
 // to system python3). DB path is resolved inside fenfind.py itself
 // (FENFIND_DB env, then ~/positions.db).
-const FENFIND_SCRIPT: string | null = (() => {
+// Path resolution shared by both fenfind + readpgn. FENFIND_PATH env
+// overrides the bundled tools/fenfind/ directory.
+const FENFIND_DIR: string | null = (() => {
   const envPath = process.env.FENFIND_PATH?.trim();
-  if (envPath) {
-    const p = join(envPath, "fenfind");
-    return existsSync(p) ? p : null;
-  }
+  if (envPath && existsSync(join(envPath, "fenfind"))) return envPath;
   const here = dirname(fileURLToPath(import.meta.url));
-  const bundled = join(here, "..", "tools", "fenfind", "fenfind");
-  return existsSync(bundled) ? bundled : null;
+  const bundled = join(here, "..", "tools", "fenfind");
+  return existsSync(join(bundled, "fenfind")) ? bundled : null;
 })();
 
-// Cap on how long we let fenfind run — SQLite query with a hash index
-// should return in well under a second, but a stuck subprocess
-// shouldn't pin the MCP handler.
+// Cap on how long we let the subprocess run. SQLite hash lookup returns
+// sub-second; PGN read from a course file is O(chapter size) and rarely
+// exceeds a second. 15s is a stuck-process backstop, not a real limit.
 const FENFIND_TIMEOUT_MS = 15_000;
 
+async function runFenfindScript(scriptName: "fenfind" | "readpgn", args: string[]): Promise<string> {
+  if (!FENFIND_DIR) {
+    throw new Error("fenfind index not installed — set FENFIND_PATH or install the tools/fenfind bundle");
+  }
+  const script = join(FENFIND_DIR, scriptName);
+  return new Promise<string>((resolve, reject) => {
+    const p = spawn(script, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", d => { out += d.toString("utf8"); });
+    p.stderr.on("data", d => { err += d.toString("utf8"); });
+    const to = setTimeout(() => {
+      try { p.kill("SIGTERM"); } catch { /* already dead */ }
+      reject(new Error(`${scriptName} timed out after ${FENFIND_TIMEOUT_MS}ms`));
+    }, FENFIND_TIMEOUT_MS);
+    p.on("error", e => { clearTimeout(to); reject(e); });
+    p.on("close", code => {
+      clearTimeout(to);
+      if (code !== 0) reject(new Error(`${scriptName} exited ${code}: ${err.slice(0, 500)}`));
+      else resolve(out);
+    });
+  });
+}
+
+function parseFenfindJson(scriptName: string, stdout: string): unknown {
+  try {
+    return JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`${scriptName} returned non-JSON output (${e instanceof Error ? e.message : String(e)}): ${stdout.slice(0, 300)}`);
+  }
+}
+
 async function findPositionInCourses(args: Args): Promise<unknown> {
-  if (!FENFIND_SCRIPT) {
+  if (!FENFIND_DIR) {
     return {
       status: "not_available",
       note: "fenfind index not installed on this server. Set FENFIND_PATH env var to the directory containing the `fenfind` script and positions.db, or install the tools/fenfind bundle shipped in the npm package.",
@@ -1716,39 +1774,37 @@ async function findPositionInCourses(args: Args): Promise<unknown> {
 
   const resolved = await resolveFromNodeOrFen(args);
   const cliArgs: string[] = [resolved.fen, "--json"];
+  if (typeof args.sort === "string" && (args.sort === "recency" || args.sort === "notes")) {
+    cliArgs.push("--sort", args.sort);
+  }
   if (args.include_games) cliArgs.push("--games");
   if (args.chapters_mode) cliArgs.push("--chapters");
   if (typeof args.min_notes_chars === "number") cliArgs.push("--min", String(args.min_notes_chars));
   if (typeof args.limit === "number") cliArgs.push("-n", String(args.limit));
 
-  const stdout = await new Promise<string>((resolve, reject) => {
-    const p = spawn(FENFIND_SCRIPT!, cliArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "";
-    let err = "";
-    p.stdout.on("data", d => { out += d.toString("utf8"); });
-    p.stderr.on("data", d => { err += d.toString("utf8"); });
-    const to = setTimeout(() => {
-      try { p.kill("SIGTERM"); } catch { /* already dead */ }
-      reject(new Error(`fenfind timed out after ${FENFIND_TIMEOUT_MS}ms`));
-    }, FENFIND_TIMEOUT_MS);
-    p.on("error", e => { clearTimeout(to); reject(e); });
-    p.on("close", code => {
-      clearTimeout(to);
-      if (code !== 0) {
-        reject(new Error(`fenfind exited ${code}: ${err.slice(0, 500)}`));
-      } else {
-        resolve(out);
-      }
-    });
-  });
+  const stdout = await runFenfindScript("fenfind", cliArgs);
+  return parseFenfindJson("fenfind", stdout);
+}
 
-  try {
-    return JSON.parse(stdout);
-  } catch (e) {
-    throw new Error(`fenfind returned non-JSON output (${e instanceof Error ? e.message : String(e)}): ${stdout.slice(0, 300)}`);
+async function readCourseAtPosition(args: Args): Promise<unknown> {
+  if (!FENFIND_DIR) {
+    return {
+      status: "not_available",
+      note: "fenfind index not installed on this server. Set FENFIND_PATH env var to the directory containing the `fenfind`/`readpgn` scripts and positions.db.",
+    };
   }
+  const fileId = typeof args.course_file_id === "number" ? args.course_file_id : Number(args.course_file_id);
+  if (!Number.isFinite(fileId) || fileId <= 0) {
+    throw new Error("`course_file_id` is required — pass the value from a find_position_in_courses hit");
+  }
+  const cliArgs: string[] = ["--file-id", String(fileId)];
+  if (typeof args.fen === "string" && args.fen.trim() !== "") cliArgs.push("--fen", args.fen.trim());
+  if (typeof args.moves === "string" && args.moves.trim() !== "") cliArgs.push("--moves", args.moves.trim());
+  if (typeof args.chapter === "string" && args.chapter.trim() !== "") cliArgs.push("--chapter", args.chapter.trim());
+  if (typeof args.max_plies_below === "number") cliArgs.push("--max-plies-below", String(args.max_plies_below));
+
+  const stdout = await runFenfindScript("readpgn", cliArgs);
+  return parseFenfindJson("readpgn", stdout);
 }
 
 // Walk chess.js-free: resolve a path against a tree, throw if invalid.
@@ -2314,6 +2370,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "find_position_in_courses":
       return findPositionInCourses(args);
+
+    case "read_course_at_position":
+      return readCourseAtPosition(args);
 
     case "list_prep_files":
       return authedRequest("GET", "/api/agent/prep-files");
