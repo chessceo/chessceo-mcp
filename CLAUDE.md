@@ -17,6 +17,25 @@ Dockerfile               For Glama listing's automated safety checks (not for pr
 CLAUDE.md                This file.
 ```
 
+## Experimental — tear down, don't build up
+
+**No backwards compatibility.** This whole surface is experimental and I am the only real caller (via my own Claude/Codex MCP hosts). When something needs to change:
+
+- **Rename the thing.** Don't keep the old name as an alias. Delete it.
+- **Change the shape.** Don't add a new field alongside the old one with precedence rules. Kill the old field.
+- **Cut features.** Don't leave dead code paths marked "kept for compatibility". If nothing calls it after the change, delete it.
+- **No compat shims in commits.** Don't write `// legacy shape, kept for callers still passing X`. There are no such callers — I control both ends.
+- **Bump the minor version freely.** v0.31 → v0.32 → v0.33 is cheap. Semver-wise every commit is potentially breaking; that's fine.
+
+The one exception is **data at rest** — a prep file on disk with `[%ceo-eval …]` escape tags shouldn't stop parsing because I renamed a field. Migrations for stored data are OK; API compat shims are not.
+
+Concrete anti-patterns I've fallen into and shouldn't repeat:
+- Adding `stockfish_multipv` alongside a shared `multipv` with precedence rules — should have just replaced.
+- Keeping `read_prep_strategy_guide` alive as an alias when renaming to `read_opening_prep_guide` — should have just renamed hard.
+- "kept for signature stability" comments on parameters no other caller passes — just change the signature.
+
+If a rewrite churns the LLM's muscle memory for a session, that's a fair cost — the LLM re-reads the tool list on every session start anyway.
+
 ## Where this fits
 
 Three surfaces call chess.ceo:

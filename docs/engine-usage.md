@@ -129,7 +129,7 @@ Mental model:
 - **Stockfish = the checker.** "Is this line objectively good? What's actually best?" Narrow, deep, one answer.
 - **Lc0 = the explorer.** "What's practically interesting? What alternatives are worth a look?" Wide, breadth-first, several answers.
 
-`multipv` (unprefixed) still works as a shortcut when you want the same value on both engines, but the per-engine defaults are almost always the right call.
+Override the defaults with `stockfish_multipv` / `lc0_multipv` when a specific position warrants a different shape.
 
 ## Splitting engines on `cloud_analyse`
 

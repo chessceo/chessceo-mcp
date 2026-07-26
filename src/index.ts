@@ -555,12 +555,6 @@ const TOOLS: Tool[] = [
           maximum: 10000,
           description: "Think time in milliseconds (default 2000).",
         },
-        multipv: {
-          type: "integer",
-          minimum: 1,
-          maximum: 10,
-          description: "Shortcut: applies the same multipv to BOTH engines. Usually you want the per-engine defaults instead (SF=2, Lc0=8) — see stockfish_multipv / lc0_multipv below and the engine-usage guide.",
-        },
         stockfish_multipv: {
           type: "integer",
           minimum: 1,
@@ -1092,7 +1086,7 @@ async function fetchCompactEval(fen: string): Promise<CompactEval | null> {
     const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse",
       { fen, movetime_ms: 1500, multipv: 1 });
     const converted = convertCloudSnapshotResponse(raw, fen);
-    const stored = analysisToStoredEval(converted, fen);
+    const stored = analysisToStoredEval(converted);
     return storedEvalToCompact(stored, converted);
   } catch {
     return null;
@@ -1421,7 +1415,7 @@ async function runEvalJob(
         "/api/agent/cloud-engines/analyse",
         { fen: t.fen, movetime_ms: movetimeMs, multipv: 1 },
       );
-      const ev = analysisToStoredEval(analysis, t.fen);
+      const ev = analysisToStoredEval(analysis);
       if (ev) {
         pending.push({ op: "set_ceo_eval", node_id: t.nodeId, ceoEval: ev });
         job.evaluated++;
@@ -1593,7 +1587,7 @@ async function runDeepJob(job: DeepJob): Promise<void> {
   const body = {
     fen: job.fen,
     movetime_ms: job.movetimeMs,
-    multipv: job.multipv,
+    stockfish_multipv: job.multipv,
     engines: ["stockfish"],
   };
   let raw: unknown;
@@ -1629,7 +1623,7 @@ async function runDeepJob(job: DeepJob): Promise<void> {
   // quote_engine_eval can cite it later. We build a StoredEval that has
   // only the sf leg — no Lc0 was run.
   if (job.fileHandle && sf) {
-    const ev = analysisToStoredEval({ stockfish: sf }, job.fen);
+    const ev = analysisToStoredEval({ stockfish: sf });
     if (ev) {
       try {
         await storeEvalOnNode(job.fileHandle, ev);
@@ -1773,23 +1767,16 @@ function pathIntoTree(root: PrepNode, path: Path): PrepNode {
 // no PVs, White-POV cp / mate, depth, and derived NAG). Returns null if
 // there's no usable Stockfish signal (SF is the source of truth for
 // the NAG per docs).
-function analysisToStoredEval(analysis: unknown, fen: string): StoredEval | null {
+function analysisToStoredEval(analysis: unknown): StoredEval | null {
   if (!analysis || typeof analysis !== "object") return null;
   const r = analysis as {
     stockfish?: { depth?: number; lines?: Array<{ depth?: number; scoreCp?: number; mate?: number }> };
     lc0?:       { depth?: number; lines?: Array<{ depth?: number; scoreCp?: number; mate?: number }> };
   };
-  // NOTE: the backend already returns White-POV cp/mate (engine-ws flips
-  // in ParseInfo based on side-to-move, then cloud_snapshot passes the
-  // number through). Previously this function ALSO flipped on
-  // black-to-move — a double flip that silently inverted every
-  // Black-to-move position's stored eval, so half of every prep tree
-  // had wrong-sign ceoEval and the auto-attached .eval on those
-  // positions reported White as better when Black was. Any ceoEval
-  // written on a Black-to-move node prior to 2026-07-26 is inverted;
-  // re-run auto_evaluate on affected files to overwrite.
-  // Unused `fen` kept as an arg for signature stability with callers.
-  void fen;
+  // Backend returns White-POV cp/mate (engine-ws flips in ParseInfo
+  // based on side-to-move, cloud_snapshot passes through). Pure
+  // pass-through here — a previous sign-flip on black-to-move was
+  // wrong and silently inverted every Black-to-move stored eval.
 
   const engineEval = (block: typeof r.stockfish): StoredEngineEval | undefined => {
     const line = block?.lines?.[0];
@@ -2299,7 +2286,6 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       const fen = resolved.fen;
       const body: Record<string, unknown> = { fen };
       if (typeof args.movetime_ms === "number") body.movetime_ms = args.movetime_ms;
-      if (typeof args.multipv === "number") body.multipv = args.multipv;
       if (typeof args.stockfish_multipv === "number") body.stockfish_multipv = args.stockfish_multipv;
       if (typeof args.lc0_multipv === "number") body.lc0_multipv = args.lc0_multipv;
       if (typeof args.contempt === "number") body.contempt = args.contempt;
@@ -2313,7 +2299,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       // node_id=Y, because the store only fires when file_id+node_id
       // was supplied and the eval survives via the [%ceo-eval] escape.
       if (resolved.file) {
-        const ev = analysisToStoredEval(converted, fen);
+        const ev = analysisToStoredEval(converted);
         if (ev) await storeEvalOnNode(resolved.file, ev);
       }
       return converted;
