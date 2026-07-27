@@ -91,16 +91,18 @@ Two-tool workflow:
 
 Query patterns worth reaching for:
 
-- **"Does my chosen line have coverage?"** — search from the target position. If several recent courses cover it, read the top hit for background before writing prep.
-- **"What do opposite-colour repertoires recommend against this move?"** — same position, look at hits authored for the OTHER side. That's the LLM's window into "what will opponents have been told to play here".
-- **"Has anyone tried my novelty before?"** — search the post-novelty position. Zero hits = genuine novelty (good). Hits = it's been tried; read what happened.
-- **"Compare how two authors annotate the same critical position"** — two `read_course_at_position` calls with different `course_file_id`s.
+- **"Does my chosen line have coverage?"** — search from the target position. If several recent courses cover it, read the top 3-5 hits and see how much they agree; if they diverge, the position is a decision point worth annotating with the disagreement itself.
+- **"What do opposite-colour repertoires recommend against this move?"** — same position, look at hits authored for the OTHER side. That's the LLM's window into "what will opponents have been told to play here". Read every same-side hit — a repertoire that appears in one course may still be someone's line.
+- **"Has anyone tried my novelty before?"** — search the post-novelty position. Zero hits = genuine novelty (good). Hits = it's been tried; **read all of them**, not just the first — a novelty covered by three 2025 courses is not a novelty, but one that appears only in a single 2019 course probably still is.
+- **"Compare how multiple authors annotate the same critical position"** — several `read_course_at_position` calls with different `course_file_id`s from the same search. This is the common case, not a special one.
+
+**Read multiple hits, not just the top one.** The default action after `find_position_in_courses` returns 5 hits is FIVE `read_course_at_position` calls, not one. Different Chessable authors recommend different moves at critical junctions, and that disagreement is exactly the signal your user needs — it tells them where prep depth actually matters versus where the field is unanimous. Reading only the top hit gives the LLM one author's opinion presented as consensus; reading five gives the actual state of theory as the library sees it. The only excuse to stop after one is that the position is trivial (mainline endgame draw, hyper-quiet) and there's nothing to disagree about.
 
 Discipline:
 
 - Course material is a signal, not truth. A course written 2019 may be objectively refuted by current engine analysis; cross-check with `cloud_analyse` before adopting a course's recommendation wholesale.
 - Recency ranking matters most in fast-moving lines (Najdorf, KID, Grünfeld) and less in stable structures (Caro-Kann, Slav mainlines). Weight accordingly.
-- Cite the source when you use it: `{Ganguly (Reinventing the Ragozin, 2025) covers this exact position — recommends 12.Rd1.}` The reader can then go read the chapter themselves. Don't dump the course prose into your comment; point them at it.
+- Cite the sources when you use them: `{Ganguly (Reinventing the Ragozin, 2025) recommends 12.Rd1; Aagaard (Attacking Manual II) prefers 12.a3 — decide based on what you're comfortable with.}` Naming multiple authors when they disagree gives the reader something to act on; naming one when others also cover the position understates the picture.
 
 Not available if fenfind isn't installed on the server; both tools respond with `status: "not_available"` in that case.
 

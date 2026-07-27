@@ -16,6 +16,8 @@ When you call `cloud_analyse`, chess.ceo runs Stockfish and Lc0 in parallel on t
 
 Concrete failure this rule blocks: the LLM says *"9...Bb7: both engines 0.00"* after only calling `cloud_analyse` on the child positions (post-1.d4, post-castling). Both continuations really returned 0.00, but the Bb7 node was never analysed, and the claim reads to the user as a measurement. With this protocol, `quote_engine_eval(node_id=Bb7)` would return null and the LLM would either analyse it or reword to *"both continuations run to 0.00, so this position looks balanced"* (soft inference, honestly labelled).
 
+**Transposition propagation.** `cloud_analyse({file_id, node_id})` also stamps the resulting `ceoEval` on every OTHER node in the same file that reaches the same position by a different move order (3-field FEN match: pieces + side-to-move + castling). The response includes `also_stored_on: [id, id]` when this happens, and a follow-up `quote_engine_eval` on any of those twin nodes returns the same measurement — no second analysis needed. `auto_evaluate` also dedupes candidates by the same key and returns `skipped_transpositions` so you can see how much engine time it saved. See `list_transpositions` / `list_nodes({filter: "transpositions"})` for auditing where duplication exists before you start.
+
 **Concrete failure modes to avoid:**
 
 - Inventing an evaluation. If you say "this is +0.4 for White", that number must come from an engine call. Not a guess, not a vibe.

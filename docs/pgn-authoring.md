@@ -164,6 +164,16 @@ Prose is NEVER for:
 
   Test: if the reader can see it by looking at the position or clicking a branch, don't write it. Prose is only for plans, prep-signal, or WHY — the layer the app can't derive.
 
+## Transpositions: don't analyse (or comment on) the same position twice
+
+Move orders diverge and re-converge constantly. `1.d4 Nf6 2.c4 e6 3.Nc3` and `1.c4 e6 2.Nc3 Nf6 3.d4` land on the same position. The tree model doesn't merge those into one node — it stores both nodes with the same position — so if you're not careful you'll analyse both, quote engine numbers on both, and write two different comments for what is the same chess.
+
+**Detection.** `read_prep_file` shows `transposes_to: [id, id]` on every node whose position appears elsewhere in the file, and the header carries `transposition_groups` / `transposition_nodes` counts. `list_nodes({filter: "transpositions"})` lists just the affected nodes. `list_transpositions` groups every duplicated position with its member nodes. Match key is the frontend's rule: piece placement + side to move + castling rights (en-passant + clocks intentionally ignored).
+
+**Auto-propagation.** When `cloud_analyse({file_id, node_id})` stores `ceoEval` on a node, it also stamps every transposition of that position in the same file — see `also_stored_on: [id, id]` in the response. This means `auto_evaluate({only_missing: true})` naturally skips the twin. `auto_evaluate` also dedupes candidates before it starts and returns `skipped_transpositions` in the initial response so you can see how much engine time was saved.
+
+**Prose.** For commentary, pick a canonical node (usually the mainline-order occurrence — first in `transposes_to`) and write the plans / prep-signal / novelty there. On the twin, either point at it (`{transposes to 3.Nc3 in the mainline — see the note there}`) or leave the comment empty. Don't paste the same three sentences on both — they'll drift as you edit one and forget the other.
+
 ## Move-judgment symbols (NAGs)
 
 NAGs are the compact way to attach an evaluation to a move. Pass as `$N` strings to `set_nags`.

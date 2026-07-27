@@ -116,6 +116,37 @@ export function getParent(root: PrepNode, path: Path): { parent: PrepNode; index
   return { parent, index };
 }
 
+// Transposition key: the part of the FEN that decides whether two
+// positions are the same for opening/preparation purposes. Matches the
+// frontend's rule (frontend/src/game/gamestate/services/TreeService.ts
+// fenPositionMatch): piece placement + side to move + castling rights.
+// En-passant square, halfmove clock and fullmove number are excluded —
+// they diverge across move orders that reach the same position, and
+// treating them as significant would defeat the whole point of
+// transposition detection.
+export function positionKey(fen: string): string {
+  return fen.split(" ").slice(0, 3).join(" ");
+}
+
+// Group every node in the tree by transposition key. Returned in DFS
+// order — the FIRST node in each list is the earliest (mainline-preferred)
+// occurrence, which is what the LLM should treat as the canonical anchor
+// for prose ("this transposes to line X"). Groups with only one member
+// are still included, so callers can check membership cheaply; filter
+// for size ≥ 2 to get actual transpositions.
+export function buildFenIndex(root: PrepNode): Map<string, PrepNode[]> {
+  const index = new Map<string, PrepNode[]>();
+  const walk = (node: PrepNode): void => {
+    const key = positionKey(node.fen);
+    const arr = index.get(key);
+    if (arr) arr.push(node);
+    else index.set(key, [node]);
+    for (const c of node.children) walk(c);
+  };
+  walk(root);
+  return index;
+}
+
 // Deep-clone nodes on the path from root to the mutation target,
 // leaving unrelated subtrees shared. Downstream code treats siblings
 // as immutable so this sharing is safe.

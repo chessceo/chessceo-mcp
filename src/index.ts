@@ -25,11 +25,12 @@ import {
   promoteVariation,
   setAnnotations,
   setCeoEval,
+  setCeoEvalMany,
   setComment,
   setNags,
   setTag,
 } from "./pgn/mutations.js";
-import { buildIdIndex, NodeIdError, PathError, resolveNodeId, ROOT_ID } from "./pgn/paths.js";
+import { buildFenIndex, buildIdIndex, NodeIdError, PathError, positionKey, resolveNodeId, ROOT_ID } from "./pgn/paths.js";
 import type {
   Path,
   PrepAnnotations,
@@ -112,6 +113,7 @@ const AUTHED_TOOLS = new Set([
   "search_prep_files",
   "read_prep_file",
   "list_nodes",
+  "list_transpositions",
   "create_prep_file",
   "delete_prep_file",
   "add_move",
@@ -633,17 +635,33 @@ const TOOLS: Tool[] = [
       "  • `mainline` — the spine (children[0] recursively). Use for a compact 'what does the repertoire cover' view.\n" +
       "  • `novelties` — nodes carrying the `$146` NAG.\n" +
       "  • `leaves` — nodes with no children (variation endpoints). Useful for finding lines that need continuation.\n" +
+      "  • `transpositions` — nodes that share their position with at least one other node in the same file (piece placement + side to move + castling rights match). Response includes `transposes_to: [node_id, …]` per hit so you can see the partners without a second call. Use this BEFORE auto_evaluate on a large branch to see where analysis will double up, and BEFORE writing prose to know which nodes can share commentary via 'transposes to line X'.\n" +
       "  • `all` — every node id. Use only when you really need the whole list.\n\n" +
-      "Response: `{ file_id, filter, count, nodes: [{node_id, san, ply, ...}] }`. `...` is filter-specific — e.g. `has_comment` includes the first 80 chars of the comment; `missing_eval` includes nothing extra (just the addressing).",
+      "Response: `{ file_id, filter, count, nodes: [{node_id, san, ply, ...}] }`. `...` is filter-specific — e.g. `has_comment` includes the first 80 chars of the comment; `transpositions` includes `transposes_to`; `missing_eval` includes nothing extra (just the addressing).",
     inputSchema: {
       type: "object",
       properties: {
         id:       { type: "string", description: "Prep file id." },
-        filter:   { type: "string", enum: ["missing_eval", "has_comment", "has_annotations", "mainline", "novelties", "leaves", "all"], description: "Which nodes to list." },
+        filter:   { type: "string", enum: ["missing_eval", "has_comment", "has_annotations", "mainline", "novelties", "leaves", "transpositions", "all"], description: "Which nodes to list." },
         node_id:  { type: "string", description: "Subtree root (default `'r'` = whole file)." },
         max_depth:{ type: "integer", minimum: 0, description: "Cap the walk at this many plies below `node_id`. Omit for unlimited." },
       },
       required: ["id", "filter"],
+    },
+  },
+  {
+    name: "list_transpositions",
+    description:
+      "Group every position in a prep file that appears more than once — the same piece placement + side-to-move + castling rights reached by different move orders. Chess move orders diverge and re-converge constantly (1.d4 Nf6 2.c4 e6 3.Nc3 vs 1.c4 e6 2.Nc3 Nf6 3.d4 land on the same position); if you analyse both branches independently or write the same commentary twice, you're wasting engine time and inviting inconsistency.\n\n" +
+      "Call this BEFORE `auto_evaluate` on a big subtree to see how much work will actually be new, and BEFORE writing prose to know which nodes can share a comment or should point at each other with 'transposes to line X'.\n\n" +
+      "Note: engine evals auto-propagate — when `cloud_analyse({file_id, node_id})` stores `ceoEval` on a node, it also stamps every transposition of that position in the same file (see the response's `also_stored_on`). And `auto_evaluate({only_missing: true})` naturally skips the twin because it now has an eval. So detection is cheap AND propagation is automatic; this tool is for prose planning and one-shot audits, not for gating engine work.\n\n" +
+      "Response: `{ file_id, group_count, node_count, groups: [{ position_key, size, node_ids, sans }] }`. `position_key` is the 3-field FEN prefix used as the match key; `size` is how many nodes share it; `sans` are the moves that led to each occurrence (parallel with `node_ids`, DFS order — first entry is the earliest/mainline-preferred occurrence). Only groups with size ≥ 2 are returned; sorted by size descending.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Prep file id." },
+      },
+      required: ["id"],
     },
   },
   {
@@ -939,12 +957,14 @@ const TOOLS: Tool[] = [
     name: "find_position_in_courses",
     description:
       "Look up which of the USER's own Chessable / PGN courses cover a position. This is the LLM's window into what the user has personally studied — not a general database. Two-step: `find_position_in_courses` returns metadata (course, chapter, author, updated_at, notes_chars, `course_file_id`); `read_course_at_position` fetches the actual commentary + variations from a specific hit.\n\n" +
+      "**Read multiple hits, not just the top one.** A search commonly returns 3-10 courses covering the same position. Different authors recommend different moves, weight lines differently, and disagree about which sidelines matter — that disagreement is exactly the information you want. Default assumption: read the top 3-5 hits by recency, more if the position is critical (novelty candidate, main-line trunk, sharp tactical junction). Reading only the first hit gives you one author's opinion; reading five gives you the actual state of theory as your user's library sees it.\n\n" +
       "Use it as a reference library, not memory. Query patterns:\n" +
-      "  • 'Does my chosen line have coverage?' → search from the position, see which repertoires cover it.\n" +
-      "  • 'What do opposite-colour repertoires recommend against this move?' → search, filter by author/course to the other side.\n" +
-      "  • 'Has anyone tried my novelty before?' → search the position, if hits exist read the ones that reach it.\n\n" +
+      "  • 'Does my chosen line have coverage?' → search from the position, read multiple hits, see whether the field agrees on the main response.\n" +
+      "  • 'What do opposite-colour repertoires recommend against this move?' → search, then read every hit whose author/course maps to the other side.\n" +
+      "  • 'Has anyone tried my novelty before?' → search the position, if hits exist read all of them (a novelty that appears in ONE 2019 course is still a novelty to serious opponents; a novelty covered by three 2025 courses is not).\n" +
+      "  • 'What are the main disagreements between authors?' → read the top 3-5 hits, diff the recommended moves against each other; if two Chessable authors branch differently at move 8, that's a decision point worth annotating in your own file.\n\n" +
       "Default sort is `recency` (most-recently-updated file first — theory shifts, 10-year-old material is less trustworthy than 2-month-old). Switch to `notes` when you specifically want the deepest annotated chapter regardless of age.\n\n" +
-      "Returns: `{fen, found, total_occurrences, sort, excluded, hits: [{course_file_id, course, file, author, chapter, line, ply, notes_chars, subtree_moves, updated_at}], truncated}`. Pass `course_file_id` to `read_course_at_position` to actually see the material.\n\n" +
+      "Returns: `{fen, found, total_occurrences, sort, excluded, hits: [{course_file_id, course, file, author, chapter, line, ply, notes_chars, subtree_moves, updated_at}], truncated}`. Pass `course_file_id` to `read_course_at_position` to actually see the material — and pass it more than once, on the top few hits, not just the first one.\n\n" +
       "Not available if the fenfind index isn't installed on the server — response includes a clear note in that case.",
     inputSchema: {
       type: "object",
@@ -966,11 +986,12 @@ const TOOLS: Tool[] = [
     description:
       "Read the actual commentary + variations from a course file at a specific position. Second half of the find→read pair — `find_position_in_courses` returns metadata; this returns the material itself.\n\n" +
       "Response includes the subtree as PGN (comments, NAGs, `[%cal]`/`[%csl]` arrows all preserved), plus the moves-to-position and chapter metadata. Depth-capped by `max_plies_below` (default 20) to keep responses small — widen when you want to see deeper analysis, or call with a different `fen` to jump to another position in the same file.\n\n" +
+      "**Called once per search is a smell.** When `find_position_in_courses` returned 5 hits and you only read the first, you have 1 author's view of the position, not a survey. Read the top 3-5 hits by default; compare their recommendations and disagreements — that comparison is the value the user's library provides over your training data.\n\n" +
       "Usage patterns:\n" +
       "  • Read what an author says about a specific position → pass `course_file_id` from a find hit + the FEN.\n" +
       "  • Explore a chapter from move 1 → pass `course_file_id` + `chapter`, no FEN.\n" +
       "  • Skim deeper into a branch you're interested in → same file/chapter, wider `max_plies_below`.\n" +
-      "  • Compare how two authors annotate the same position → two calls with different `course_file_id`s.",
+      "  • **Compare how multiple authors annotate the same position → several calls with different `course_file_id`s (this is the common case, not the exception).** If the top hits recommend different moves, that's a decision point worth annotating with the disagreement itself.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1388,6 +1409,27 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   // (no move); otherwise the anchor node IS a real move and gets evaluated.
   walk(startNode, startNode.id === ROOT_ID);
 
+  // Dedup transpositions: if two candidate targets share the same
+  // 3-field FEN key, they're the same position reached by different
+  // move orders. Analyse ONE of them — cloud_analyse auto-propagates
+  // the resulting ceoEval to every other node with a matching key
+  // (see storeEvalOnNode), so the twin ends up with the same eval
+  // without a second engine call. Keep DFS-first (mainline-preferred)
+  // occurrence.
+  let skippedTranspositions = 0;
+  {
+    const seen = new Set<string>();
+    const deduped: Target[] = [];
+    for (const t of targets) {
+      const key = positionKey(t.fen);
+      if (seen.has(key)) { skippedTranspositions++; continue; }
+      seen.add(key);
+      deduped.push(t);
+    }
+    targets.length = 0;
+    targets.push(...deduped);
+  }
+
   // Nothing to do → return a done job synthetically so the caller doesn't
   // need to special-case the empty response.
   if (targets.length === 0) {
@@ -1434,6 +1476,9 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   return {
     job_id: jobId,
     target_count: targets.length,
+    // Transpositions inside the walk that we skipped because they'll
+    // pick up the eval via auto-propagation. Zero when there are none.
+    skipped_transpositions: skippedTranspositions,
     status: "running",
     // Rough time estimate at the current default movetime. Serialization
     // on the per-combo semaphore means walltime ≈ target_count × movetime.
@@ -2052,7 +2097,13 @@ async function loadPrepFile(id: string): Promise<{ file: PrepFile; version: numb
 
 // Recursively project a PrepNode into the requested view. `depthLeft`
 // null → unlimited; 0 → just the node without children.
-function projectNode(node: PrepNode, view: ViewMode, depthLeft: number | null): unknown {
+//
+// `fenIndex` (optional) enables the `transposes_to` field — for each
+// node whose position also appears elsewhere in the SAME file, we
+// annotate it with the OTHER occurrences' ids. Pass null (the default)
+// to skip the annotation entirely; passing the map costs one lookup
+// per node projected.
+function projectNode(node: PrepNode, view: ViewMode, depthLeft: number | null, fenIndex: Map<string, PrepNode[]> | null = null): unknown {
   const base: Record<string, unknown> = {
     id: node.id,
     san: node.san,
@@ -2065,15 +2116,22 @@ function projectNode(node: PrepNode, view: ViewMode, depthLeft: number | null): 
     base.fen = node.fen;
     if (node.annotations) base.annotations = node.annotations;
   }
+  if (fenIndex && node.id !== ROOT_ID) {
+    const group = fenIndex.get(positionKey(node.fen));
+    if (group && group.length > 1) {
+      const others = group.filter(n => n.id !== node.id).map(n => n.id);
+      if (others.length > 0) base.transposes_to = others;
+    }
+  }
   // Children handling depends on view + depth budget.
   const showChildren = depthLeft === null || depthLeft > 0;
   const childDepth = depthLeft === null ? null : depthLeft - 1;
   if (showChildren && node.children.length > 0) {
     if (view === "spine") {
       // Only follow children[0] — collapses the tree to the mainline.
-      base.children = [projectNode(node.children[0], view, childDepth)];
+      base.children = [projectNode(node.children[0], view, childDepth, fenIndex)];
     } else {
-      base.children = node.children.map(c => projectNode(c, view, childDepth));
+      base.children = node.children.map(c => projectNode(c, view, childDepth, fenIndex));
     }
   } else {
     base.children = [];
@@ -2093,6 +2151,17 @@ async function readPrepFile(args: Args): Promise<unknown> {
   const idIndex = buildIdIndex(file.root);
   const path = resolveNodeId(idIndex, startNodeId);
   const anchor = getNodeByPath(file.root, path);
+  const fenIndex = buildFenIndex(file.root);
+
+  // How many DISTINCT positions in the file appear more than once,
+  // and how many nodes are involved. Shown in the header so the LLM
+  // sees at a glance whether transpositions matter here before diving
+  // into the tree.
+  let transGroups = 0;
+  let transNodes = 0;
+  for (const arr of fenIndex.values()) {
+    if (arr.length > 1) { transGroups++; transNodes += arr.length; }
+  }
 
   const header: Record<string, unknown> = {
     id: fileIdEcho ?? id,
@@ -2101,6 +2170,8 @@ async function readPrepFile(args: Args): Promise<unknown> {
     view,
     node_id: startNodeId,
     max_depth: maxDepth,
+    transposition_groups: transGroups,
+    transposition_nodes: transNodes,
   };
 
   if (view === "pgn") {
@@ -2116,7 +2187,7 @@ async function readPrepFile(args: Args): Promise<unknown> {
     return { ...header, pgn: subtreePgn };
   }
 
-  return { ...header, tree: projectNode(anchor, view, maxDepth) };
+  return { ...header, tree: projectNode(anchor, view, maxDepth, fenIndex) };
 }
 
 // Produce a PGN string for a subtree rooted at `anchor`, truncated
@@ -2157,6 +2228,7 @@ async function listNodes(args: Args): Promise<unknown> {
   const idIndex = buildIdIndex(file.root);
   const path = resolveNodeId(idIndex, startNodeId);
   const anchor = getNodeByPath(file.root, path);
+  const fenIndex = filter === "transpositions" ? buildFenIndex(file.root) : null;
 
   type Hit = Record<string, unknown>;
   const hits: Hit[] = [];
@@ -2183,6 +2255,14 @@ async function listNodes(args: Args): Promise<unknown> {
           include = node.children.length === 0; break;
         case "mainline":
           include = spineOnly; break;
+        case "transpositions": {
+          const group = fenIndex!.get(positionKey(node.fen));
+          if (group && group.length > 1) {
+            include = true;
+            extra.transposes_to = group.filter(n => n.id !== node.id).map(n => n.id);
+          }
+          break;
+        }
         case "all":
           include = true; break;
         default:
@@ -2207,6 +2287,30 @@ async function listNodes(args: Args): Promise<unknown> {
   walk(anchor, maxDepth, rootIsSpineForFilter);
 
   return { file_id: id, filter, node_id: startNodeId, max_depth: maxDepth, count: hits.length, nodes: hits };
+}
+
+// list_transpositions — every position that occurs 2+ times in the
+// file, so the LLM knows where its analysis / prose will double up.
+async function listTranspositions(args: Args): Promise<unknown> {
+  const id = String(args.id);
+  const { file } = await loadPrepFile(id);
+  const fenIndex = buildFenIndex(file.root);
+
+  type Group = { position_key: string; size: number; node_ids: string[]; sans: (string | null)[] };
+  const groups: Group[] = [];
+  for (const [key, arr] of fenIndex.entries()) {
+    if (arr.length < 2) continue;
+    groups.push({
+      position_key: key,
+      size: arr.length,
+      node_ids: arr.map(n => n.id),
+      sans: arr.map(n => n.san),
+    });
+  }
+  groups.sort((a, b) => b.size - a.size || a.position_key.localeCompare(b.position_key));
+
+  const nodeCount = groups.reduce((s, g) => s + g.size, 0);
+  return { file_id: id, group_count: groups.length, node_count: nodeCount, groups };
 }
 
 // Strip cruft the LLM doesn't need from the DB-position response.
@@ -2485,21 +2589,42 @@ function getNodeByPath(root: PrepNode, path: Path): PrepNode {
   return cur;
 }
 
-// Persist a fresh ceoEval on the node referenced by the file handle.
-// Best-effort — if the file version raced (another agent saved
-// between our GET and our PUT), we silently drop the store rather
-// than fail the analysis the LLM actually asked for. The eval is
-// still returned in the response either way.
-async function storeEvalOnNode(handle: FileHandle, ev: StoredEval): Promise<void> {
+// Persist a fresh ceoEval on the node referenced by the file handle
+// AND on every other node in the same file that transposes to the
+// same position (matches on the frontend's 3-field FEN key: piece
+// placement + side to move + castling). Best-effort — if the file
+// version raced (another agent saved between our GET and our PUT),
+// we silently drop the store rather than fail the analysis the LLM
+// actually asked for. The eval is still returned in the response
+// either way.
+//
+// Return: ids of every node the eval was stamped on (empty on error).
+// The primary node's id is always first (if present).
+async function storeEvalOnNode(handle: FileHandle, ev: StoredEval): Promise<string[]> {
   try {
-    const step = setCeoEval(handle.parsedFile, handle.nodePath, ev);
-    const newPgn = exportPGN(step.file);
+    const anchor = getNodeByPath(handle.parsedFile.root, handle.nodePath);
+    const key = positionKey(anchor.fen);
+    const fenIndex = buildFenIndex(handle.parsedFile.root);
+    const group = fenIndex.get(key) ?? [anchor];
+
+    // Resolve every transposed node back to its path. cloneOnPath
+    // rebuilds the spine so we need paths, not references — the
+    // id index was built against the original tree and every id in
+    // `group` exists there.
+    const idIndex = handle.idIndex ?? buildIdIndex(handle.parsedFile.root);
+    const paths = group.map(n => resolveNodeId(idIndex, n.id));
+
+    const { file: newFile, ids } = setCeoEvalMany(handle.parsedFile, paths, ev);
+    const newPgn = exportPGN(newFile);
     await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(handle.id)}`, {
       pgn: newPgn,
       expected_version: handle.version,
     });
+    // Ensure the primary node (the one the LLM addressed) comes first.
+    const anchorId = anchor.id;
+    return [anchorId, ...ids.filter(x => x !== anchorId)];
   } catch {
-    // Best-effort — the analysis result is what the LLM asked for.
+    return [];
   }
 }
 
@@ -2739,7 +2864,15 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       // was supplied and the eval survives via the [%ceo-eval] escape.
       if (resolved.file) {
         const ev = analysisToStoredEval(converted);
-        if (ev) await storeEvalOnNode(resolved.file, ev);
+        if (ev) {
+          const stamped = await storeEvalOnNode(resolved.file, ev);
+          if (stamped.length > 1) {
+            // Surface the propagation so the LLM sees exactly which
+            // other nodes now carry this eval (and can skip them for
+            // re-analysis).
+            (converted as Record<string, unknown>).also_stored_on = stamped.slice(1);
+          }
+        }
       }
       return converted;
     }
@@ -2768,6 +2901,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "list_nodes":
       return listNodes(args);
+
+    case "list_transpositions":
+      return listTranspositions(args);
 
     case "create_prep_file":
       return authedRequest("POST", "/api/agent/prep-files", {

@@ -193,6 +193,28 @@ export function setCeoEval(file: PrepFile, path: Path, ev: StoredEval | null): M
   return { file: { tags: file.tags, root: newRoot }, id: target.id };
 }
 
+// Set the same ceoEval on every path in `paths`. One clone-and-return
+// rather than N sequential setCeoEval calls. Used by cloud_analyse to
+// propagate a single measurement to every transposition of the position
+// in the file — the LLM shouldn't have to re-analyse a position it
+// already measured under a different move order.
+export function setCeoEvalMany(file: PrepFile, paths: Path[], ev: StoredEval | null): { file: PrepFile; ids: string[] } {
+  if (paths.length === 0) return { file, ids: [] };
+  // Sort deepest-first so cloning one target doesn't invalidate later
+  // ones' path references — cloneOnPath re-parents everything along
+  // the path, so mutating a shallower path after a deeper one is safe;
+  // sorting is defensive.
+  const sorted = [...paths].sort((a, b) => b.length - a.length);
+  let cur = file;
+  const ids: string[] = [];
+  for (const p of sorted) {
+    const step = setCeoEval(cur, p, ev);
+    cur = step.file;
+    ids.push(step.id);
+  }
+  return { file: cur, ids };
+}
+
 // Set or clear a tag. Passing null / empty removes.
 export function setTag(file: PrepFile, key: string, value: string | null): PrepFile {
   const cleanedKey = key.trim();
