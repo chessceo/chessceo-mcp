@@ -155,14 +155,40 @@ Prose is NEVER for:
 - Move recommendations ("here White should play h4") — add_move it.
 - Restating the eval a NAG already conveys.
 - **Describing a sibling variation you already added as a branch.** If move A has variation B added as `add_move(A, sibling)`, don't ALSO write `{if B then ...}` on A. The reader clicks B on the board — the branch is already there.
-- **Restating what the app already renders.** The reader opens the file in the app and sees: every sibling move (with count / avg rating / top players from the DB), each node's stored `ceoEval`, the NAG glyphs, the tree structure. Duplicating any of that in prose is pure noise.
+- **Restating what the app already renders.** The reader opens the file in the app and sees: every sibling move (with count / avg rating / top players from the DB), each node's stored `ceoEval`, the NAG glyphs, the tree structure. Duplicating any of that in prose is pure noise. Three specific patterns to never emit:
 
-  - ❌ `{5...Bb4 (180/247), 5...d6 (26), 5...Be7 (18), 5...d5 (7), 5...g6 (2)}` — those are the sibling variations, already visible.
-  - ❌ `{Main move, 180 of 247 games (So, Giri, Karjakin, Duda). Eval −0.20/−0.27.}` — count, top players, eval all shown by the app.
-  - ✅ `{Main move; the sharpest test is actually 5...d5 (only 7 games but avg 2526) — see the variation.}`
-  - ✅ `{Popular, but leads to the endgame Black draws — 6.Bd2 is where prep depth matters.}`
+  **1. Spread lists.** The database viewer already shows sibling counts and fashion scores next to every move. Pasting them into prose is doubled noise.
+
+  - ❌ `{Spread: 5.O-O ≈50, 6.h3 ≈42, 6.a4 ≈35, 6.Be3 ≈27, 6.Nbd2 ≈18 — the more White delays castling the less he gets.}` — every number here is one click away.
+  - ❌ `{Spread: 5.Nf3 ≈56, 5.Bd3 ≈55, 5.Be3 ≈47, 5.Rb1 ≈35, 5.h3 ≈32.}` — same problem.
+  - ✅ `{Two roads: quiet 5.Bd3 keeps position closed, sharp 5.e5 concedes the centre for tempo — cover both.}` — names the *character*, not the numbers.
+
+  **2. Raw centipawn values in prose.** The app shows `ceoEval` as `+0.20 / −0.27` next to every node and the NAG glyph next to that. If you write `≈−60` or `+0.35` in a comment, no reader knows whether that's a spread number, an eval, or a made-up decoration — and every one of them is visible without your prose.
+
+  - ❌ `{Best try, but ≈80 — a fifth of a pawn worse than the ...Nd7 move order.}` — cp number, opaque.
+  - ❌ `{0.00 at depth 31, 259M nodes.}` — engine metadata masquerading as insight; the eval is already visible.
+  - ❌ `{≈−60. White's f5 sacrifice does not work with the centre already liquidated.}` — the number tells the reader nothing; the *reason* is the whole comment.
+  - ✅ `{White's f5 sacrifice doesn't work with the centre already liquidated — no target for the pawn.}` — same content, no fake precision.
+  - ✅ Or better: set the NAG (`$17` for clear Black advantage) and drop the prose entirely; the glyph carries the judgment.
+
+  **3. Top-player rosters.** Count + names of the top players are shown on hover in the app. `146 GM games, Nakamura, Kramnik, MVL, So all play this` restates two visible facts.
+
+  - ❌ `{150 GM games and Caruana's choice against Liang in 2026.}` — count is visible; the specific-game citation is fine on its own if it carries prep signal.
+  - ✅ `{Caruana played this against Liang, Superbet 2026 — the current top-choice among elite Black players.}` — same specific-game citation, no restated count.
+
+  **Positive vocabulary for what the app can't render.** The reader wants labels the DB doesn't provide:
+
+  - `{The old main line — dominant through 2015, replaced by 6.Bd2 after Ding-Carlsen 2016.}` — historical context, not visible.
+  - `{The current fashion — 40+ games since 2024, mostly at 2700+.}` — recency signal condensed to a phrase, not a number list.
+  - `{Solid try (holds objectively) vs the sharper 6.Nd5 (small edge but requires memory) — choose based on style.}` — practical framing, uses labels the reader can act on.
+  - `{Prophylactic — every White plan is based on Bg5, this pre-empts it.}` — one word (prophylactic / restraint / clamp / breakthrough) does the work of a paragraph.
 
   Test: if the reader can see it by looking at the position or clicking a branch, don't write it. Prose is only for plans, prep-signal, or WHY — the layer the app can't derive.
+
+- **Prose "prevents Y" claims — always show Y as a `?`-tagged variation instead.** When you write `{6.f3 is necessary to prevent ...Bxh3.}` the reader has to trust you that the tactic exists. When you instead add a sibling variation `6.O-O? Bxh3 7.gxh3 …` marked with `?` in the NAG, the reader can play through the refutation themselves. Two benefits: (1) grounds the claim in an actual move sequence, so hallucinated tactics get exposed at authoring time when SAN validation runs; (2) the reader learns the tactic instead of taking your word for it. Rule: any prose of the shape "X because it prevents/avoids/deals with Y" should be either supplemented by or replaced with a `?`-marked variation showing Y.
+
+  - ❌ `{6.f3 is necessary — 6.O-O? runs into ...Bxh3 winning the exchange.}` — no way to check.
+  - ✅ Under 5.Nc3, add both `6.f3` (mainline) AND `6.O-O` as a sibling variation with `set_nags(["$2"])` and continuation `[Bxh3, gxh3, ...]` showing the refutation. The prose on 6.f3 shrinks to `{The 6.O-O branch shows why f3 must come first.}` — six words, refutation is playable.
 
 ## Prep is a TREE, not a line — the pasted-engine-PV anti-pattern
 
@@ -187,6 +213,21 @@ This is the single biggest quality problem in current LLM output on this system:
 3. If exactly 1 → continue linearly; note *why* it's the only move in a comment.
 
 The failure mode you're avoiding: writing prep that reads as if the opponent will helpfully play the engine's #1 preference at every ply. They won't; that's the whole point of prep.
+
+## Course chapters describe COVERAGE, not consensus — always `get_position_stats` at mainline branch points
+
+Concrete failure this rule was written to fix: a Modern Defence file made 6.O-O-O the mainline of the entire "5.Qd2 Nd7" branch, wrote a chapter around it, and analysed 15+ plies deep. `get_position_stats` at that position was NEVER called this session. Instead, the LLM ran `find_position_in_courses`, saw So / Kraai / Mihajlov all had chapters titled "5.Qd2 b5 6.O-O-O Bb7" — and cargo-culted that into "6.O-O-O is the main line". It isn't. 6.O-O-O is one of five White tries, and it wasn't even the most-played.
+
+**Course chapter titles tell you what the author decided to cover, not what practical opponents play.** A White repertoire author picks one continuation per branch and writes it up in depth — the chapter is named after what they cover. That is not the same as "this is the mainline in current practice", nor is it the same as "this is the most-played move against 5...Nd7". Five different courses can all pick different 6th moves for the same position; five different courses can all pick the SAME 6th move for coverage reasons (that's the sharpest / most-testing / easiest-to-teach) even though the DB shows practice is split five ways.
+
+**Rule:** before committing to a mainline branch — either `add_move` as the first child of a parent that's on the mainline, or `add_line` for a linear continuation you're calling THE way White/Black plays — you must have called `get_position_stats` at that parent position in this session. If you didn't, the mutation will warn (soft). Course reads are for what the authors *say about the move*, not what the mainline *is*.
+
+**How the two tools relate at a branching decision:**
+
+1. `get_position_stats(position)` — what moves are actually played, ranked by count / avg rating / fashion. This decides which moves need a branch (any move ≥5% frequency in reasonable practice; any move with unusually high avg rating even if less frequent).
+2. `find_position_in_courses(position)` → `read_course_at_position(...)` — for each branch you decided to include, what do the authors say about it, and where do they disagree. This decides the *content* of each branch (recommended reply, key concepts, historical context), not which branches exist.
+
+Getting these backwards is the failure this section exists to prevent.
 
 ## Transpositions: don't analyse (or comment on) the same position twice
 

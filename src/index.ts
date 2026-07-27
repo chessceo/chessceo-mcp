@@ -1181,6 +1181,55 @@ async function fetchCompactEval(fen: string): Promise<CompactEval | null> {
 
 // Rewrite the /api/agent/cloud-engines/analyse response (two engines,
 // each with lines[] and a bestMove) so PVs and bestMove come back in SAN.
+// Session-lifetime memory of which positions the LLM has actually asked
+// the DB about via `get_position_stats`. Keyed by the 3-field FEN
+// (piece placement + side to move + castling — same key used for
+// transposition detection). Used to warn on `add_move` / `add_line` under
+// a parent the LLM never DB-checked, which is the exact shape of the
+// bug where the LLM read course chapters and cargo-culted a "mainline"
+// that the actual games at the position don't play.
+//
+// One MCP server process per user, so this Set is effectively per-user
+// for the length of a session. Not persisted — a new session starts empty.
+const positionsStatsChecked = new Set<string>();
+// Nodes we've ALREADY warned on for the "no stats check" pattern this
+// session, so repeated adds under the same parent don't spam the LLM.
+const noStatsWarned = new Set<string>();
+
+// Detect the anti-patterns the LLM keeps producing in comment prose.
+// All of these restate what the app already renders elsewhere:
+//   - spread lists ("5.O-O ≈50, 6.h3 ≈42, ...")
+//   - raw centipawn values in prose ("≈-60", "+0.35", "at depth 24")
+//   - long roster restatement ("146 GM games, Nakamura, Kramnik, MVL")
+// Return an array of warning strings — one per matched category — so the
+// LLM sees exactly which pattern to remove.
+function commentAntiPatterns(comment: string): string[] {
+  if (!comment || typeof comment !== "string") return [];
+  const warns: string[] = [];
+
+  // Spread list: ≈ followed by a 2-3-digit number, appearing 2+ times
+  // (one appearance is a stray, two+ is a comma-separated spread the LLM
+  // pasted from stats output).
+  const spreadMatches = comment.match(/≈\s*[+\-−]?\d{1,3}/g) ?? [];
+  if (spreadMatches.length >= 2) {
+    warns.push("comment contains a spread list (≈ + counts) — the DB viewer already shows sibling counts and fashion scores next to every move, so this is doubled noise. Name the character of the choice instead (\"solid vs sharp\", \"old vs fashionable\") or drop the numbers.");
+  }
+
+  // Raw centipawn in prose: "+0.35", "-0.20", "+80" (not preceded by move
+  // number). Also "at depth N" or "N nodes" — engine metadata as prose.
+  if (/(?:^|[^\d.])[+-]\d\.\d\d(?!\d)/.test(comment) || /≈\s*[+\-−]?\d{2,3}\b/.test(comment) ||
+      /\bat depth \d+\b/i.test(comment) || /\b\d{2,3}M nodes\b/.test(comment)) {
+    warns.push("comment contains raw centipawn values or engine metadata — the app renders ceoEval + NAG glyph next to every node, so these numbers are doubled noise AND opaque (readers can't tell if ≈-60 means eval, spread, or something else). Set the NAG (set_nags) and let the glyph carry the judgment; drop the number from the prose.");
+  }
+
+  // Roster: "N GM games" pattern
+  if (/\b\d{2,4}\s+GM games\b/i.test(comment)) {
+    warns.push("comment restates game count — the app shows the count on hover. Either cite a specific game with signal (\"Caruana-Liang, Superbet 2026\") or drop the number.");
+  }
+
+  return warns;
+}
+
 // Return a warning string when an add_line is suspiciously long-and-linear
 // (the anti-pattern: LLM pastes a 15-ply engine PV into a single add_line
 // call as if it were prepared repertoire). Two thresholds so the message
@@ -1271,21 +1320,33 @@ function dispatchMutation(
   };
   const resolve = (id: string): Path => resolveNodeId(idIndex, id);
   switch (kind) {
-    case "add_move":
-      return addMove(file, resolve(nodeIdField("parent_id")), String(op.san));
+    case "add_move": {
+      const parentPath = resolve(nodeIdField("parent_id"));
+      const parent = getNodeByPath(file.root, parentPath);
+      const noStatsWarn = noStatsCheckWarning(parent);
+      const step = addMove(file, parentPath, String(op.san));
+      return { ...step, ...(noStatsWarn ? { warning: noStatsWarn } : {}) };
+    }
     case "add_line": {
       const sans = Array.isArray(op.sans) ? (op.sans as unknown[]).map(String) : [];
       const parentPath = resolve(nodeIdField("parent_id"));
+      const parent = getNodeByPath(file.root, parentPath);
       const step = addLine(file, parentPath, sans);
       const lastId = step.line.length > 0 ? step.line[step.line.length - 1].id : nodeIdField("parent_id");
-      // Same anti-pattern warning as the standalone add_line case — a long
-      // unbranched line inside a batch is still a pasted engine PV.
-      const warning = longLineWarning(sans.length);
-      const extra = warning ? { warning } : {};
-      return { file: step.file, id: lastId, results: step.line, ...extra };
+      // Same anti-pattern warnings as the standalone add_line case —
+      // long unbranched line + no-stats-check parent are both bugs
+      // whether they land solo or inside a batch.
+      const longLineWarn = longLineWarning(sans.length);
+      const noStatsWarn = noStatsCheckWarning(parent);
+      const warnings = [longLineWarn, noStatsWarn].filter((s): s is string => !!s);
+      return { file: step.file, id: lastId, results: step.line, ...(warnings.length > 0 ? { warnings } : {}) };
     }
-    case "set_comment":
-      return setComment(file, resolve(nodeIdField("node_id")), typeof op.comment === "string" ? op.comment : "");
+    case "set_comment": {
+      const commentStr = typeof op.comment === "string" ? op.comment : "";
+      const commentWarns = commentAntiPatterns(commentStr);
+      const step = setComment(file, resolve(nodeIdField("node_id")), commentStr);
+      return { ...step, ...(commentWarns.length > 0 ? { warnings: commentWarns } : {}) };
+    }
     case "set_nags":
       return setNags(file, resolve(nodeIdField("node_id")), Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : []);
     case "set_annotations": {
@@ -1325,17 +1386,18 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
 
   let file = parsePGN(g.pgnContent);
   let idIndex = buildIdIndex(file.root);
-  const results: Array<{ node_id: string; line?: unknown; warning?: string }> = [];
+  const results: Array<{ node_id: string; line?: unknown; warning?: string; warnings?: string[] }> = [];
   for (let i = 0; i < mutations.length; i++) {
     const op = mutations[i] as Record<string, unknown>;
     try {
-      const step = dispatchMutation(file, idIndex, op) as { file: PrepFile; id: string; results?: unknown; warning?: string };
+      const step = dispatchMutation(file, idIndex, op) as { file: PrepFile; id: string; results?: unknown; warning?: string; warnings?: string[] };
       file = step.file;
       idIndex = buildIdIndex(file.root);
       results.push({
         node_id: step.id,
         ...(step.results !== undefined ? { line: step.results } : {}),
         ...(step.warning ? { warning: step.warning } : {}),
+        ...(step.warnings && step.warnings.length > 0 ? { warnings: step.warnings } : {}),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -2098,7 +2160,7 @@ function storedEvalToCompact(ev: StoredEval | null, analysis: unknown): CompactE
 // resolve node_ids without rebuilding the index itself.
 async function applyMutation(
   args: Args,
-  mutator: (file: PrepFile, idIndex: Map<string, Path>) => { file: PrepFile; id: string; results?: unknown },
+  mutator: (file: PrepFile, idIndex: Map<string, Path>) => { file: PrepFile; id: string; results?: unknown; warning?: string; warnings?: string[] },
 ): Promise<unknown> {
   const id = String(args.id);
   const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
@@ -2107,7 +2169,7 @@ async function applyMutation(
 
   const file = parsePGN(g.pgnContent);
   const idIndex = buildIdIndex(file.root);
-  let result: { file: PrepFile; id: string; results?: unknown };
+  let result: { file: PrepFile; id: string; results?: unknown; warning?: string; warnings?: string[] };
   try {
     result = mutator(file, idIndex);
   } catch (err) {
@@ -2128,8 +2190,26 @@ async function applyMutation(
     ok: true,
     node_id: result.id,
     ...(result.results !== undefined ? { line: result.results } : {}),
+    ...(result.warning ? { warning: result.warning } : {}),
+    ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
     version: savedRow.version,
   };
+}
+
+// Compute the "you never DB-checked this parent" warning. Called from
+// add_move / add_line handlers with the parent node. Returns undefined
+// when either (a) the parent was checked this session (or is root — the
+// starting position doesn't need a DB check), (b) we already warned on
+// this parent (dedup so building a big branching subtree isn't spammy),
+// or (c) the mutator is running against a parent whose position has a
+// stored ceoEval (implies the LLM has done SOME analytical work here).
+function noStatsCheckWarning(parent: PrepNode): string | undefined {
+  if (parent.id === ROOT_ID) return undefined;
+  const key = positionKey(parent.fen);
+  if (positionsStatsChecked.has(key)) return undefined;
+  if (noStatsWarned.has(parent.id)) return undefined;
+  noStatsWarned.add(parent.id);
+  return `no get_position_stats call for the parent (id=${parent.id}, ${parent.san}) this session. Course chapter titles describe what an author chose to cover, not what practical opponents play — treating "the So chapter says 6.O-O-O" as "the mainline is 6.O-O-O" is the exact pattern this warning exists to catch. Call get_position_stats at this position (via file_id+node_id=${parent.id}) BEFORE deciding which branches belong here; suppress this warning by making that call. Warned once per parent per session.`;
 }
 
 // ── read_prep_file / list_nodes ────────────────────────────────────
@@ -2809,6 +2889,10 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
         (converted as { source?: string }).source = source;
         if (ev) (converted as { eval?: CompactEval }).eval = ev;
       }
+      // Record that this position was DB-checked this session. Downstream
+      // add_move / add_line under this parent won't fire the "no stats
+      // check" warning. Keyed by 3-field FEN so transpositions count.
+      positionsStatsChecked.add(positionKey(fen));
       return converted;
     }
 
@@ -2983,26 +3067,44 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return authedRequest("DELETE", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
 
     case "add_move":
-      return applyMutation(args, (file, idIndex) =>
-        addMove(file, resolveNodeId(idIndex, argNodeId(args, "parent_id")), String(args.san)),
-      );
+      return applyMutation(args, (file, idIndex) => {
+        const parentPath = resolveNodeId(idIndex, argNodeId(args, "parent_id"));
+        const parent = getNodeByPath(file.root, parentPath);
+        const noStatsWarn = noStatsCheckWarning(parent);
+        const step = addMove(file, parentPath, String(args.san));
+        return { ...step, ...(noStatsWarn ? { warning: noStatsWarn } : {}) };
+      });
 
     case "add_line": {
       const sansArg = Array.isArray(args.sans) ? (args.sans as unknown[]).map(String) : [];
-      const warning = longLineWarning(sansArg.length);
-      const result = await applyMutation(args, (file, idIndex) => {
+      const longLineWarn = longLineWarning(sansArg.length);
+      return applyMutation(args, (file, idIndex) => {
         const parentPath = resolveNodeId(idIndex, argNodeId(args, "parent_id"));
+        const parent = getNodeByPath(file.root, parentPath);
+        const noStatsWarn = noStatsCheckWarning(parent);
         const step = addLine(file, parentPath, sansArg);
         const lastId = step.line.length > 0 ? step.line[step.line.length - 1].id : argNodeId(args, "parent_id");
-        return { file: step.file, id: lastId, results: step.line };
+        const combined = [longLineWarn, noStatsWarn].filter((s): s is string => !!s);
+        return {
+          file: step.file,
+          id: lastId,
+          results: step.line,
+          ...(combined.length > 0 ? { warnings: combined } : {}),
+        };
       });
-      return warning ? { ...(result as object), warning } : result;
     }
 
-    case "set_comment":
-      return applyMutation(args, (file, idIndex) =>
-        setComment(file, resolveNodeId(idIndex, argNodeId(args)), typeof args.comment === "string" ? args.comment : ""),
-      );
+    case "set_comment": {
+      const commentStr = typeof args.comment === "string" ? args.comment : "";
+      const commentWarns = commentAntiPatterns(commentStr);
+      return applyMutation(args, (file, idIndex) => {
+        const step = setComment(file, resolveNodeId(idIndex, argNodeId(args)), commentStr);
+        return {
+          ...step,
+          ...(commentWarns.length > 0 ? { warnings: commentWarns } : {}),
+        };
+      });
+    }
 
     case "set_nags":
       return applyMutation(args, (file, idIndex) =>
