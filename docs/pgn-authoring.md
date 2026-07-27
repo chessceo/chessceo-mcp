@@ -164,6 +164,30 @@ Prose is NEVER for:
 
   Test: if the reader can see it by looking at the position or clicking a branch, don't write it. Prose is only for plans, prep-signal, or WHY — the layer the app can't derive.
 
+## Prep is a TREE, not a line — the pasted-engine-PV anti-pattern
+
+This is the single biggest quality problem in current LLM output on this system: after a `cloud_analyse` call the LLM sees a PV like `[Nf3, Nc6, Bb5, a6, Ba4, Nf6, O-O, Be7, Re1, b5, Bb3, O-O, ...]` and pastes it into a single `add_line`. 15 moves in one call, no branching, no reason to think the opponent will play any of those specific moves — one line of engine output through positions where both sides had real choices.
+
+**The reader can tell.** A pasted engine PV always looks the same: long, straight, no comments, no NAGs, ends in a position with no obvious relevance. It's the shape of the output, not the individual moves, that gives it away.
+
+**The fix is branching, not length.** Every ply along a variation is a decision point for whoever's turn it is. If the opponent has more than one plausible move at that ply (`get_position_stats` shows two or more moves with meaningful frequency; `predict_human_move` shows two or more moves with real WDL differences; `cloud_analyse.lc0.lines` shows several evals within 0.2 of each other), then that ply MUST branch — you're not preparing if you only cover one response.
+
+**Concrete rules:**
+
+- **`cloud_analyse` PVs are capped at 6 plies by default and marked `pv_truncated: true` when longer.** This is not a bug — it's telling you that the engine's confidence tail is not repertoire material. To see further into a line, don't raise `pv_max_plies` — pick the position at the end of the truncated PV and run a fresh `cloud_analyse` on it. That's what makes it prep instead of pasted output.
+
+- **`add_line` warns when you pass ≥9 plies** and warns hard at ≥14 plies. Long unbranched lines with no comment default to "engine PV pasted as prep" in the reader's eyes. Rule of thumb: if you added ≥8 plies in one call, at least half of them should have branched.
+
+- **Genuine forcing sequences ARE allowed** — a 12-ply mate combination, an obligated exchange sequence where both sides have exactly one reasonable move at every ply. In those cases: (a) write a comment naming what makes it forced (`{Every move here is forced by the mate threat on h7.}`), and (b) don't stop where the engine PV stops — stop where the position becomes evaluatable ("winning endgame, technique wins"; "mate in 3, easy calculation from here").
+
+**Correct pattern for building a variation.** At every ply:
+
+1. What are the plausible replies? `get_position_stats` (frequencies), `cloud_analyse` with `lc0_multipv: 8` (candidate spread), `predict_human_move` (what people actually play).
+2. If ≥2 are plausible → branch. `add_move` each, then recurse on each branch or `add_line` for each of the several straightforward continuations.
+3. If exactly 1 → continue linearly; note *why* it's the only move in a comment.
+
+The failure mode you're avoiding: writing prep that reads as if the opponent will helpfully play the engine's #1 preference at every ply. They won't; that's the whole point of prep.
+
 ## Transpositions: don't analyse (or comment on) the same position twice
 
 Move orders diverge and re-converge constantly. `1.d4 Nf6 2.c4 e6 3.Nc3` and `1.c4 e6 2.Nc3 Nf6 3.d4` land on the same position. The tree model doesn't merge those into one node — it stores both nodes with the same position — so if you're not careful you'll analyse both, quote engine numbers on both, and write two different comments for what is the same chess.

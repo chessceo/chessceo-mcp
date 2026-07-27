@@ -191,8 +191,19 @@ Two calls:
 
 If the user is specifically preparing to *play* the black side in a must-win, add `contempt=-30` (or up to `-60` for a harder steer) on a follow-up call to see which lines Lc0 finds most fighting for Black. Compare against Stockfish's objective read to make sure the fighting choice isn't just losing.
 
+## The PV is not a line to paste
+
+`cloud_analyse` caps each PV at 6 plies (3 full moves) by default and marks longer ones `pv_truncated: true`. This is deliberate — the tail of a PV is where the engine's confidence collapses (SF at depth 24 has resolved the first few plies solidly and hedged everything after), and pasting long PVs into `add_line` as prep is the biggest documented anti-pattern of this whole system.
+
+**A PV tells you what the engine sees, not what will be played.** A 15-ply PV pasted as a variation is one line of engine output through positions where the opponent had 2-3 real alternatives at almost every ply. That's not prep — that's the engine's preferred game, and no opponent plays the engine's preferred game.
+
+**To see further into a line, walk the tree.** Take the position at the tail of your truncated PV, run a fresh `cloud_analyse` on it. That call gives you the multipv candidate set at THAT position — the opponent's actual options — which is what you need to decide whether to branch. Don't raise `pv_max_plies` unless you're verifying a forcing sequence (a mate, an obligated recapture chain).
+
+Practical: raise `lc0_multipv` (default 8) to see the candidate spread on the current position, NOT to see further down one PV. If Lc0 shows moves 1-3 within 0.15 of each other, that's a branching point — three responses need coverage, not one PV.
+
 ## What NOT to do
 
+- **Don't paste PVs as `add_line` variations.** See the section above and `pgn-authoring.md`'s "Prep is a TREE, not a line" section. This is not a stylistic preference — the tool warns you starting at 9 plies and warns hard at 14+, and the truncated `pv_truncated: true` marker is telling you the engine itself doesn't stand behind the tail.
 - **Don't quote Lc0's contempt-biased eval as objective.** If you tell the user "Lc0 gives Black +0.30 here" without disclosing you set contempt=-30, that's misleading.
 - **Don't run cloud analysis just for casual questions.** `cloud_analyse` costs the user real money per second. If the question is "is 1.e4 or 1.d4 better?", the free `analyse` (single Stockfish, 2s) or `get_position_stats` (11.7M-game database) is enough.
 - **Don't ignore the disagreement.** When Stockfish and Lc0 diverge sharply, that's exactly when you should explain *why* to the user — not paper over it.

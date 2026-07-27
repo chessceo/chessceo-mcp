@@ -535,6 +535,7 @@ const TOOLS: Tool[] = [
       "• When they agree → high confidence. When they disagree → look at both scores and reason WHY (Stockfish sharply higher = tactic Lc0 missed; Lc0 higher = long-term positional edge past Stockfish's horizon). Never dismiss either — the disagreement is the signal.\n\n" +
       "Contempt (`contempt`) skews Lc0 (only Lc0 — Stockfish always stays objective) toward White (positive) or Black (negative). Signed 0-100 strength — same scale as the web UI's ContemptStrength slider (the server multiplies by 8 to produce Lc0's internal cp bias). Typical values: ±15 for a light nudge, ±30-60 for real fighting play, ±80-100 for maximum steer. Use it to find non-objective 'practical' ideas or when the user needs to lean toward fighting/solid lines with a specific colour. Do NOT quote a contempt-biased eval as objective — cross-check with Stockfish.\n\n" +
       "Also useful: pass `moves` on top of `fen` to explore a variation without computing FENs yourself (e.g. fen='<tabiya>', moves='b4 a5 c3'). And the flip-side-to-move threat check documented in the guide is a great free trick.\n\n" +
+      "**PVs are capped at 6 plies by default (3 full moves), and lines that got truncated are marked with `pv_truncated: true`.** This is deliberate: the tail of a PV is where the engine's confidence collapses, AND pasting a long PV into `add_line` as if it were prepared repertoire is the #1 documented anti-pattern of this MCP — a 15-move PV is one line of engine output through positions where both sides had real choices, not a repertoire. To see further, don't raise `pv_max_plies`; instead, walk the tree one branch at a time with a fresh `cloud_analyse` at each position where the opponent has real alternatives — that's what makes it prep instead of pasted output. Only raise the cap when you're verifying a forcing sequence (a mate, a forced tactical resolution), not to build lines.\n\n" +
       "For the full guide including worked examples, call the `read_engine_usage_guide` tool.\n\n" +
       "Not for casual questions — this costs real money per second. Use `get_position_stats` for anything that doesn't require deep prep.\n\n" +
       "**When called with `file_id`+`node_id` (preferred inside a prep file), the resulting eval is auto-stored on that node's `ceoEval` — you can then quote it with quote_engine_eval on any later call.** This is what makes engine attribution trustworthy: prose that says 'engines say X on node Y' can only be true if a call was actually made against node_id=Y.",
@@ -578,6 +579,12 @@ const TOOLS: Tool[] = [
           items: { type: "string", enum: ["stockfish", "lc0"] },
           description:
             "Which engines to run. Default = both. Use `[\"lc0\"]` to skip Stockfish (e.g. while a deep_analyse job is holding the SF slot on the same combo). Use `[\"stockfish\"]` when only the objective read matters. The skipped engine's field is omitted from the response.",
+        },
+        pv_max_plies: {
+          type: "integer",
+          minimum: 1,
+          maximum: 40,
+          description: "Cap each returned PV to this many plies (default 6 = 3 full moves). PVs beyond ~6 plies are speculative and are the anti-pattern behind pasted-engine-line 'prep' — don't raise unless you're specifically checking a forcing tactic or verifying a mate. When a line was truncated, the response marks it with `pv_truncated: true`.",
         },
       },
     },
@@ -712,7 +719,8 @@ const TOOLS: Tool[] = [
     name: "add_line",
     description:
       "Append a linear sequence of moves under `parent_id`. Each SAN in the list becomes the mainline child of the previous — one call instead of N add_move calls for a straight variation. If the parent already has other children, this whole line is appended as a variation (promote_variation the first move if you want it as the mainline).\n\n" +
-      "Auto-saves. Returns `{node_id, line: [{node_id, san}, ...], version}` — `node_id` is the last (leaf) node's id, `line` is every node created in order so you can address any of them next.",
+      "**Anti-pattern: pasting an engine PV as a single long `add_line`.** Real prep is a tree, not a line. Almost every position along a variation has more than one plausible move — pasting a 12+-ply engine PV without branching at those points is the #1 documented failure mode of this MCP: it produces a page that reads as prep but ignores every decision the opponent actually gets to make. Long unbranched lines get a warning field in the response starting at ~9 plies and a strong warning at 14+ plies. Rule of thumb: if you added ≥8 plies in one call, at least half of them should have branched. Genuine exceptions exist (forced mates, obligated exchange sequences) — in those cases add a comment naming what makes the sequence forced (`{Every move here is forced by the mate threat.}`), so the reader knows it's forced by chess, not by LLM laziness.\n\n" +
+      "Auto-saves. Returns `{node_id, line: [{node_id, san}, ...], version}` — `node_id` is the last (leaf) node's id, `line` is every node created in order so you can address any of them next. When long-and-linear, also includes `warning: \"...\"`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1173,6 +1181,44 @@ async function fetchCompactEval(fen: string): Promise<CompactEval | null> {
 
 // Rewrite the /api/agent/cloud-engines/analyse response (two engines,
 // each with lines[] and a bestMove) so PVs and bestMove come back in SAN.
+// Return a warning string when an add_line is suspiciously long-and-linear
+// (the anti-pattern: LLM pastes a 15-ply engine PV into a single add_line
+// call as if it were prepared repertoire). Two thresholds so the message
+// escalates — a 10-ply Berlin mainline is fine, a 20-ply LLM extrapolation
+// almost never is. Threshold applies at the CALL level, not against
+// existing tree depth — the anti-pattern is a single tool call adding
+// many plies at once with no user thought about where the branching should
+// live.
+function longLineWarning(sansLength: number): string | undefined {
+  if (sansLength >= 14) {
+    return `you added ${sansLength} plies in one call without branching — this is the shape of a pasted engine PV, not a repertoire. Real prep branches at every ply where the opponent has meaningful alternatives. Either (a) delete the tail and rebuild with add_move at each decision point, calling cloud_analyse + get_position_stats to see what actually gets played, or (b) if this really is one forcing sequence (mate combination, tactical winner), add a comment naming what makes it forced. Long unbranched lines with no comment default to "engine PV pasted as prep" in the reader's eyes.`;
+  }
+  if (sansLength >= 9) {
+    return `${sansLength}-ply linear line — check that every ply is a genuine only-move or a documented mainline. If the opponent has real alternatives at any ply (get_position_stats would show 2+ moves with meaningful frequency), that ply should branch instead. Prep is a tree, not a line.`;
+  }
+  return undefined;
+}
+
+// Trim every PV in a converted cloud-analyse response to `maxPlies`
+// and mark each trimmed line with `pv_truncated: true` so the LLM
+// sees what happened. Applied ONLY to cloud_analyse (short synchronous
+// snapshot); deep_analyse is the explicit "give me the deep line"
+// tool and keeps its full PV.
+function capPvsInResponse(converted: unknown, maxPlies: number): void {
+  if (!converted || typeof converted !== "object") return;
+  const r = converted as { stockfish?: EngineBlock; lc0?: EngineBlock };
+  for (const eng of [r.stockfish, r.lc0]) {
+    if (!eng || !Array.isArray(eng.lines)) continue;
+    for (const line of eng.lines) {
+      if (Array.isArray(line.pv) && line.pv.length > maxPlies) {
+        line.pv = line.pv.slice(0, maxPlies);
+        (line as { pv_truncated?: boolean }).pv_truncated = true;
+      }
+    }
+  }
+  (converted as { pv_max_plies?: number }).pv_max_plies = maxPlies;
+}
+
 function convertCloudSnapshotResponse(raw: unknown, startFen: string): unknown {
   if (!raw || typeof raw !== "object") return raw;
   const r = raw as { stockfish?: EngineBlock; lc0?: EngineBlock };
@@ -1232,7 +1278,11 @@ function dispatchMutation(
       const parentPath = resolve(nodeIdField("parent_id"));
       const step = addLine(file, parentPath, sans);
       const lastId = step.line.length > 0 ? step.line[step.line.length - 1].id : nodeIdField("parent_id");
-      return { file: step.file, id: lastId, results: step.line };
+      // Same anti-pattern warning as the standalone add_line case — a long
+      // unbranched line inside a batch is still a pasted engine PV.
+      const warning = longLineWarning(sans.length);
+      const extra = warning ? { warning } : {};
+      return { file: step.file, id: lastId, results: step.line, ...extra };
     }
     case "set_comment":
       return setComment(file, resolve(nodeIdField("node_id")), typeof op.comment === "string" ? op.comment : "");
@@ -1275,14 +1325,18 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
 
   let file = parsePGN(g.pgnContent);
   let idIndex = buildIdIndex(file.root);
-  const results: Array<{ node_id: string; line?: unknown }> = [];
+  const results: Array<{ node_id: string; line?: unknown; warning?: string }> = [];
   for (let i = 0; i < mutations.length; i++) {
     const op = mutations[i] as Record<string, unknown>;
     try {
-      const step = dispatchMutation(file, idIndex, op);
+      const step = dispatchMutation(file, idIndex, op) as { file: PrepFile; id: string; results?: unknown; warning?: string };
       file = step.file;
       idIndex = buildIdIndex(file.root);
-      results.push({ node_id: step.id, ...(step.results !== undefined ? { line: step.results } : {}) });
+      results.push({
+        node_id: step.id,
+        ...(step.results !== undefined ? { line: step.results } : {}),
+        ...(step.warning ? { warning: step.warning } : {}),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`mutation #${i} (${String(op.op)}) failed: ${msg}`);
@@ -2856,6 +2910,21 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       if (Array.isArray(args.engines)) body.engines = args.engines;
       const raw = await authedRequest("POST", "/api/agent/cloud-engines/analyse", body);
       const converted = convertCloudSnapshotResponse(raw, fen);
+      // PV cap: engine PVs beyond ~6 plies are speculative (the tail is
+      // where the search's confidence collapses — SF at depth 24 has
+      // seen the first few plies solidly and hedged everything after).
+      // More importantly, LLMs paste long PVs into `add_line` as if
+      // they were prepared repertoire. A 15-move PV pasted as a
+      // variation is one line of engine output through positions
+      // where both sides had real choices — not a repertoire. Cap the
+      // affordance: return only what's load-bearing (3 full moves for
+      // understanding the point), let the caller re-analyse the
+      // resulting position if they want to see further. Override via
+      // `pv_max_plies` for the rare case (deep tactics verification).
+      const pvMaxPlies = typeof args.pv_max_plies === "number" && args.pv_max_plies > 0
+        ? Math.min(args.pv_max_plies, 40)
+        : 6;
+      capPvsInResponse(converted, pvMaxPlies);
       // Node-addressed calls: persist the result on the node's ceoEval
       // so a later quote_engine_eval can cite this measurement. This is
       // the anti-hallucination hinge — prose that says "engines say X
@@ -2918,14 +2987,17 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
         addMove(file, resolveNodeId(idIndex, argNodeId(args, "parent_id")), String(args.san)),
       );
 
-    case "add_line":
-      return applyMutation(args, (file, idIndex) => {
-        const sans = Array.isArray(args.sans) ? (args.sans as unknown[]).map(String) : [];
+    case "add_line": {
+      const sansArg = Array.isArray(args.sans) ? (args.sans as unknown[]).map(String) : [];
+      const warning = longLineWarning(sansArg.length);
+      const result = await applyMutation(args, (file, idIndex) => {
         const parentPath = resolveNodeId(idIndex, argNodeId(args, "parent_id"));
-        const step = addLine(file, parentPath, sans);
+        const step = addLine(file, parentPath, sansArg);
         const lastId = step.line.length > 0 ? step.line[step.line.length - 1].id : argNodeId(args, "parent_id");
         return { file: step.file, id: lastId, results: step.line };
       });
+      return warning ? { ...(result as object), warning } : result;
+    }
 
     case "set_comment":
       return applyMutation(args, (file, idIndex) =>
