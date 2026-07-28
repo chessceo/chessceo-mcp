@@ -377,7 +377,8 @@ const TOOLS: Tool[] = [
   {
     name: "describe_position",
     description:
-      "Everything you need to understand a position in one call. USE BEFORE COMMENTING — pieces get misplaced when reading a FEN, hanging pieces missed, 'the knight on d5' turns out to not exist. ~50-100 ms per call (chess-primitive analysis is instant; the Stockfish leg dominates wall time).\n\n" +
+      "**CALL WHEN**: about to write ANY comment on a position that describes what's happening on the board — piece activity, structure, plans, weaknesses. This is the single biggest lever for prose quality in the whole system. Live audit: nodes where describe_position was called first produced comments grounded specifically in the position (correct piece squares, real pawn structure, actual weak squares); nodes where it wasn't produced generic pattern-matched prose that confidently named pieces on wrong squares. `set_comment` now emits a warning whenever a substantive comment lands on a node whose position was never grounded via describe_position this session — that warning is telling you to fix a class of hallucination that already showed up in your output. Cheap: chess-primitive analysis is instant, Stockfish leg is ~50-100 ms, no billing.\n\n" +
+      "Everything you need to understand a position in one call. Pieces get misplaced when reading a FEN, hanging pieces missed, 'the knight on d5' turns out to not exist.\n\n" +
       "Returns three layers:\n\n" +
       "**Board state** — piece placements per colour, material balance in pawn units, contested pieces (attackers + defenders), hanging pieces, checkers if in check, castling rights, en passant, side to move, full LEGAL MOVES list. Use `.legalMoves` when `add_move` rejects an illegal SAN.\n\n" +
       "**Structural analysis** — chess-concept observations a human sees at a glance:\n" +
@@ -735,7 +736,10 @@ const TOOLS: Tool[] = [
   {
     name: "set_comment",
     description:
-      "Set (or clear, with empty string) the text comment on the node identified by `node_id`. Comments are for plans, prep-signal, and interpretation the app can't derive — NOT for describing moves that should be variations instead. Auto-saves.",
+      "Set (or clear, with empty string) the text comment on the node identified by `node_id`. Comments are for plans, prep-signal, and interpretation the app can't derive — NOT for describing moves that should be variations instead. Auto-saves.\n\n" +
+      "**Two guardrails fire in the response as `warnings: [...]`:**\n" +
+      "  1. **Content scan** — comments containing spread lists (`≈50, ≈42, …`), raw centipawn values (`≈−60`, `+0.35`, `at depth 24`), or roster restatement (`146 GM games — Nakamura, …`) are all restating what the app already renders. The warning names the fix (set the NAG and drop the number; label the character not the numbers; cite a specific game instead of a count).\n" +
+      "  2. **Ungrounded prose** — substantive comments (≥40 chars) on a node whose position was never passed to `describe_position` this session are prone to hallucinated structural claims (piece on wrong square, invented captures, misidentified pawn structure). Call `describe_position` with `file_id`+`node_id` BEFORE writing prose about the position; the same node's warning clears once the position is described.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1196,6 +1200,17 @@ const positionsStatsChecked = new Set<string>();
 // session, so repeated adds under the same parent don't spam the LLM.
 const noStatsWarned = new Set<string>();
 
+// Session-lifetime memory of positions the LLM has called
+// `describe_position` on. Same 3-field FEN key. Live-log audit
+// (2026-07-27 Modern Defence session): 13 describe_position calls
+// vs 50+ set_comment ops — most comments were written blind. When
+// describe_position IS called before commentary, prose accuracy
+// jumps sharply (user's own observation). This tracks the same way
+// as positionsStatsChecked and drives the noDescribeWarning below.
+const positionsDescribed = new Set<string>();
+// Once-per-node dedup for the describe warning.
+const noDescribeWarned = new Set<string>();
+
 // Detect the anti-patterns the LLM keeps producing in comment prose.
 // All of these restate what the app already renders elsewhere:
 //   - spread lists ("5.O-O ≈50, 6.h3 ≈42, ...")
@@ -1344,8 +1359,12 @@ function dispatchMutation(
     case "set_comment": {
       const commentStr = typeof op.comment === "string" ? op.comment : "";
       const commentWarns = commentAntiPatterns(commentStr);
-      const step = setComment(file, resolve(nodeIdField("node_id")), commentStr);
-      return { ...step, ...(commentWarns.length > 0 ? { warnings: commentWarns } : {}) };
+      const targetPath = resolve(nodeIdField("node_id"));
+      const targetNode = getNodeByPath(file.root, targetPath);
+      const describeWarn = noDescribeWarning(targetNode, commentStr);
+      const step = setComment(file, targetPath, commentStr);
+      const all = [...commentWarns, ...(describeWarn ? [describeWarn] : [])];
+      return { ...step, ...(all.length > 0 ? { warnings: all } : {}) };
     }
     case "set_nags":
       return setNags(file, resolve(nodeIdField("node_id")), Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : []);
@@ -2196,6 +2215,23 @@ async function applyMutation(
   };
 }
 
+// Compute the "you never called describe_position on this node" warning.
+// Fires from set_comment when the comment is substantive (>= 40 chars —
+// anything shorter is a label / pointer, doesn't need structural
+// grounding). LLMs are unreliable at reading FEN strings and confidently
+// describe positions that don't match the actual board; describe_position
+// is a pure-computation grounding pass that reliably fixes this. Warn
+// once per node.
+function noDescribeWarning(node: PrepNode, comment: string): string | undefined {
+  if (node.id === ROOT_ID) return undefined;
+  if (comment.length < 40) return undefined;
+  const key = positionKey(node.fen);
+  if (positionsDescribed.has(key)) return undefined;
+  if (noDescribeWarned.has(node.id)) return undefined;
+  noDescribeWarned.add(node.id);
+  return `substantive comment (${comment.length} chars) on a node whose position was never grounded via describe_position this session (id=${node.id}, ${node.san}). LLMs invent captures, miscount pieces, and swap files/ranks when reading FEN strings — describe_position is a pure-computation pass (~1 ms, no engine cost, structural facts + Stockfish's per-term eval breakdown) that reliably prevents this class of hallucination. In live audits, prose accuracy jumps sharply on nodes where describe_position was called first. Call describe_position with file_id+node_id=${node.id} BEFORE writing prose. Warned once per node.`;
+}
+
 // Compute the "you never DB-checked this parent" warning. Called from
 // add_move / add_line handlers with the parent node. Returns undefined
 // when either (a) the parent was checked this session (or is root — the
@@ -2917,6 +2953,10 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       if (ev && ev.found === true) {
         merged.engineEvalTerms = { terms: ev.terms, total: ev.total };
       }
+      // Record so set_comment on this node won't fire the "not described"
+      // warning. Keyed by 3-field FEN so a described position is
+      // credited across its transpositions too.
+      positionsDescribed.add(positionKey(resolved.fen));
       return merged;
     }
 
@@ -3098,10 +3138,14 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       const commentStr = typeof args.comment === "string" ? args.comment : "";
       const commentWarns = commentAntiPatterns(commentStr);
       return applyMutation(args, (file, idIndex) => {
-        const step = setComment(file, resolveNodeId(idIndex, argNodeId(args)), commentStr);
+        const targetPath = resolveNodeId(idIndex, argNodeId(args));
+        const targetNode = getNodeByPath(file.root, targetPath);
+        const describeWarn = noDescribeWarning(targetNode, commentStr);
+        const step = setComment(file, targetPath, commentStr);
+        const all = [...commentWarns, ...(describeWarn ? [describeWarn] : [])];
         return {
           ...step,
-          ...(commentWarns.length > 0 ? { warnings: commentWarns } : {}),
+          ...(all.length > 0 ? { warnings: all } : {}),
         };
       });
     }

@@ -316,7 +316,9 @@ Contempt scale is signed 0-100 (same as the web UI's ContemptStrength slider). T
 
 ### Before you write any commentary: describe_position
 
-LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent captures, miscount pieces. Before you write a comment describing what's happening in a position, call `describe_position(fen)`. Pure computation (~1 ms, no engine), returns two layers:
+**This is the biggest lever for prose quality in the whole system.** Live audit of a recent session — 13 `describe_position` calls versus 50+ `set_comment` ops. The nodes where `describe_position` was called first produced comments that grounded specifically in the position (correct piece squares, real pawn structure, actual weak squares). The nodes where it wasn't produced generic prose that pattern-matched to similar-*looking* positions and confidently named pieces on wrong squares. This gap is why `set_comment` now emits a warning whenever a substantive comment (≥40 chars) lands on a node whose position was never grounded via `describe_position` this session.
+
+LLMs are not reliable at reading FEN strings — you'll swap files/ranks, invent captures, miscount pieces. Before you write a comment describing what's happening in a position, call `describe_position` (with `file_id`+`node_id` inside a prep file). Pure computation (~1 ms, no engine), returns two layers:
 
 **Board state** — piece placements, material, contested pieces (attackers + defenders), hanging list, check state, castling, en passant, legal moves. Fixes the *"Black's queen on c7 is defended by the knight on d5"* failure when actually there's no knight on d5 and the queen is on c8.
 
