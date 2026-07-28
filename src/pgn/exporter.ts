@@ -29,9 +29,19 @@ export function exportPGN(file: PrepFile): string {
   }
   parts.push(""); // blank line between headers and movetext
 
-  // Movetext.
+  // Movetext. Root can carry a text comment AND visual annotations
+  // AND a stored eval — all rendered in a single {…} block before the
+  // first move so the parser's regexes pick them all up on re-parse.
+  // (v0.46 fix: previously only the visual/eval annotation was emitted
+  // and it went out unbraced — a plain comment set on the root via
+  // set_comment silently disappeared during export.)
+  const rootPreludeBits: string[] = [];
+  if (file.root.comment && file.root.comment.trim().length > 0) {
+    rootPreludeBits.push(file.root.comment.trim());
+  }
   const rootAnnotation = renderNodeAnnotation(file.root);
-  const rootPrelude = rootAnnotation ? `${rootAnnotation} ` : "";
+  if (rootAnnotation) rootPreludeBits.push(rootAnnotation);
+  const rootPrelude = rootPreludeBits.length > 0 ? `{${rootPreludeBits.join(" ")}} ` : "";
   const movetext = rootPrelude + renderChildren(file.root.children, file.root.ply + 1, /* forceMoveNumber */ true);
   const result = file.tags.Result ?? "*";
   parts.push(`${movetext.trim()} ${result}`);

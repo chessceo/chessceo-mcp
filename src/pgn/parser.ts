@@ -27,7 +27,15 @@ import { deriveNodeId, ROOT_ID } from "./paths.js";
 const CAL_RE = /\[%cal\s+([^\]]+)\]/g;
 const CSL_RE = /\[%csl\s+([^\]]+)\]/g;
 const CEO_EVAL_RE = /\[%ceo-eval\s+([^\]]+)\]/g;
-const ANY_CMD_RE = /\[%[a-z-]+\s+[^\]]+\]/g;
+// Only strip the three escape commands we structurally parse (into
+// annotations + ceoEval). Everything else — [%eval], [%wdl], [%clk],
+// [%emt], and any future/unknown [%foo] — is preserved verbatim in
+// the comment text so a parse → export round-trip is lossless.
+// v0.46 fix: previously ANY_CMD_RE matched `\[%[a-z-]+\s+[^\]]+\]`
+// and silently dropped every unknown escape (real report: a
+// `{[%eval] [%wdl]}` comment on an imported Lichess PGN got stripped
+// on a set_tag save cycle).
+const KNOWN_CMD_RE = /\[%(?:cal|csl|ceo-eval)\s+[^\]]+\]/g;
 
 // Parse a `sf=+0.20/38` or `lc0=M-5/22` fragment into its numeric parts.
 // Returns null if the value doesn't parse; the parser tolerates missing
@@ -93,9 +101,32 @@ export function parseCommentAnnotations(comment: string): {
     if (ev.sf || ev.lc0 || ev.nag) ceoEval = ev;
   }
 
-  const text = comment.replace(ANY_CMD_RE, "").replace(/\s+/g, " ").trim();
+  const text = comment.replace(KNOWN_CMD_RE, "").replace(/\s+/g, " ").trim();
   const annotations = arrows.length || highlights.length ? { arrows, highlights } : undefined;
   return { text, annotations, ceoEval };
+}
+
+// chessops' parsePgn silently drops any {…} block that sits BEFORE
+// the first move — we've verified this: `{root note} 1. e4` parses
+// with the "root note" nowhere in the resulting tree. That broke
+// set_comment(node_id: "r") round-trips (v0.46 bug report). Extract
+// the leading root-level comment ourselves before handing the rest
+// to chessops. Anything past the leading `{…}` is left untouched so
+// chessops can do its normal job.
+function extractRootComment(pgn: string): { pgn: string; rootComment: string | null } {
+  const sepMatch = /\r?\n\r?\n/.exec(pgn);
+  if (!sepMatch) return { pgn, rootComment: null };
+  const headerEnd = sepMatch.index + sepMatch[0].length;
+  const body = pgn.slice(headerEnd);
+  // Leading whitespace, then a {…} block. Non-greedy so we stop at
+  // the first `}` even if the file has more comments later.
+  const m = /^\s*\{([\s\S]*?)\}\s*/.exec(body);
+  if (!m) return { pgn, rootComment: null };
+  const rest = body.slice(m[0].length);
+  return {
+    pgn: pgn.slice(0, headerEnd) + rest,
+    rootComment: m[1],
+  };
 }
 
 // Parse full PGN → PrepFile. Throws on unrecoverable errors (no games,
@@ -103,7 +134,8 @@ export function parseCommentAnnotations(comment: string): {
 // silently — matches the frontend's tolerant behaviour so a game with
 // one typo doesn't nuke the whole tree.
 export function parsePGN(pgn: string): PrepFile {
-  const games = parsePgn(pgn);
+  const { pgn: cleanPgn, rootComment: preComment } = extractRootComment(pgn);
+  const games = parsePgn(cleanPgn);
   if (games.length === 0) throw new Error("no games in PGN");
   const game = games[0];
 
@@ -119,10 +151,15 @@ export function parsePGN(pgn: string): PrepFile {
   const rootFen = makeFen(startPos.toSetup());
   const root: PrepNode = { id: ROOT_ID, san: null, fen: rootFen, ply: 0, children: [] };
 
-  // Root-level comment on the game (rare, but supported).
-  const gameComments = (game.moves as { comments?: string[] }).comments;
-  if (gameComments && gameComments.length > 0) {
-    const parsed = parseCommentAnnotations(gameComments.join(" "));
+  // Root-level comment on the game. Two sources:
+  //   1. `game.moves.comments` — kept as a fallback in case chessops
+  //      ever populates it (currently doesn't for pre-move-1 blocks).
+  //   2. `preComment` — the {…} we pre-extracted above.
+  const gameCommentsRaw = (game.moves as { comments?: string[] }).comments ?? [];
+  const rootCommentBits: string[] = [...gameCommentsRaw];
+  if (preComment) rootCommentBits.push(preComment);
+  if (rootCommentBits.length > 0) {
+    const parsed = parseCommentAnnotations(rootCommentBits.join(" "));
     if (parsed.text) root.comment = parsed.text;
     if (parsed.annotations) root.annotations = parsed.annotations;
     if (parsed.ceoEval) root.ceoEval = parsed.ceoEval;

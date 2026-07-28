@@ -18,21 +18,28 @@ import type { PrepNode, Path } from "./types.js";
 // Special ID for the root position (starting FEN, no move played).
 export const ROOT_ID = "r";
 
-// 8-hex-char (32-bit) content hash. Root is "r". Every other node's
+// 12-hex-char (48-bit) content hash. Root is "r". Every other node's
 // id is derived from (parent.id, san). Two children of the same parent
 // with the same SAN are impossible in real chess — same SAN from the
 // same position IS the same move — so within-parent same-id events
 // mean the caller tried to duplicate a move that already exists;
 // `addMove` handles that by joining to the existing child rather than
-// appending a duplicate (see mutations.ts). Cross-tree birthday
-// collisions in 32 bits at 1000 nodes are ~10^-4 — rare, and thrown
-// at parse time rather than silently masked.
+// appending a duplicate (see mutations.ts).
+//
+// v0.46: widened from 32 → 48 bit. At the 32-bit width birthday
+// collisions in real prep files ran ~10^-4 at 1000 nodes and were
+// hit in practice, throwing at buildIdIndex time and rendering the
+// whole file unreadable. 48 bits drops that to ~10^-9 at 1000 nodes
+// (~10^-7 at 10k). If a collision still lands, buildIdIndex now
+// keeps the first occurrence and logs rather than throwing, so
+// reads survive; only mutations against the collided id go to the
+// first-found node.
 export function deriveNodeId(parentId: string, san: string): string {
   const h = createHash("sha256");
   h.update(parentId);
   h.update("|");
   h.update(san);
-  return h.digest("hex").slice(0, 8);
+  return h.digest("hex").slice(0, 12);
 }
 
 // Bad-node-id errors so the LLM sees exactly what went wrong. Message
@@ -50,21 +57,36 @@ export class PathError extends Error {
   }
 }
 
-// Build the id → path index for a whole tree. Also detects the rare
-// collision (two nodes with the same 32-bit id) and throws so the
-// caller can surface a clear message.
+// Build the id → path index for a whole tree.
+//
+// v0.46: collisions no longer throw. At 48-bit width they're
+// statistically improbable (~10^-9 at 1000 nodes), but if one does
+// land — e.g. a persisted PGN whose IDs were derived by an older
+// 32-bit build — throwing would render the whole file unreadable
+// via the MCP surface. Instead, we keep the FIRST occurrence in the
+// index and emit a stderr line naming both nodes. Reads survive
+// (`read_prep_file` returns the full tree; the collided IDs both
+// appear in the tree even though only one is addressable via
+// `resolveNodeId`). Mutations against the collided id hit the
+// first-found node deterministically. Downstream tools that care —
+// `list_nodes`, `find_position_in_files`, engine calls that don't
+// need a node handle — keep working normally.
 export function buildIdIndex(root: PrepNode): Map<string, Path> {
   const index = new Map<string, Path>();
   const walk = (node: PrepNode, path: Path): void => {
-    if (index.has(node.id)) {
-      throw new Error(
-        `node id collision on "${node.id}" — two distinct nodes in the tree ` +
-        `hash to the same 32-bit id. This is statistically rare (~10^-4 at ` +
-        `1000 nodes); if you see this, please report the file so we can ` +
-        `widen the hash.`,
+    const existing = index.get(node.id);
+    if (existing !== undefined) {
+      // Keep the earlier occurrence; log so operators can widen further
+      // if this recurs. Message names both nodes' SAN + ply so the file
+      // is identifiable.
+      console.error(
+        `[mcp] node id collision on "${node.id}" — first at path ${JSON.stringify(existing)}, ` +
+        `now at path ${JSON.stringify(path)} (san=${node.san}, ply=${node.ply}). ` +
+        `Keeping the first; mutations against this id will hit that node.`,
       );
+    } else {
+      index.set(node.id, path);
     }
-    index.set(node.id, path);
     for (let i = 0; i < node.children.length; i++) {
       walk(node.children[i], [...path, i]);
     }

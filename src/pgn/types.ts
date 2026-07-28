@@ -2,7 +2,7 @@
 //
 // Nodes are addressed by a stable, content-derived `id`:
 //   root.id = "r"
-//   node.id = first 8 hex chars of sha256(parent.id + "|" + san)
+//   node.id = first 12 hex chars of sha256(parent.id + "|" + san)
 //
 // The derivation is a pure function of the tree structure, so IDs
 // survive parse → mutate → export → reparse without needing to be
@@ -12,10 +12,13 @@
 // op inserts a sibling) simply cannot happen. See src/pgn/paths.ts
 // for the id → path resolution used to power mutation calls.
 //
-// 32-bit width (8 hex chars) means birthday-collision probability
-// is ~10^-4 even at 1000 nodes — the largest prep files we see are
-// well under that. On the rare parse-time collision we throw a clear
-// error rather than persisting anything ambiguous.
+// v0.46: 48-bit width (12 hex chars) means birthday-collision
+// probability is ~10^-9 at 1000 nodes and ~10^-7 at 10k. Was 32-bit
+// (8 hex chars) through v0.45; collisions hit ~10^-4 there and were
+// observed in live prep files. If a collision still lands at the new
+// width, buildIdIndex keeps the first occurrence and logs to stderr
+// rather than throwing — the file stays readable, only mutations
+// against the collided id are ambiguous.
 
 export type PrepArrow = { color: string; from: string; to: string };
 export type PrepHighlight = { color: string; square: string };
@@ -44,7 +47,7 @@ export type StoredEval = {
 };
 
 export type PrepNode = {
-  id: string;                // "r" for root; 8-hex-char content hash otherwise
+  id: string;                // "r" for root; 12-hex-char content hash otherwise
   san: string | null;        // null for root
   fen: string;
   ply: number;               // 0 for root; +1 per ply
