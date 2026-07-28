@@ -4,15 +4,22 @@ You can save chess prep to the user's chess.ceo account and read it back across 
 
 ## The mental model
 
-The user has **one** collection dedicated to your work — labelled "AI Prep" in their chess.ceo app with a 🤖 icon. Inside it, each **prep file** is one PGN game with variations. You never see the collection itself; the tools operate directly on the files inside it.
+The user has **any number of PGN collections** in their chess.ceo library — you have full access to every non-encrypted one. A **prep file** is one PGN game with variations, inside a collection. Every prep file id is a composite `<collection_id>:<game_id>` — opaque to you, pass it through unchanged to any tool that takes `id` or `file_id`.
 
-File-level tools:
+Discovery tools:
 
-- `list_prep_files` — show me all my prep files
-- `search_prep_files(query)` — find by opponent name / opening keyword
-- `read_prep_file(id)` — parsed tree (every node carries a stable `id`) + tags + `version`
-- `create_prep_file(name)` — new empty file, `name` becomes the [Event] tag
+- `list_collections` — show me all the user's collections (their organizational scheme is theirs; browse before creating)
+- `list_prep_files(collection_id)` — the games inside one collection
+- `search_prep_files(query)` — text search across ALL of the user's collections
+- `find_position_in_files(fen)` — position search across ALL of the user's collections (matched by zobrist hash so move-order variants are found automatically). Distinct from `find_position_in_courses` — that's the user's read-only reference library (Chessable etc.); this is their own editable prep
+
+Per-file tools:
+
+- `read_prep_file(id)` — parsed tree (every node carries a stable content-derived `id`) + tags + `version`
+- `create_prep_file(collection_id, name)` — new empty file inside the given collection, `name` becomes the [Event] tag
 - `delete_prep_file(id)` — soft delete (user can restore from app)
+
+**No default landing folder.** v0.43 removed the old hidden `/mcp` collection — prep files now live wherever the user organizes them. Every `create_prep_file` call REQUIRES `collection_id`; call `list_collections` first if you don't have one. Permanent delete is not exposed on this surface — the user does that from the app.
 
 Mutation tools (edit an existing file — you never touch raw PGN):
 
@@ -25,11 +32,12 @@ Every mutation call takes a `node_id` (or `parent_id` for add-style ops) and aut
 
 **Before creating a new file, search for an existing one.** LLMs make three "Prep vs Firouzja" files in a row all the time. Always:
 
-1. `list_prep_files` (if the user has ≤20-30 files) or `search_prep_files(query=<opponent name>)` for their key term
-2. Read the ones that look relevant
-3. Decide: extend an existing one (save_prep_file) or genuinely start fresh (create_prep_file)
+1. **Text search first**: `search_prep_files(query=<opponent name or opening keyword>)` — searches across every collection the user owns.
+2. **Position search when the request is position-shaped** ("prep me against 6.f3 in the Najdorf"): `find_position_in_files(fen=<the specific tabiya>)` — catches files that reach the position via a different move order too. This is often more accurate than text search because file names don't always mention every position they cover.
+3. Read the ones that look relevant.
+4. Decide: extend an existing one or genuinely start fresh (`create_prep_file(collection_id, name)`).
 
-Duplicate files are the #1 way to lose your user's trust in this system.
+Duplicate files are the #1 way to lose your user's trust in this system. Two searches (text + position) cost roughly nothing and catch nearly all overlap.
 
 ## Before writing any prose: read the examples
 
@@ -107,6 +115,8 @@ Keep it short enough to fit in a picker (30-40 chars). Long titles get truncated
 - User asks "I found a novelty in the Najdorf" and a Najdorf file exists → extend.
 - Rule of thumb: if the user's request semantically overlaps with an existing file's [Event] name or main opening line, extend.
 
-## Icons and appearance
+## Appearance
 
-The user sees your files in a collection called "AI Prep" with a 🤖 icon under folder `/mcp` in their chess.ceo app. This is intentional — they can tell at a glance which prep came from you, and they can browse / edit / delete from the app just like their manual work. Your files are first-class citizens on their account.
+Prep files land in whichever collection the user picked (via `create_prep_file(collection_id, name)`). They're first-class citizens in that collection — the user can browse, edit, share, or delete them from the app exactly like manually-created games. Your only visibility signal is the [Event] tag; make it descriptive.
+
+The `/mcp` "AI Prep" hidden folder from earlier versions no longer exists. If the user has a collection literally named "AI Prep" it's one they created themselves.

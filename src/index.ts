@@ -109,8 +109,10 @@ const AUTHED_TOOLS = new Set([
   "list_cloud_engines",
   "stop_cloud_engine",
   "cloud_analyse",
+  "list_collections",
   "list_prep_files",
   "search_prep_files",
+  "find_position_in_files",
   "read_prep_file",
   "list_nodes",
   "list_transpositions",
@@ -208,6 +210,116 @@ async function authedRequest(
     throw new Error(`chess.ceo ${res.status}: ${text.slice(0, 500)}`);
   }
   return text.length ? JSON.parse(text) : null;
+}
+
+// ── Backend I/O layer ──────────────────────────────────────────────
+//
+// v0.43: MCP surface moved off the single-`/mcp`-folder model onto the
+// full user PGN library. LLM-facing tool ids are opaque composites of
+// the form `<collection_id>:<game_id>` so every existing tool that
+// takes `id` keeps taking `id` — the composite splits back into two
+// pieces at the HTTP layer. Backend routes live under
+// `/api/agent/pgns/*` (same handlers as `/me/pgns/*` browser routes;
+// a path-rewrite middleware in the server main.go maps the two).
+
+const PGN_BASE = "/api/agent/pgns";
+
+// Browser handlers wrap successful responses as
+//   { success: true, message: "...", data: <actual thing> }
+// via handlers.RespondSuccess. Peel that off; leave anything without
+// the envelope unchanged (some endpoints return raw bodies).
+function unwrap<T = unknown>(raw: unknown): T {
+  if (
+    raw &&
+    typeof raw === "object" &&
+    "data" in raw &&
+    (raw as { success?: boolean }).success === true
+  ) {
+    return (raw as { data: T }).data;
+  }
+  return raw as T;
+}
+
+// LLM-facing "prep file id" is always "<collection_id>:<game_id>" —
+// makeFileId to compose from a listing, splitFileId at the HTTP edge.
+function makeFileId(collectionId: string, gameId: string): string {
+  return `${collectionId}:${gameId}`;
+}
+function splitFileId(id: string): { collectionId: string; gameId: string } {
+  const idx = id.indexOf(":");
+  if (idx <= 0 || idx === id.length - 1) {
+    throw new Error(
+      `invalid prep file id "${id}" — expected "<collection_id>:<game_id>" ` +
+        `(get one from list_prep_files, search_prep_files, find_position_in_files, ` +
+        `or the create_prep_file return value)`,
+    );
+  }
+  return { collectionId: id.slice(0, idx), gameId: id.slice(idx + 1) };
+}
+
+// Minimal shape of a PGN game as the browser handler returns it. The
+// backend model has more fields; we only care about the ones the MCP
+// wrapper touches.
+type PgnGame = {
+  id: string;
+  collectionId: string;
+  pgnContent: string;
+  version: number;
+  event?: string;
+  white_player?: string;
+  black_player?: string;
+  tags?: Record<string, unknown>;
+  updated_at?: string;
+};
+
+// GET one game by composite id. Throws on 404.
+async function fetchGame(id: string): Promise<PgnGame> {
+  const { collectionId, gameId } = splitFileId(id);
+  const raw = await authedRequest(
+    "GET",
+    `${PGN_BASE}/${encodeURIComponent(collectionId)}/games/${encodeURIComponent(gameId)}`,
+  );
+  const g = unwrap<PgnGame>(raw);
+  if (!g || typeof g.pgnContent !== "string") {
+    throw new Error("prep file missing pgnContent");
+  }
+  return g;
+}
+
+// PUT the game body. Returns the saved game (new version).
+async function saveGame(
+  id: string,
+  pgn: string,
+  expectedVersion: number | undefined,
+): Promise<PgnGame> {
+  const { collectionId, gameId } = splitFileId(id);
+  const body: Record<string, unknown> = { pgnContent: pgn };
+  if (typeof expectedVersion === "number") body.baseVersion = expectedVersion;
+  const raw = await authedRequest(
+    "PUT",
+    `${PGN_BASE}/${encodeURIComponent(collectionId)}/games/${encodeURIComponent(gameId)}`,
+    body,
+  );
+  return unwrap<PgnGame>(raw);
+}
+
+// POST a new game into the given collection. Returns the created game.
+async function createGame(collectionId: string, pgn: string): Promise<PgnGame> {
+  const raw = await authedRequest(
+    "POST",
+    `${PGN_BASE}/${encodeURIComponent(collectionId)}/games`,
+    { pgnContent: pgn },
+  );
+  return unwrap<PgnGame>(raw);
+}
+
+// DELETE (soft) a game by composite id.
+async function deleteGame(id: string): Promise<void> {
+  const { collectionId, gameId } = splitFileId(id);
+  await authedRequest(
+    "DELETE",
+    `${PGN_BASE}/${encodeURIComponent(collectionId)}/games/${encodeURIComponent(gameId)}`,
+  );
 }
 
 // ── Tool definitions ───────────────────────────────────────────────
@@ -591,21 +703,53 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "list_collections",
+    description:
+      "List the user's own PGN collections — every collection they've created, not just prep files. Response: `{collections: [{id, title, icon, folder_path, game_count, updated_at, position_search_enabled}]}`.\n\n" +
+      "**Call this before create_prep_file** — the LLM must pick a collection to write into (no default landing folder any more; the old hidden `/mcp` collection was retired in v0.43). Also useful when the user asks a position-shaped question — LLM can then run find_position_in_files to see which of these collections already covers the position.\n\n" +
+      "Encrypted collections (client-side-encrypted PGN) are excluded — the server can't read their contents, so they'd be dead weight on this surface.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "list_prep_files",
     description:
-      "List every prep file the user has (all games inside their dedicated AI Prep collection). Returns id, PGN tags (Event, White, Black, Date, etc. — read the Event tag for the user-facing name), size, updated_at. ALWAYS call this before create_prep_file to check for existing coverage — creating a second 'Prep vs Firouzja' when one already exists is a common LLM failure. If the user has many, use search_prep_files with a query to narrow down.",
-    inputSchema: { type: "object", properties: {} },
+      "List the games (prep files) inside one of the user's collections. **Requires `collection_id`** — call `list_collections` first if you don't have one. Returns id (composite `<collection_id>:<game_id>`, opaque to the LLM — pass as-is to read_prep_file / mutation tools), PGN header fields, updated_at.\n\n" +
+      "For cross-collection discovery use `search_prep_files` (text) or `find_position_in_files` (position); list_prep_files is the browse-one-collection tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        collection_id: { type: "string", description: "Collection id from list_collections. Required." },
+      },
+      required: ["collection_id"],
+    },
   },
   {
     name: "search_prep_files",
     description:
-      "Text search over the user's prep files (matches PGN headers, comments, and content). Use this instead of list_prep_files when you know a keyword — e.g. search_prep_files(query='Firouzja') or search_prep_files(query='Najdorf').",
+      "Text search over the user's prep files ACROSS ALL their collections (matches PGN headers, comments, and content). Use when you know a keyword — e.g. search_prep_files(query='Firouzja') or search_prep_files(query='Najdorf'). Cheaper than paging list_collections + list_prep_files to find one file by name.",
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", description: "Free-text query (opponent name, opening name, event keyword)." },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "find_position_in_files",
+    description:
+      "Position search across every one of the user's EDITABLE prep files (all their non-encrypted collections). Given a FEN, returns which of the user's files reach that exact position (or a transposition of it — matched by zobrist hash, so move-order variants are found automatically). Recency-sorted.\n\n" +
+      "Distinct from `find_position_in_courses`: courses are READ-ONLY reference material (Chessable PGNs, downloaded backups); this searches the user's OWN editable prep. Common workflow: user asks about a position → call this first to see if their existing prep covers it → if yes, extend that file; if no, consider whether to start new prep.\n\n" +
+      "Position input: `file_id`+`node_id` (from an already-open prep file), or `fen`, or `moves` from startpos, or `fen`+`moves`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: { type: "string", description: "Prep file id. With `node_id`, derives FEN from the tree." },
+        node_id: { type: "string", description: "Node id inside `file_id`. Root is 'r'." },
+        fen:     { type: "string", description: "Position as FEN. Only used if `file_id`/`node_id` not set." },
+        moves:   { type: "string", description: "SAN moves from startpos (or on top of fen)." },
+        line:    { type: "string", description: "Alias for moves." },
+      },
     },
   },
   {
@@ -675,17 +819,23 @@ const TOOLS: Tool[] = [
   {
     name: "create_prep_file",
     description:
-      "Create a new (empty) prep file. `name` becomes the Event PGN tag. You then extend it with mutation tools (add_move, set_comment, …).\n\n" +
-      "ALWAYS call list_prep_files (or search_prep_files with the opponent / opening keyword) FIRST — creating a duplicate 'Prep vs Firouzja' when one exists is the #1 LLM failure mode. If a file already covers the topic, add moves to that one instead.",
+      "Create a new (empty) prep file in the specified collection. `name` becomes the Event PGN tag. You then extend it with mutation tools (add_move, set_comment, …).\n\n" +
+      "**collection_id is REQUIRED** — call `list_collections` first to pick where it lives. There is no default landing folder any more (v0.43: the old hidden `/mcp` collection was removed; prep files now live wherever the user organizes them).\n\n" +
+      "**Duplicate-check first.** Call `search_prep_files(query=<opponent / opening keyword>)` OR `find_position_in_files(fen=...)` before creating — a second 'Prep vs Firouzja' file when one already exists is a common LLM failure mode. If a file already covers the topic, extend that one instead.\n\n" +
+      "Response: `{ok, id, collection_id, version}` — `id` is a composite you pass to every other prep-file tool as `id` or `file_id`.",
     inputSchema: {
       type: "object",
       properties: {
+        collection_id: {
+          type: "string",
+          description: "Collection id from list_collections. Required — this is where the new file lands.",
+        },
         name: {
           type: "string",
           description: "User-facing name — becomes the [Event] tag. Example: 'Prep vs Firouzja (Black) 2026-07-23'.",
         },
       },
-      required: ["name"],
+      required: ["collection_id", "name"],
     },
   },
   {
@@ -1399,9 +1549,7 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
   const mutations = Array.isArray(args.mutations) ? args.mutations : [];
   if (mutations.length === 0) throw new Error("mutations array required");
 
-  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
-  const g = raw as { pgnContent?: string; version?: number };
-  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+  const g = await fetchGame(id);
 
   let file = parsePGN(g.pgnContent);
   let idIndex = buildIdIndex(file.root);
@@ -1425,12 +1573,8 @@ async function applyBatchMutations(args: Args): Promise<unknown> {
   }
   const newPgn = exportPGN(file);
   const expected = typeof args.expected_version === "number" ? args.expected_version : g.version;
-  const saved = await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(id)}`, {
-    pgn: newPgn,
-    expected_version: expected,
-  });
-  const savedRow = saved as { version?: number };
-  return { ok: true, results, version: savedRow.version };
+  const saved = await saveGame(id, newPgn, expected);
+  return { ok: true, results, version: saved.version };
 }
 
 // Auto-evaluate: walk the tree from `path`, run cloud_analyse on each node,
@@ -1518,9 +1662,7 @@ async function autoEvaluate(args: Args): Promise<unknown> {
   const onlyMissing = args.only_missing !== false; // default true
   const movetimeMs = typeof args.movetime_ms === "number" ? args.movetime_ms : 1500;
 
-  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
-  const g = raw as { pgnContent?: string; version?: number };
-  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+  const g = await fetchGame(id);
   const file = parsePGN(g.pgnContent);
   const idIndex = buildIdIndex(file.root);
   const startPath = resolveNodeId(idIndex, startNodeId);
@@ -2182,9 +2324,7 @@ async function applyMutation(
   mutator: (file: PrepFile, idIndex: Map<string, Path>) => { file: PrepFile; id: string; results?: unknown; warning?: string; warnings?: string[] },
 ): Promise<unknown> {
   const id = String(args.id);
-  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
-  const g = raw as { pgnContent?: string; version?: number };
-  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+  const g = await fetchGame(id);
 
   const file = parsePGN(g.pgnContent);
   const idIndex = buildIdIndex(file.root);
@@ -2200,18 +2340,14 @@ async function applyMutation(
   const newPgn = exportPGN(result.file);
 
   const expected = typeof args.expected_version === "number" ? args.expected_version : g.version;
-  const saved = await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(id)}`, {
-    pgn: newPgn,
-    expected_version: expected,
-  });
-  const savedRow = saved as { version?: number };
+  const saved = await saveGame(id, newPgn, expected);
   return {
     ok: true,
     node_id: result.id,
     ...(result.results !== undefined ? { line: result.results } : {}),
     ...(result.warning ? { warning: result.warning } : {}),
     ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
-    version: savedRow.version,
+    version: saved.version,
   };
 }
 
@@ -2259,10 +2395,11 @@ function noStatsCheckWarning(parent: PrepNode): string | undefined {
 type ViewMode = "compact" | "full" | "spine" | "pgn";
 
 async function loadPrepFile(id: string): Promise<{ file: PrepFile; version: number | undefined; fileIdEcho: string | undefined; pgn: string }> {
-  const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(id)}`);
-  const g = raw as { pgnContent?: string; version?: number; id?: string };
-  if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
-  return { file: parsePGN(g.pgnContent), version: g.version, fileIdEcho: g.id, pgn: g.pgnContent };
+  const g = await fetchGame(id);
+  // Echo the composite id back so read_prep_file responses match the
+  // exact id the LLM passed in. The backend returns the raw game_id;
+  // recompose so the LLM never sees the split form.
+  return { file: parsePGN(g.pgnContent), version: g.version, fileIdEcho: id, pgn: g.pgnContent };
 }
 
 // Recursively project a PrepNode into the requested view. `depthLeft`
@@ -2307,6 +2444,137 @@ function projectNode(node: PrepNode, view: ViewMode, depthLeft: number | null, f
     base.children = [];
   }
   return base;
+}
+
+// ── Collection + file listing handlers ─────────────────────────────
+//
+// v0.43: the LLM sees the user's full PGN library, not just a hidden
+// `/mcp` folder. list_collections lets it discover collections;
+// list_prep_files + search_prep_files + find_position_in_files return
+// composite `<collection_id>:<game_id>` ids the mutation tools consume.
+
+type PgnCollection = {
+  id: string;
+  title: string;
+  icon?: string;
+  folderPath?: string;
+  gameCount?: number;
+  positionSearchEnabled?: boolean;
+  updatedAt?: string;
+};
+type PgnGameListRow = {
+  id: string;
+  collectionId?: string;
+  collectionTitle?: string;
+  event?: string;
+  white_player?: string;
+  black_player?: string;
+  eco?: string;
+  opening?: string;
+  updated_at?: string;
+  ply?: number;
+};
+
+async function listCollections(_args: Args): Promise<unknown> {
+  const raw = await authedRequest("GET", PGN_BASE);
+  const collections = unwrap<PgnCollection[]>(raw) ?? [];
+  return {
+    collections: collections.map(c => ({
+      id: c.id,
+      title: c.title,
+      icon: c.icon,
+      folder_path: c.folderPath,
+      game_count: c.gameCount,
+      position_search_enabled: c.positionSearchEnabled,
+      updated_at: c.updatedAt,
+    })),
+  };
+}
+
+// Convert a browser-returned game list row into the LLM shape (composite
+// id, cleaned field names).
+function projectGameRow(row: PgnGameListRow): Record<string, unknown> {
+  const collId = row.collectionId ?? "";
+  return {
+    id: collId ? makeFileId(collId, row.id) : row.id,
+    collection_id: collId,
+    collection_title: row.collectionTitle,
+    event: row.event,
+    white: row.white_player,
+    black: row.black_player,
+    eco: row.eco,
+    opening: row.opening,
+    updated_at: row.updated_at,
+    ply: row.ply,
+  };
+}
+
+async function listPrepFiles(args: Args): Promise<unknown> {
+  const collectionId = typeof args.collection_id === "string" ? args.collection_id.trim() : "";
+  if (!collectionId) {
+    throw new Error(
+      "collection_id required — call list_collections to see your options, or search across collections with search_prep_files / find_position_in_files",
+    );
+  }
+  // Browser handler at GET /me/pgns/{id}/games returns a paginated list.
+  const raw = await authedRequest(
+    "GET",
+    `${PGN_BASE}/${encodeURIComponent(collectionId)}/games?page=1&limit=200`,
+  );
+  const data = unwrap<{ games?: PgnGameListRow[]; pagination?: unknown }>(raw);
+  const games = data?.games ?? (Array.isArray(data) ? (data as PgnGameListRow[]) : []);
+  return { collection_id: collectionId, prep_files: games.map(projectGameRow) };
+}
+
+async function searchPrepFiles(args: Args): Promise<unknown> {
+  const q = typeof args.query === "string" ? args.query.trim() : "";
+  if (!q) throw new Error("query required");
+  const raw = await authedRequest(
+    "GET",
+    `${PGN_BASE}/games/search?q=${encodeURIComponent(q)}&limit=100`,
+  );
+  const data = unwrap<{ games?: PgnGameListRow[] }>(raw);
+  const games = data?.games ?? [];
+  return { query: q, prep_files: games.map(projectGameRow) };
+}
+
+async function findPositionInFiles(args: Args): Promise<unknown> {
+  // FEN can come from a node handle OR a direct fen/moves/line. Reuse
+  // the same resolver everything else uses.
+  const resolved = await resolveFromNodeOrFen(args);
+  const fen = resolved.fen;
+  const raw = await authedRequest(
+    "GET",
+    `${PGN_BASE}/games/search?position=${encodeURIComponent(fen)}&limit=100`,
+  );
+  const data = unwrap<{ games?: PgnGameListRow[] }>(raw);
+  const games = data?.games ?? [];
+  return {
+    fen,
+    match_count: games.length,
+    prep_files: games.map(projectGameRow),
+  };
+}
+
+async function createPrepFile(args: Args): Promise<unknown> {
+  const collectionId = typeof args.collection_id === "string" ? args.collection_id.trim() : "";
+  if (!collectionId) {
+    throw new Error(
+      "collection_id required — call list_collections to pick where the new file lives. There is no default landing folder any more (v0.43: the old hidden /mcp collection was removed).",
+    );
+  }
+  const name = String(args.name || "").trim();
+  if (!name) throw new Error("name is required");
+  // Seed with a PGN carrying the LLM-chosen name as the Event tag so
+  // subsequent list_prep_files calls display something useful.
+  const seedPgn = `[Event "${name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]\n\n*\n`;
+  const game = await createGame(collectionId, seedPgn);
+  return {
+    ok: true,
+    id: makeFileId(game.collectionId ?? collectionId, game.id),
+    collection_id: game.collectionId ?? collectionId,
+    version: game.version,
+  };
 }
 
 async function readPrepFile(args: Args): Promise<unknown> {
@@ -2692,9 +2960,7 @@ async function resolveFromNodeOrFen(args: Args): Promise<{ fen: string; file?: F
   const nodeId = typeof args.node_id === "string" ? args.node_id.trim() : "";
 
   if (fileId && nodeId) {
-    const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
-    const g = raw as { pgnContent?: string; version?: number };
-    if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+    const g = await fetchGame(fileId);
     const parsedFile = parsePGN(g.pgnContent);
     const idIndex = buildIdIndex(parsedFile.root);
     const nodePath = resolveNodeId(idIndex, nodeId);
@@ -2711,18 +2977,15 @@ async function resolveFromNodeOrFen(args: Args): Promise<{ fen: string; file?: F
     // node_id had been supplied (auto-persist on match).
     const fen = resolveFenFromArgs(args);
     try {
-      const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
-      const g = raw as { pgnContent?: string; version?: number };
-      if (typeof g.pgnContent === "string") {
-        const parsedFile = parsePGN(g.pgnContent);
-        const match = findNodeByFen(parsedFile.root, fen);
-        if (match) {
-          const idIndex = buildIdIndex(parsedFile.root);
-          return {
-            fen,
-            file: { id: fileId, version: g.version ?? 0, parsedFile, idIndex, nodePath: match.path, fen },
-          };
-        }
+      const g = await fetchGame(fileId);
+      const parsedFile = parsePGN(g.pgnContent);
+      const match = findNodeByFen(parsedFile.root, fen);
+      if (match) {
+        const idIndex = buildIdIndex(parsedFile.root);
+        return {
+          fen,
+          file: { id: fileId, version: g.version ?? 0, parsedFile, idIndex, nodePath: match.path, fen },
+        };
       }
     } catch {
       // Best-effort: if the file load fails, fall through to scratch mode.
@@ -2786,10 +3049,7 @@ async function storeEvalOnNode(handle: FileHandle, ev: StoredEval): Promise<stri
 
     const { file: newFile, ids } = setCeoEvalMany(handle.parsedFile, paths, ev);
     const newPgn = exportPGN(newFile);
-    await authedRequest("PUT", `/api/agent/prep-files/${encodeURIComponent(handle.id)}`, {
-      pgn: newPgn,
-      expected_version: handle.version,
-    });
+    await saveGame(handle.id, newPgn, handle.version);
     // Ensure the primary node (the one the LLM addressed) comes first.
     const anchorId = anchor.id;
     return [anchorId, ...ids.filter(x => x !== anchorId)];
@@ -3083,11 +3343,17 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "read_course_at_position":
       return readCourseAtPosition(args);
 
+    case "list_collections":
+      return listCollections(args);
+
     case "list_prep_files":
-      return authedRequest("GET", "/api/agent/prep-files");
+      return listPrepFiles(args);
 
     case "search_prep_files":
-      return authedRequest("GET", `/api/agent/prep-files/search?q=${encodeURIComponent(String(args.query))}`);
+      return searchPrepFiles(args);
+
+    case "find_position_in_files":
+      return findPositionInFiles(args);
 
     case "read_prep_file":
       return readPrepFile(args);
@@ -3099,12 +3365,12 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return listTranspositions(args);
 
     case "create_prep_file":
-      return authedRequest("POST", "/api/agent/prep-files", {
-        name: String(args.name),
-      });
+      return createPrepFile(args);
 
-    case "delete_prep_file":
-      return authedRequest("DELETE", `/api/agent/prep-files/${encodeURIComponent(String(args.id))}`);
+    case "delete_prep_file": {
+      await deleteGame(String(args.id));
+      return { ok: true };
+    }
 
     case "add_move":
       return applyMutation(args, (file, idIndex) => {
@@ -3192,9 +3458,7 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     case "quote_engine_eval": {
       const fileId = String(args.id);
       const nodeId = argNodeId(args);
-      const raw = await authedRequest("GET", `/api/agent/prep-files/${encodeURIComponent(fileId)}`);
-      const g = raw as { pgnContent?: string };
-      if (typeof g.pgnContent !== "string") throw new Error("prep file missing pgnContent");
+      const g = await fetchGame(fileId);
       const file = parsePGN(g.pgnContent);
       const idIndex = buildIdIndex(file.root);
       const path = resolveNodeId(idIndex, nodeId);
