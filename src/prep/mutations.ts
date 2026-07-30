@@ -50,6 +50,7 @@ import {
   longLineWarning,
   noDescribeWarning,
   noStatsCheckWarning,
+  positionalNagOnIntermediateWarning,
 } from "../warnings.js";
 
 type Args = Record<string, unknown>;
@@ -117,8 +118,14 @@ export function dispatchMutation(
       const all = [...commentWarns, ...(describeWarn ? [describeWarn] : [])];
       return { ...step, ...(all.length > 0 ? { warnings: all } : {}) };
     }
-    case "set_nags":
-      return setNags(file, resolve(nodeIdField("node_id")), Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : []);
+    case "set_nags": {
+      const nagsArr = Array.isArray(op.nags) ? (op.nags as unknown[]).map(String) : [];
+      const targetPath = resolve(nodeIdField("node_id"));
+      const targetNode = getNodeByPath(file.root, targetPath);
+      const nagWarn = positionalNagOnIntermediateWarning(targetNode, nagsArr);
+      const step = setNags(file, targetPath, nagsArr);
+      return { ...step, ...(nagWarn ? { warning: nagWarn } : {}) };
+    }
     case "set_annotations": {
       const arrows = Array.isArray(op.arrows) ? (op.arrows as PrepArrow[]) : [];
       const highlights = Array.isArray(op.highlights) ? (op.highlights as PrepHighlight[]) : [];

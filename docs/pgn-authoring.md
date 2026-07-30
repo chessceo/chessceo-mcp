@@ -214,6 +214,10 @@ This is the single biggest quality problem in current LLM output on this system:
 
 The failure mode you're avoiding: writing prep that reads as if the opponent will helpfully play the engine's #1 preference at every ply. They won't; that's the whole point of prep.
 
+**"Main tabiya" (or "main line", "main try", "Main choice") is the START of analysis, not the end.** Live case (Ruy Lopez Bc5 file, 2026-07-30): the author tagged a position "Main tabiya" and stopped there — despite the DB showing many high-level games with divergent replies from that exact position. If a position is important enough to CALL a tabiya, it's important enough to fully cover: every reply at ~15%+ frequency, or every distinct plan, gets its own branch. Writing "Main tabiya" and leaving it with one continuation is the shape of "I skimmed the DB and picked one" — the exact anti-pattern this system is meant to prevent. Rule of thumb: if you named a node "tabiya" / "main try" / "critical" in prose, the number of children beneath it should be at least the number of DB moves you named as popular.
+
+**Cover N alternatives when the DB shows N.** From the same live file: at one move-8 position, `get_position_stats` showed three roughly-equally-played tries; the LLM added exactly one branch. That's not prep, that's a hint. If frequencies were 40 / 30 / 25 / 5, the first three get branches (the 5% one gets skipped or a one-line dismissal); if the top four are all 20-25%, all four get branches. The heuristic isn't "pick the top" — it's "cover what the opponent might actually play." When ceoEvals across the top candidates sit within 0.15 of each other, that's not one Best Move, that's a menu — treat it as one.
+
 ## Course chapters describe COVERAGE, not consensus — always `get_position_stats` at mainline branch points
 
 Concrete failure this rule was written to fix: a Modern Defence file made 6.O-O-O the mainline of the entire "5.Qd2 Nd7" branch, wrote a chapter around it, and analysed 15+ plies deep. `get_position_stats` at that position was NEVER called this session. Instead, the LLM ran `find_position_in_courses`, saw So / Kraai / Mihajlov all had chapters titled "5.Qd2 b5 6.O-O-O Bb7" — and cargo-culted that into "6.O-O-O is the main line". It isn't. 6.O-O-O is one of five White tries, and it wasn't even the most-played.
@@ -291,6 +295,12 @@ Where NAGs actually earn their place:
 - **`$44` (compensation)** on a genuine gambit; **`$13` (∞)** on a genuinely sharp/unclear position that engines don't resolve.
 
 Where NAGs are noise: every `$10` "=" glyph on every equal position. If the whole tree is 0.00, that's the *default state* — leave it unmarked and the reader understands.
+
+**Position NAGs (`$10`-`$19`) belong at variation ENDPOINTS, not on every intermediate move.** This is the rule the Ruy Lopez Bc5 file (2026-07-30) failed: `$14` set on ~15 mainline nodes plus 10+ intermediate move-choice nodes. Result: a wall of ⩲ symbols throughout the movetext, with nothing signalling where the line actually converges.
+
+A variation is walkable. The reader plays through the moves and, at the LEAF, wants to know "so where did we land?" One `$14` at the endpoint answers that. Twenty `$14`s along the way don't say more — they say less, because the reader's eye skims past them and the endpoint no longer stands out.
+
+Concrete rule: **position NAGs (`$10` = / `$13` ∞ / `$14` ⩲ / `$15` ⩱ / `$16` ± / `$17` ∓ / `$18` +− / `$19` −+) on non-leaf nodes trigger a warning.** Either move the NAG to the leaf, drop it, or leave it only if THIS specific move is the one that TIPPED the balance (rare, and worth prose naming the shift). Move-quality NAGs (`$1` ! / `$2` ? / `$3` !! / `$4` ?? / `$5` !? / `$6` ?! / `$146` novelty) on intermediate moves are FINE at any depth — those are statements about the move, not the resulting position.
 
 When reading back a file, `node.ceoEval.nag` carries the threshold-derived NAG (`$10` / `$14` / `$16` / `$18` etc.) — treat it as a *suggestion*, not an automatic write. Promote it to a visible NAG only when a glyph on that move actually helps the reader.
 

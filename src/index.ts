@@ -56,6 +56,7 @@ import {
   longLineWarning,
   noDescribeWarning,
   noStatsCheckWarning,
+  positionalNagOnIntermediateWarning,
   positionsDescribed,
   positionsStatsChecked,
 } from "./warnings.js";
@@ -596,9 +597,14 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
     }
 
     case "set_nags":
-      return applyMutation(args, (file, idIndex) =>
-        setNags(file, resolveNodeId(idIndex, argNodeId(args)), Array.isArray(args.nags) ? (args.nags as unknown[]).map(String) : []),
-      );
+      return applyMutation(args, (file, idIndex) => {
+        const nagsArg = Array.isArray(args.nags) ? (args.nags as unknown[]).map(String) : [];
+        const targetPath = resolveNodeId(idIndex, argNodeId(args));
+        const targetNode = getNodeByPath(file.root, targetPath);
+        const nagWarn = positionalNagOnIntermediateWarning(targetNode, nagsArg);
+        const step = setNags(file, targetPath, nagsArg);
+        return { ...step, ...(nagWarn ? { warning: nagWarn } : {}) };
+      });
 
     case "set_annotations": {
       const arrowsRaw = Array.isArray(args.arrows) ? args.arrows as PrepArrow[] : [];

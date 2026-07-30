@@ -62,9 +62,18 @@ export function commentAntiPatterns(comment: string): string[] {
 
   // Raw centipawn in prose: "+0.35", "-0.20", "+80" (not preceded by move
   // number). Also "at depth N" or "N nodes" — engine metadata as prose.
+  //
+  // ceoEval itself is NOT rendered — it's LLM-internal state. But raw cp
+  // values in prose are still bad for a different reason: they're opaque
+  // decoration. "≈-60" gives the reader no chess signal without knowing
+  // the unit (centipawns? spread rank? pawns?) and no scale (is -60
+  // slight, meaningful, or losing?). The NAG glyph IS visible and is
+  // the intended channel for that judgment — one ⩱ conveys what "-60"
+  // fails to convey. Engine metadata like "at depth 24" or "259M nodes"
+  // is even weaker: it's process detail, not a claim about the position.
   if (/(?:^|[^\d.])[+-]\d\.\d\d(?!\d)/.test(comment) || /≈\s*[+\-−]?\d{2,3}\b/.test(comment) ||
       /\bat depth \d+\b/i.test(comment) || /\b\d{2,3}M nodes\b/.test(comment)) {
-    warns.push("comment contains raw centipawn values or engine metadata — the app renders ceoEval + NAG glyph next to every node, so these numbers are doubled noise AND opaque (readers can't tell if ≈-60 means eval, spread, or something else). Set the NAG (set_nags) and let the glyph carry the judgment; drop the number from the prose.");
+    warns.push("comment contains raw centipawn values or engine metadata — these are opaque to the reader (no clear unit or scale) and the intended channel for the position-quality signal is the NAG glyph, which IS rendered. Set the NAG (set_nags) at the variation's endpoint and let the glyph carry the judgment; drop the number and any \"at depth N\" / \"N nodes\" fragments from the prose.");
   }
 
   // Roster: "N GM games" pattern
@@ -108,6 +117,38 @@ export function noDescribeWarning(node: PrepNode, comment: string): string | und
   if (noDescribeWarned.has(node.id)) return undefined;
   noDescribeWarned.add(node.id);
   return `substantive comment (${comment.length} chars) on a node whose position was never grounded via describe_position this session (id=${node.id}, ${node.san}). LLMs invent captures, miscount pieces, and swap files/ranks when reading FEN strings — describe_position is a pure-computation pass (~1 ms, no engine cost, structural facts + Stockfish's per-term eval breakdown) that reliably prevents this class of hallucination. In live audits, prose accuracy jumps sharply on nodes where describe_position was called first. Call describe_position with file_id+node_id=${node.id} BEFORE writing prose. Warned once per node.`;
+}
+
+// Position NAGs on intermediate moves ("everything is ⩲" spam).
+//
+// Position NAGs — `$10` = / `$11` = / `$13` ∞ / `$14` ⩲ / `$15` ⩱ /
+// `$16` ± / `$17` ∓ / `$18` +− / `$19` −+ — are visible glyphs on the
+// move. They belong at variation ENDPOINTS: the reader plays through
+// a line and, at the end, wants to know "so where did we land?"
+// Tagging every mainline move with `$14` (routine slight White edge)
+// turns the movetext into a wall of ⩲ symbols the reader skims past;
+// it also pre-empts the walk-through by hard-coding the verdict at
+// every step. The single leaf NAG carries the same information with
+// none of the noise.
+//
+// Real-world case (Ruy Lopez Bc5 file, 2026-07-30): `$14` set on ~15
+// mainline nodes plus 10+ intermediate move-choice nodes. Nothing
+// signaled where the variation actually converged.
+//
+// Rule this warning encodes: position NAGs on non-leaf nodes are
+// almost always noise. Move-quality NAGs — `$1` !, `$2` ?, `$3` !!,
+// `$4` ??, `$5` !?, `$6` ?!, and `$146` novelty — are FINE at any
+// depth because they're statements about the MOVE, not the resulting
+// position. Warned once per node.
+const positionalNagWarned = new Set<string>();
+export function positionalNagOnIntermediateWarning(node: PrepNode, nags: string[]): string | undefined {
+  const positional = new Set(["$10", "$11", "$12", "$13", "$14", "$15", "$16", "$17", "$18", "$19"]);
+  const hit = nags.filter(n => positional.has(n));
+  if (hit.length === 0) return undefined;
+  if (node.children.length === 0) return undefined; // leaf — legitimate placement
+  if (positionalNagWarned.has(node.id)) return undefined;
+  positionalNagWarned.add(node.id);
+  return `positional NAG ${hit.join(" ")} set on a non-leaf node (id=${node.id}, ${node.san}, ${node.children.length} children). Position NAGs (=, ⩲, ±, +−) belong at variation ENDPOINTS — the reader plays through the line and at the leaf wants to know how it lands. Marking every intermediate move with the same ⩲ turns the movetext into visual noise the eye skims past AND pre-empts the walk-through. Either move this NAG to the leaf, drop it entirely, or leave it only if THIS specific move is the one that tipped the balance (rare, and worth prose). Move-quality NAGs on intermediate moves — !, ?, !?, ?!, $146 novelty — are FINE, because they're statements about the move not the resulting position. Warned once per node.`;
 }
 
 // Compute the "you never DB-checked this parent" warning. Called from
