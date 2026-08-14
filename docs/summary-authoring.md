@@ -13,6 +13,22 @@ The reference is Peter Heine Nielsen's two-file convention from Magnus Carlsen's
 
 You may or may not have a "big" version to work from — sometimes prep just is what it is. Don't reference a source file or add a `SourceFile` tag; the summary stands alone. It's defined by its SHAPE, not by having a companion.
 
+## Summaries are color-oriented
+
+**A summary is always FOR ONE SIDE.** The reader is about to sit down and play a specific colour in a specific round; the file is a set of instructions for them. Ask which colour before writing anything; do not build a two-sided summary "for reference." A two-sided document is a study, not a summary.
+
+Once the colour is committed, everything downstream follows from it:
+
+- **Name it.** The [Event] tag says the colour: `"Modern Defence — Tiger ...a6/...b5 — Black (Summary)"`, `"Petroff 6.Bd3 Bd6 — White (Summary)"`. Reader picks it out of a list of files immediately.
+- **Mainline is YOUR moves.** Every mainline choice at a node where you're to move is a *recommendation you're making* to the reader. The mainline at a node where the *opponent* is to move is the reply you're preparing them to face.
+- **"Cover the alternatives" means opponent alternatives, not yours.** At a node where you're to move, you commit to ONE move — that's what makes it a repertoire. Sidelines for your side belong in the big file, not the summary. At a node where the opponent is to move, cover the 2-3 replies they're actually likely to play. This is the axis where "cover N when the DB shows N" (from `pgn-authoring`) matters most.
+- **Voice is second-person or first-person plural.** "You'll get a slight edge here", "Our knight is better than his bishop", "Meet ...Bg4 with h3 first" — not the neutral "White's position is preferable." The reader is about to be one specific side; write to them.
+- **Endpoint NAGs are from YOUR side's POV.** `$14` (⩲) is fine on a White-side summary at an endpoint White is happy with. On a Black-side summary that same objective position wants `$15` (⩱) or `$10` (=) instead — "objectively White is slightly better" is depressing prep if the reader is Black; either the line shouldn't be in the summary at all, or the endpoint NAG communicates from the reader's chair. See `pgn-authoring` on positional NAG placement.
+- **"Practical, not correspondence" bites hardest here.** Objective evals matter for whether a line is defensible; PRACTICAL evals (Lc0, `predict_human_move`, "what will the opponent actually play?") matter for which of several defensible replies the opponent will actually reach for. Use both, but weigh the practical one when it disagrees on which line the SUMMARY should follow.
+- **Move-order tricks are asymmetric.** Some tricks work for you; some work against you. Name the ones that work FOR the reader's colour ("play ...a6 first because ...Nge7 first walks into d5") — the mirror-image tricks for the opposite side aren't the reader's problem right now.
+
+If you're offered a request that's genuinely two-sided ("summary of the Berlin for both sides"), split it into two summary files, one per side, cross-referenced only in prose. Each individual file stays color-oriented.
+
 ## The shape
 
 A summary has five properties. Miss any of them and it's not a summary — it's a lightweight big-file.
@@ -70,7 +86,8 @@ If yes to all three, ship it. If no, either add what's missing or CUT the branch
 The same tools as any prep file, but different order and different density.
 
 0. **Cloud engine running?** A summary looks light but requires SHARPER analysis than a big file — every endpoint NAG has to be right, and there are few enough of them that a wrong one stands out. Call `list_cloud_engines` first. Zero combos running → STOP: tell the user a summary needs engines, list options via `list_cloud_machine_options`, get their SKU + explicit confirmation (real money per second), then `start_cloud_engine`. Do NOT build a summary from cached / guessed evals — the point of the summary is trust, and a placeholder `$14` at an endpoint the reader will internalize is worse than no summary.
-1. `create_prep_file(collection_id, name)` — name it with "Summary" in the Event tag (`"Modern Defence — Tiger ...a6/...b5 (Summary)"`) so the reader recognizes the artifact.
+0.5. **Which colour is the reader playing?** Ask if you don't know. This decides everything downstream — the mainline is their moves, the branches are their opponent's replies, the endpoint NAGs are judged from their POV, the voice is written to them. See the "Summaries are color-oriented" section above.
+1. `create_prep_file(collection_id, name)` — name it with the colour AND "Summary" in the Event tag (`"Modern Defence — Tiger ...a6/...b5 — Black (Summary)"`, `"Petroff 6.Bd3 Bd6 — White (Summary)"`) so the reader picks it out of a list immediately.
 2. `set_comment(root, "framing")` — the file's thesis, first thing.
 3. Build the mainline top-down with `apply_mutations` batches — each move gets its comment in the same batch that adds it. Don't come back to write comments later; the density is the point.
 4. At each branching decision, add ONLY the branches the opponent might actually play. Skip the ones you'd cover in a big file.
