@@ -206,6 +206,7 @@ const ENGINE_USAGE_DOC = loadBundledDoc("engine-usage.md", "Engine usage guide")
 const PREP_STRATEGY_DOC = loadBundledDoc("prep-strategy.md", "Prep strategy guide");
 const PREP_FILES_DOC = loadBundledDoc("prep-files-guide.md", "Prep files guide");
 const PGN_AUTHORING_DOC = loadBundledDoc("pgn-authoring.md", "PGN authoring guide");
+const SUMMARY_AUTHORING_DOC = loadBundledDoc("summary-authoring.md", "Summary authoring guide");
 
 // Reference PGNs authored by a strong human coach. LLM pulls these when
 // it wants to see the commentary style, NAG discipline, and annotation
@@ -214,6 +215,46 @@ const PGN_AUTHORING_DOC = loadBundledDoc("pgn-authoring.md", "PGN authoring guid
 // all intact) — not summarised into English.
 const EXAMPLE_OVERVIEW_PGN = loadBundledDoc("examples/italian-fried-liver.pgn", "Italian Fried Liver overview example");
 const EXAMPLE_REPERTOIRE_PGN = loadBundledDoc("examples/najdorf-6-f4-white.pgn", "Najdorf 6.f4 White repertoire example");
+
+// v0.48: consolidated the five `read_*_guide` / `read_example_prep_files`
+// tools into ONE `read_docs`. LLM lists what it wants; we return them
+// in a single response. Also cleaner: enumerating available docs in one
+// tool description (with per-doc "CALL WHEN" hints) beats surfacing
+// five almost-identical tools in the tool listing.
+const DOC_LIBRARY: Record<string, string> = {
+  "engine-usage": ENGINE_USAGE_DOC,
+  "opening-prep": PREP_STRATEGY_DOC,
+  "prep-files": PREP_FILES_DOC,
+  "pgn-authoring": PGN_AUTHORING_DOC,
+  "summary-authoring": SUMMARY_AUTHORING_DOC,
+  "examples/italian-fried-liver-overview": EXAMPLE_OVERVIEW_PGN,
+  "examples/najdorf-6-f4-repertoire": EXAMPLE_REPERTOIRE_PGN,
+};
+
+function readDocs(args: Args): unknown {
+  const raw = args.docs;
+  const requested = Array.isArray(raw)
+    ? raw.map(String).map(s => s.trim()).filter(s => s.length > 0)
+    : [];
+  if (requested.length === 0) {
+    throw new Error(`docs required — pass e.g. { docs: ["engine-usage", "pgn-authoring"] }. Available: ${Object.keys(DOC_LIBRARY).join(", ")}`);
+  }
+  const out: Record<string, string> = {};
+  const unknown: string[] = [];
+  for (const name of requested) {
+    if (name in DOC_LIBRARY) {
+      out[name] = DOC_LIBRARY[name];
+    } else {
+      unknown.push(name);
+    }
+  }
+  const resp: Record<string, unknown> = { docs: out };
+  if (unknown.length > 0) {
+    resp.unknown = unknown;
+    resp.note = `unknown doc name(s): ${unknown.join(", ")}. Available: ${Object.keys(DOC_LIBRARY).join(", ")}`;
+  }
+  return resp;
+}
 
 
 
@@ -651,20 +692,8 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
       return { ceoEval: node.ceoEval ?? null };
     }
 
-    case "read_engine_usage_guide":
-      return { guide: ENGINE_USAGE_DOC };
-
-    case "read_opening_prep_guide":
-      return { guide: PREP_STRATEGY_DOC };
-
-    case "read_prep_files_guide":
-      return { guide: PREP_FILES_DOC };
-
-    case "read_pgn_authoring_guide":
-      return { guide: PGN_AUTHORING_DOC };
-
-    case "read_example_prep_files":
-      return { overview: EXAMPLE_OVERVIEW_PGN, repertoire: EXAMPLE_REPERTOIRE_PGN };
+    case "read_docs":
+      return readDocs(args);
 
     case "prep_snapshot": {
       const me = Number(args.fide_id_me);

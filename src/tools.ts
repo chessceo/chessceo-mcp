@@ -888,39 +888,42 @@ export const TOOLS: Tool[] = [
     },
   },
   {
-    name: "read_engine_usage_guide",
+    name: "read_docs",
     description:
-      "Returns the full chess.ceo engine-usage guide: when to trust Stockfish (objective truth) vs Lc0 (practical eval), how to read disagreements between them, and how to use Lc0 contempt to find non-objective 'practical' ideas. Call this ONCE per session before running expensive `cloud_analyse` calls or when the user asks WHY the engines gave certain scores. Same content is also available as the `engine_usage_primer` prompt (for clients that surface prompts as slash commands), but many clients do not expose prompts to the model — this tool works everywhere.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "read_opening_prep_guide",
-    description:
-      "**CALL WHEN**: the user asks about OPENING PREPARATION — 'prep me against X', 'what should I play vs the Najdorf', 'help me build a repertoire against 1.e4', 'walk this opponent's Sveshnikov'. This guide is chess-and-analysis philosophy, not storage semantics.\n\n" +
-      "Covers: why win% is one weight not a verdict, why prep is a two-player game with symmetric information (opponent sees your history too), how sample size and recency change the reading, when 'revealed weaknesses' are actionable vs already patched, how to choose between the GM-classical DB and the main DB, when to combine chesscom/lichess sources with FIDE, the three chess.com profile shapes (consistent / eclectic / split-personality), the reversed-colours scarcity trick, how to calibrate surprise (rare secondary lines inside the existing repertoire, not big first-move switches).\n\n" +
-      "Different tool: `read_prep_files_guide` covers the FILE STORAGE feature (how to list/create/save prep files) — call that only when about to manipulate files, not for opening questions.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "read_prep_files_guide",
-    description:
-      "**CALL WHEN**: you're about to CREATE, LIST, SAVE, or DELETE a prep file — the persistent file storage feature. Not for opening prep philosophy (that's `read_opening_prep_guide`) and not for how to write PGN (that's `read_pgn_authoring_guide`).\n\n" +
-      "Covers: the AI Prep folder, when to list vs search vs create (avoid duplicate 'Prep vs Firouzja' files), optimistic locking with `version`, naming conventions for the [Event] tag, node-id addressing basics.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "read_pgn_authoring_guide",
-    description:
-      "Returns the guide on how to write correct, useful PGN — mainline discipline, variations as moves (never prose describing moves), NAG symbols including novelty ($146), unclear ($13), compensation ($44) and the standard set, ChessBase arrow/coloured-square syntax ([%cal] / [%csl]), and common pitfalls the parser will reject. Call this ONCE per session before any save_prep_file call, or any time you're producing PGN output for the user.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "read_example_prep_files",
-    description:
-      "**CALL WHEN**: about to write ANY prose commentary in a prep file, ever. Even one comment. Even one variation. This is not optional and not once-per-project — call it early in the session and read the examples before your first `set_comment` or `apply_mutations` batch that includes comments. Log analysis showed <5% of sessions call this despite it being the single biggest quality lift documented in this MCP; that's the mistake this description is trying to fix.\n\n" +
-      "Why: `read_pgn_authoring_guide` tells you the rules in prose. These files show you the *sound* of them applied by a strong human coach — comment density (short and load-bearing, not verbose), how citations look in-line (`WeiYi-Svidler` not `\"Svidler's choice at the FIDE World Blitz Team, June 2026\"`), when `$146` / `$3` / `$44` earn their place, when a bare `[%csl Rf7]` says everything a sentence would say. LLMs default to florid, restate-what's-visible commentary; reading these once inoculates against that.\n\n" +
-      "Two files bundled with the MCP (not the user's own): one general opening overview (Italian Fried Liver, both sides, 1600+ audience) and one one-sided repertoire (Najdorf 6.f4 for White, 2200+ audience). Response: `{ overview: <pgn>, repertoire: <pgn> }` — raw PGN with comments, arrows, NAGs, stored evals intact.",
-    inputSchema: { type: "object", properties: {} },
+      "Fetch one or more bundled reference docs / example files in a single call. **Batch what you need in one call rather than reading them one at a time.**\n\n" +
+      "**Docs available** — each with when to call:\n\n" +
+      "  • `engine-usage` — CALL WHEN: about to run `cloud_analyse`, explaining engine disagreements, or asked WHY the engines gave certain scores. Covers Stockfish (objective truth) vs Lc0 (practical eval), how to read disagreements, when to use Lc0 contempt.\n" +
+      "  • `opening-prep` — CALL WHEN: the user asks about opening preparation ('prep me against X', 'what should I play vs the Najdorf', 'walk this opponent's Sveshnikov'). Covers why win% is one weight not a verdict, prep as a two-player game, sample-size/recency reading, when 'revealed weaknesses' are actionable vs patched, GM-classical vs main DB, chess.com/lichess/FIDE source combining, chess.com profile shapes, reversed-colours scarcity trick, surprise calibration.\n" +
+      "  • `prep-files` — CALL WHEN: about to CREATE, LIST, SAVE, or DELETE a prep file. Covers list vs search vs create (avoid duplicates), optimistic locking with `version`, naming conventions for the [Event] tag, collection selection, node-id addressing basics.\n" +
+      "  • `pgn-authoring` — CALL WHEN: about to write any comment / NAG / arrow / variation. Covers mainline discipline, variations as moves (not prose describing moves), NAG placement rules (position NAGs at ENDPOINTS only), the pasted-engine-PV anti-pattern, transposition handling, 'main tabiya' behavior, cover-N-alternatives rule, describe_position grounding.\n" +
+      "  • `summary-authoring` — CALL WHEN: the user asks for a SUMMARY prep file — the 15-minute-read shape. Covers the two-file convention (reference vs summary), the coach's voice with real jvanf/Peter-Heine-Nielsen examples, endpoint NAG discipline, novelty and move-order-trick callouts, when to CUT branches rather than add them.\n" +
+      "  • `examples/italian-fried-liver-overview` — bundled reference PGN, general opening overview at ~1600 audience. Shows comment density, NAG discipline, annotation style from a strong human coach.\n" +
+      "  • `examples/najdorf-6-f4-repertoire` — bundled reference PGN, one-sided repertoire at ~2200 audience. Same purpose.\n\n" +
+      "**CALL WHEN in general**: early in the session before any substantive work, with `docs: [\"pgn-authoring\", \"examples/najdorf-6-f4-repertoire\"]` if writing prep, or `[\"opening-prep\", \"engine-usage\"]` if analysing. If you don't know which, ask for `[\"opening-prep\", \"prep-files\", \"pgn-authoring\"]` — three docs in one call is fine.\n\n" +
+      "Response: `{ docs: { <name>: <full content> } }`. Content is markdown for guides, raw PGN for examples.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        docs: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "string",
+            enum: [
+              "engine-usage",
+              "opening-prep",
+              "prep-files",
+              "pgn-authoring",
+              "summary-authoring",
+              "examples/italian-fried-liver-overview",
+              "examples/najdorf-6-f4-repertoire",
+            ],
+          },
+          description: "Names of docs to fetch. See the tool description for the full list + when-to-call hints.",
+        },
+      },
+      required: ["docs"],
+    },
   },
   {
     name: "prep_snapshot",
