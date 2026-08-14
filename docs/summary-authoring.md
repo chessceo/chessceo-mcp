@@ -69,11 +69,12 @@ If yes to all three, ship it. If no, either add what's missing or CUT the branch
 
 The same tools as any prep file, but different order and different density.
 
+0. **Cloud engine running?** A summary looks light but requires SHARPER analysis than a big file — every endpoint NAG has to be right, and there are few enough of them that a wrong one stands out. Call `list_cloud_engines` first. Zero combos running → STOP: tell the user a summary needs engines, list options via `list_cloud_machine_options`, get their SKU + explicit confirmation (real money per second), then `start_cloud_engine`. Do NOT build a summary from cached / guessed evals — the point of the summary is trust, and a placeholder `$14` at an endpoint the reader will internalize is worse than no summary.
 1. `create_prep_file(collection_id, name)` — name it with "Summary" in the Event tag (`"Modern Defence — Tiger ...a6/...b5 (Summary)"`) so the reader recognizes the artifact.
 2. `set_comment(root, "framing")` — the file's thesis, first thing.
 3. Build the mainline top-down with `apply_mutations` batches — each move gets its comment in the same batch that adds it. Don't come back to write comments later; the density is the point.
 4. At each branching decision, add ONLY the branches the opponent might actually play. Skip the ones you'd cover in a big file.
-5. At every leaf, set an endpoint NAG.
+5. At every leaf, `cloud_analyse` the position (or verify a stored `ceoEval`) and set the endpoint NAG based on that measurement, not on generic knowledge of the opening.
 6. `set_annotations` on the 3-5 most important positions — the tabiya, the novelty, the critical junction. Not every position.
 
 Total build: dozens of nodes, not hundreds. If your summary is 200+ nodes, it's probably a big file wearing a summary hat — cut ruthlessly.
