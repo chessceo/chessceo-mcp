@@ -1,23 +1,27 @@
 # @chessceo/mcp
 
-Model Context Protocol server for [chess.ceo](https://chess.ceo) — 11.7M+ games, ~1.5M FIDE player profiles, opening preparation, live broadcasts. Lets Claude, Cursor, and any other MCP host answer chess questions directly against real data instead of hallucinating.
+Model Context Protocol server for [chess.ceo](https://chess.ceo) — 11.7M+ games, ~1.5M FIDE player profiles, opening preparation, live broadcasts, cloud engine analysis, and (signed-in) a full read/write prep-file workflow. Lets Claude, Cursor, and any other MCP host answer chess questions directly against real data instead of hallucinating.
 
-No API key. No auth. No state. Free to use.
+Player/game lookups need no API key or auth. Cloud engines and prep-file tools need a `mcp_...` bearer token (see Auth below).
 
 ## What it can do
 
-The server exposes 8 tools that mirror the public GET API surface at `chess.ceo`:
+47 tools as of v0.48.2, mirroring the `chess.ceo` API surface. A few of the most-used:
 
 | Tool | What it answers |
 |---|---|
 | `search_player` | "Find FIDE ID for Magnus Carlsen" |
 | `get_player_profile` | "How strong is X, what do they play, who have they beaten" |
-| `get_player_preparation` | "What does X play against 1.e4? What's their win rate with the Najdorf?" |
+| `prepare_opponent` + `get_prep_position` | "What does X play against 1.e4? What's their win rate with the Najdorf?" |
 | `get_position_stats` | "From this position, which move scores best in the 11.7M-game database?" |
 | `get_head_to_head` | "What's the record between X and Y?" |
-| `list_live_tournaments` | "What's being broadcast live right now?" |
-| `list_tournament_players` | "Who's playing in tournament T?" |
-| `list_player_live_tournaments` | "Is X playing anywhere right now?" |
+| `list_live_tournaments` / `list_tournament_players` / `list_player_live_tournaments` | "What's being broadcast live right now? Who's playing? Is X in it?" |
+| `cloud_analyse` | "Run Stockfish + Lc0 on this position on my rented GPU instance" |
+| `read_prep_file` / `add_line` / `add_move` / `apply_mutations` | Read and edit your own repertoire/course PGNs stored server-side |
+| `auto_evaluate` / `deep_analyse` | Kick off a long-running engine-evaluation job over a whole prep file, poll it, cancel it |
+| `read_docs` | Bundled guides (engine usage, opening prep, prep-file conventions, PGN authoring, summary authoring) |
+
+Full tool inventory with categories lives in [`CLAUDE.md`](CLAUDE.md) under "Tools cheatsheet" — that's the maintained source of truth; this table is illustrative, not exhaustive.
 
 ## Install (Claude Desktop)
 
@@ -61,6 +65,25 @@ This repo is also a [Claude Code plugin marketplace](https://code.claude.com/doc
 ```
 
 Claude Code will pull the plugin from GitHub and wire the MCP server automatically. Enable "Sync automatically" in the marketplace UI if you want future updates fetched on push.
+
+## Auth (for cloud engines and prep files)
+
+Read-only chess data — player search, profiles, position stats, head-to-head, live tournaments — needs nothing. Cloud engine tools and your own prep-file tools (list/read/create/edit) need a `mcp_...` bearer token.
+
+- **Local (`npx`/Claude Desktop/Cursor):** set `CHESSCEO_TOKEN` in the server's `env` block:
+  ```json
+  {
+    "mcpServers": {
+      "chessceo": {
+        "command": "npx",
+        "args": ["-y", "@chessceo/mcp"],
+        "env": { "CHESSCEO_TOKEN": "mcp_..." }
+      }
+    }
+  }
+  ```
+  Get a token from your chess.ceo account settings.
+- **Remote (`mcp.chess.ceo/mcp`):** no config needed — calling an authed tool without a token triggers the host's normal OAuth flow (claude.ai, ChatGPT connectors) automatically.
 
 ## Try it
 
@@ -109,7 +132,7 @@ In Claude Desktop, edit `claude_desktop_config.json`:
 }
 ```
 
-Same 8 tools, same data, zero-install. Useful when the host can't spawn subprocesses (e.g. Claude.ai web, Claude mobile, ChatGPT connectors).
+Same tools, same data, zero-install. Bearer-authed tools (cloud engines, prep files) go through this host's OAuth flow instead of a config-file token. Useful when the host can't spawn subprocesses (e.g. Claude.ai web, Claude mobile, ChatGPT connectors).
 
 ## Self-host the HTTP transport
 
