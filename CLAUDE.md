@@ -97,7 +97,7 @@ tool-based path — see the gap noted under "Docs" in the Tools cheatsheet.
 
 ## Tools cheatsheet
 
-47 tools as of v0.48.2. Full source in `src/tools.ts` (schemas) + `src/index.ts`
+49 tools as of v0.49.0. Full source in `src/tools.ts` (schemas) + `src/index.ts`
 `callToolInner` switch (behavior). Categories:
 
 **Player data (anonymous)**
@@ -123,7 +123,7 @@ tool-based path — see the gap noted under "Docs" in the Tools cheatsheet.
 
 **Prep files (bearer-authed)** — the user's own repertoire/course PGNs, stored server-side
 - Browse/read: `list_collections`, `list_prep_files`, `search_prep_files`, `find_position_in_files`, `read_prep_file`, `list_nodes`, `list_transpositions`
-- Lifecycle: `create_prep_file`, `delete_prep_file`, `restore_prep_file`
+- Lifecycle: `create_collection` (new folder — v0.49, previously there was no way to create one at all, only add files to an existing one), `create_prep_file`, `delete_prep_file`, `restore_prep_file`
 - Mutate: `add_move`, `add_line`, `set_comment`, `set_nags`, `set_annotations`, `set_tag`, `delete_subtree`, `promote_variation`, `apply_mutations` (batch)
 
 **Engine evaluation jobs (bearer-authed)** — long-running, poll-and-cancel shape

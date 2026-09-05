@@ -497,6 +497,28 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: "create_collection",
+    description:
+      "Create a new, empty PGN collection (a folder of prep files) — NOT a prep file itself. Use this when the user asks for a new file/course and `list_collections` shows nothing suitable to put it in; then call `create_prep_file` with the returned `id`.\n\n" +
+      "**Check `list_collections` first** — a duplicate folder with a slightly different name is the common failure mode here, same as `create_prep_file`.\n\n" +
+      "`folder_path` is optional (root if omitted) but should almost always be set — an ungrouped pile of top-level collections is exactly what this tool exists to avoid creating.\n\n" +
+      "Response: `{ok, id, title, folder_path}` — pass `id` to `create_prep_file` as `collection_id`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "Collection name, shown in the user's file browser. Example: 'Sicilian Rauzer'.",
+        },
+        folder_path: {
+          type: "string",
+          description: "Virtual folder path, e.g. '/AI Organized/Sicilian Rauzer'. Omit for root.",
+        },
+      },
+      required: ["title"],
+    },
+  },
+  {
     name: "create_prep_file",
     description:
       "Create a new (empty) prep file in the specified collection. `name` becomes the Event PGN tag. You then extend it with mutation tools (add_move, set_comment, …).\n\n" +

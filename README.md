@@ -6,7 +6,7 @@ Player/game lookups need no API key or auth. Cloud engines and prep-file tools n
 
 ## What it can do
 
-47 tools as of v0.48.2, mirroring the `chess.ceo` API surface. A few of the most-used:
+49 tools as of v0.49.0, mirroring the `chess.ceo` API surface. A few of the most-used:
 
 | Tool | What it answers |
 |---|---|

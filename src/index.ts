@@ -120,6 +120,7 @@ import {
   readPrepFile,
 } from "./prep/read.js";
 import {
+  createCollection,
   createPrepFile,
   findPositionInFiles,
   listCollections,
@@ -144,6 +145,7 @@ const AUTHED_TOOLS = new Set([
   "stop_cloud_engine",
   "cloud_analyse",
   "list_collections",
+  "create_collection",
   "list_prep_files",
   "search_prep_files",
   "find_position_in_files",
@@ -561,6 +563,9 @@ async function callToolInner(name: string, args: Args): Promise<unknown> {
 
     case "list_collections":
       return listCollections(args);
+
+    case "create_collection":
+      return createCollection(args);
 
     case "list_prep_files":
       return listPrepFiles(args);

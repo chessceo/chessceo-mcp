@@ -119,6 +119,23 @@ export async function findPositionInFiles(args: Args): Promise<unknown> {
   };
 }
 
+export async function createCollection(args: Args): Promise<unknown> {
+  const title = String(args.title || "").trim();
+  if (!title) throw new Error("title is required");
+  const folderPath = typeof args.folder_path === "string" ? args.folder_path.trim() : undefined;
+  const raw = await authedRequest("POST", PGN_BASE, {
+    title,
+    ...(folderPath ? { folderPath } : {}),
+  });
+  const collection = unwrap<PgnCollection>(raw);
+  return {
+    ok: true,
+    id: collection.id,
+    title: collection.title,
+    folder_path: collection.folderPath,
+  };
+}
+
 export async function createPrepFile(args: Args): Promise<unknown> {
   const collectionId = typeof args.collection_id === "string" ? args.collection_id.trim() : "";
   if (!collectionId) {
