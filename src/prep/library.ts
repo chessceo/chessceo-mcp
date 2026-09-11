@@ -96,8 +96,11 @@ export async function searchPrepFiles(args: Args): Promise<unknown> {
     "GET",
     `${PGN_BASE}/games/search?q=${encodeURIComponent(q)}&limit=100`,
   );
-  const data = unwrap<{ games?: PgnGameListRow[] }>(raw);
-  const games = data?.games ?? [];
+  // Unlike list_prep_files' {games:[...]} envelope, the cross-collection
+  // search handler (RespondPaginated) puts the array straight into `data` —
+  // `data?.games` was always undefined here, so this silently returned []
+  // for every query/position regardless of real matches (found 2026-09-11).
+  const games = unwrap<PgnGameListRow[]>(raw) ?? [];
   return { query: q, prep_files: games.map(projectGameRow) };
 }
 
@@ -110,8 +113,8 @@ export async function findPositionInFiles(args: Args): Promise<unknown> {
     "GET",
     `${PGN_BASE}/games/search?position=${encodeURIComponent(fen)}&limit=100`,
   );
-  const data = unwrap<{ games?: PgnGameListRow[] }>(raw);
-  const games = data?.games ?? [];
+  // See searchPrepFiles above — RespondPaginated's `data` is the array itself.
+  const games = unwrap<PgnGameListRow[]>(raw) ?? [];
   return {
     fen,
     match_count: games.length,
